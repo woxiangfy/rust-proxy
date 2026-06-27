@@ -1,0 +1,15 @@
+# Sample configuration for rust-proxy
+# Copy this file to config.toml and modify as needed
+# Command line arguments take precedence over config file settings
+
+# Port to bind (default: 8080)
+port = 8080
+
+# Log file path (optional, defaults to console output)
+# log_file = "proxy.log"
+
+# Request timeout in seconds (default: 30)
+timeout = 30
+
+# Log level: trace, debug, info, warn, error (default: info)
+log_level = "info"

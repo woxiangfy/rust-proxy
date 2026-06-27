@@ -1,0 +1,71 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-key: ${{ matrix.os }}
+
+      - name: Install OpenSSL (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          mkdir -p release
+          copy target\release\rust-proxy.exe release\rust-proxy.exe
+
+      - name: Prepare artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p release
+          cp target/release/rust-proxy release/rust-proxy
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-proxy-${{ matrix.os }}
+          path: release/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/rust-proxy-windows-latest/rust-proxy.exe
+            artifacts/rust-proxy-ubuntu-latest/rust-proxy
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

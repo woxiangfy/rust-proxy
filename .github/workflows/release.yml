@@ -10,6 +10,9 @@ on:
         description: 'Tag name for the release (e.g., v0.1.0)'
         required: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ${{ matrix.runner }}

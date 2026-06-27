@@ -8,15 +8,21 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - target: windows
+            runner: windows-latest
+            suffix: .exe
+          - target: linux
+            runner: ubuntu-latest
+            suffix: ''
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -24,23 +30,23 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: ${{ matrix.os }}
+          cache-key: ${{ matrix.target }}
 
       - name: Install OpenSSL (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Build release
         run: cargo build --release
 
       - name: Prepare artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.target == 'windows'
         run: |
           mkdir -p release
           copy target\release\rust-proxy.exe release\rust-proxy.exe
 
       - name: Prepare artifact (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'linux'
         run: |
           mkdir -p release
           cp target/release/rust-proxy release/rust-proxy
@@ -48,7 +54,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-proxy-${{ matrix.os }}
+          name: rust-proxy-${{ matrix.target }}
           path: release/
 
   release:
@@ -56,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -64,8 +70,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/rust-proxy-windows-latest/rust-proxy.exe
-            artifacts/rust-proxy-ubuntu-latest/rust-proxy
+            artifacts/rust-proxy-windows/rust-proxy.exe
+            artifacts/rust-proxy-linux/rust-proxy
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

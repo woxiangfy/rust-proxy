@@ -191,12 +191,10 @@ mod windows_service {
         let _guard = logging::setup_logging(&Some(log_file.clone()), &args.log_level)
             .context("Failed to setup logging")?;
 
-        let working_dir = std::env::current_dir().ok();
+        // let working_dir = std::env::current_dir().ok();
         info!(
-            "Rust Proxy Service starting... port={}, log_file={:?}, working_dir={:?}",
-            args.port,
-            log_file,
-            working_dir
+            "Rust Proxy Service starting... port={}",
+            args.port
         );
 
         let status_handle = service_control_handler::register(SERVICE_NAME, handle_control)

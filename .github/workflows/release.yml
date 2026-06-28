@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install system dependencies
-        run: apt-get update && apt-get install -y curl build-essential libssl-dev openssl
+        run: apt-get update && apt-get install -y curl build-essential
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

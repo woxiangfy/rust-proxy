@@ -111,6 +111,7 @@ pub enum ServerSubcommand {
     Start,
     Stop,
     Restart,
+    Status,
 }
 
 #[derive(clap::Parser, Debug)]

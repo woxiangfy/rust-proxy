@@ -117,6 +117,9 @@ async fn handle_server_command(server_args: ServerArgs) -> Result<()> {
         ServerSubcommand::Restart => {
             service::restart_service()?;
         }
+        ServerSubcommand::Status => {
+            service::status_service()?;
+        }
     }
 
     Ok(())

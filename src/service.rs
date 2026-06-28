@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use service_manager::{
-    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
-    ServiceUninstallCtx,
+    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
+    ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
 
 use crate::config::ServerRunArgs;
 
 const SERVICE_LABEL: &str = "rust-proxy";
+const DEFAULT_SERVICE_DESCRIPTION: &str = "Rust HTTP Proxy Server";
 
 pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
     let exe_path = std::env::current_exe()
@@ -60,21 +61,75 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from(log_level.to_string()));
     }
 
-    let manager = <dyn ServiceManager>::native()
-        .context("Failed to detect service management platform")?;
+    let description = DEFAULT_SERVICE_DESCRIPTION.to_string();
 
-    manager.install(ServiceInstallCtx {
-        label: label.clone(),
-        program: exe_path,
-        args: command_args,
-        contents: None,
-        username: None,
-        autostart: true,
-        environment: None,
-        restart_policy: RestartPolicy::default(),
-        working_directory: Some(exe_dir),
-    })
-    .context("Failed to install service")?;
+    #[cfg(target_os = "linux")]
+    {
+        use service_manager::SystemdServiceManager;
+        
+        let mut manager = SystemdServiceManager::system();
+        manager.config.install.description = Some(description.clone());
+        
+        manager.install(ServiceInstallCtx {
+            label: label.clone(),
+            program: exe_path,
+            args: command_args,
+            contents: None,
+            username: None,
+            autostart: true,
+            environment: None,
+            restart_policy: RestartPolicy::default(),
+            working_directory: Some(exe_dir),
+        })
+        .context("Failed to install service")?;
+    }
+    
+    #[cfg(windows)]
+    {
+        let manager = <dyn ServiceManager>::native()
+            .context("Failed to detect service management platform")?;
+
+        manager.install(ServiceInstallCtx {
+            label: label.clone(),
+            program: exe_path,
+            args: command_args,
+            contents: None,
+            username: None,
+            autostart: true,
+            environment: None,
+            restart_policy: RestartPolicy::default(),
+            working_directory: Some(exe_dir),
+        })
+        .context("Failed to install service")?;
+
+        let output = std::process::Command::new("sc")
+            .args(["description", SERVICE_LABEL, &description])
+            .output()
+            .context("Failed to set service description")?;
+        
+        if !output.status.success() {
+            println!("Warning: Failed to set service description: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let manager = <dyn ServiceManager>::native()
+            .context("Failed to detect service management platform")?;
+
+        manager.install(ServiceInstallCtx {
+            label: label.clone(),
+            program: exe_path,
+            args: command_args,
+            contents: None,
+            username: None,
+            autostart: true,
+            environment: None,
+            restart_policy: RestartPolicy::default(),
+            working_directory: Some(exe_dir),
+        })
+        .context("Failed to install service")?;
+    }
 
     println!("Service installed successfully: {}", label);
     Ok(())
@@ -135,6 +190,36 @@ pub fn restart_service() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(2));
     start_service()?;
     println!("Service restarted successfully");
+    Ok(())
+}
+
+pub fn status_service() -> Result<()> {
+    let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
+
+    let manager = <dyn ServiceManager>::native()
+        .context("Failed to detect service management platform")?;
+
+    let status = manager.status(ServiceStatusCtx {
+        label: label.clone(),
+    })
+    .context("Failed to get service status")?;
+
+    match status {
+        ServiceStatus::Running => {
+            println!("Service is running");
+        }
+        ServiceStatus::Stopped(reason) => {
+            if let Some(r) = reason {
+                println!("Service is stopped: {}", r);
+            } else {
+                println!("Service is stopped");
+            }
+        }
+        ServiceStatus::NotInstalled => {
+            println!("Service is not installed");
+        }
+    }
+
     Ok(())
 }
 

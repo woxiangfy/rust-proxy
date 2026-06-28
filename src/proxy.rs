@@ -384,7 +384,7 @@ pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
     let request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
-         User-Agent: rust-proxy/0.1.0\r\n\
+         User-Agent: rust-proxy/0.1.2\r\n\
          Accept: */*\r\n\
          Connection: close\r\n\r\n",
         request_target, host_header

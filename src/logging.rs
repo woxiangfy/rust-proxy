@@ -13,27 +13,34 @@ use tracing_subscriber::{fmt, fmt::format::Writer, layer::SubscriberExt, util::S
 
 use crate::config::LogLevel;
 
-/// Maximum number of log files to retain
 const MAX_LOG_FILES: usize = 10;
 
-/// Custom time formatter for local timezone with format: YYYY-MM-DD HH:MM:SS
-struct LocalTimeFormatter;
+struct CustomFormatEvent;
 
-impl fmt::time::FormatTime for LocalTimeFormatter {
-    fn format_time(&self, w: &mut Writer) -> std::fmt::Result {
+impl<S, N> fmt::FormatEvent<S, N> for CustomFormatEvent
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'writer> fmt::FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
         let now = SystemTime::now();
         let datetime: chrono::DateTime<chrono::Local> = now.into();
-        write!(w, "{}", datetime.format("%Y-%m-%d %H:%M:%S"))
+        write!(writer, "{} ", datetime.format("%Y-%m-%d %H:%M:%S"))?;
+        
+        write!(writer, "{} ", event.metadata().level())?;
+        
+        write!(writer, "{}: ", event.metadata().target())?;
+        
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
-/// Initialize logging with optional file output, log rotation, and log level
-/// Returns a WorkerGuard if file logging is enabled to keep the guard alive
-///
-/// Features:
-/// - Daily log rotation at midnight in the system local timezone
-/// - Keeps up to MAX_LOG_FILES (10) most recent log files
-/// - Rotated files are named `proxy.log.YYYY-MM-DD`
 pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result<Option<WorkerGuard>> {
     let level = log_level.to_tracing_level();
     let filter = EnvFilter::from_default_env()
@@ -52,8 +59,7 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
                 fmt::layer()
                     .with_writer(non_blocking_writer)
                     .with_ansi(false)
-                    .with_target(true)
-                    .with_timer(LocalTimeFormatter)
+                    .event_format(CustomFormatEvent)
             )
             .init();
 
@@ -63,8 +69,7 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
             .with(filter)
             .with(
                 fmt::layer()
-                    .with_target(true)
-                    .with_timer(LocalTimeFormatter)
+                    .event_format(CustomFormatEvent)
             )
             .init();
 
@@ -72,31 +77,19 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
     }
 }
 
-// === Rolling file writer ===
-
 struct RollingWriterInner {
-    /// Path to the current log file.
     base_path: PathBuf,
-    /// Currently open log file.
     current_file: Option<File>,
-    /// Number of bytes written to `current_file`.
     current_size: u64,
-    /// When the next time-based rotation should occur.
     next_rotation: chrono::DateTime<Local>,
-    /// Maximum number of archived log files to keep.
     max_files: usize,
 }
 
-/// A simple rolling file writer that rotates daily in the system local timezone.
-///
-/// Rotated files are named `{base}.{YYYY-MM-DD}`. The current log file always
-/// uses the configured base path.
 pub struct RollingWriter {
     inner: Mutex<RollingWriterInner>,
 }
 
 impl RollingWriter {
-    /// Create a new [`RollingWriterBuilder`] for the given log file path.
     pub fn builder<P: AsRef<Path>>(path: P) -> RollingWriterBuilder {
         RollingWriterBuilder::new(path)
     }
@@ -109,7 +102,6 @@ impl RollingWriter {
 
         let base_path = inner.base_path.clone();
         let max_files = inner.max_files;
-        // Close the current file before renaming it.
         let _ = inner.current_file.take();
         drop(inner);
 
@@ -217,14 +209,12 @@ impl std::fmt::Debug for RollingWriter {
     }
 }
 
-/// Builder for [`RollingWriter`].
 pub struct RollingWriterBuilder {
     path: PathBuf,
     max_files: usize,
 }
 
 impl RollingWriterBuilder {
-    /// Create a new builder for the given log file path.
     fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
@@ -232,13 +222,11 @@ impl RollingWriterBuilder {
         }
     }
 
-    /// Set the maximum number of archived log files to keep.
     pub fn max_files(mut self, max: usize) -> Self {
         self.max_files = max;
         self
     }
 
-    /// Build the [`RollingWriter`] and open the log file.
     pub fn build(self) -> io::Result<RollingWriter> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -264,7 +252,6 @@ fn open_log_file(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// Returns the next midnight in the system local timezone.
 fn next_local_midnight() -> chrono::DateTime<Local> {
     let now = chrono::Local::now();
     let tomorrow = now.date_naive() + Days::new(1);
@@ -275,7 +262,6 @@ fn next_local_midnight() -> chrono::DateTime<Local> {
     }
 }
 
-/// Remove oldest archived log files when there are more than `max_files`.
 fn prune_old_files(base_path: &Path, max_files: usize) {
     let dir = base_path
         .parent()
@@ -313,7 +299,6 @@ fn prune_old_files(base_path: &Path, max_files: usize) {
         return;
     }
 
-    // Sort newest first.
     archives.sort_by(|a, b| b.1.cmp(&a.1));
 
     for (path, _) in archives.iter().skip(max_files) {

@@ -279,5 +279,36 @@ pub use windows_service::run_as_service;
 
 #[cfg(not(windows))]
 pub fn run_as_service() -> Result<()> {
-    Err(anyhow::anyhow!("Service mode is only supported on Windows"))
+    use crate::config::Args;
+    use crate::logging;
+    use crate::server;
+    use tokio::runtime::Runtime;
+    use tracing::{error, info};
+
+    let start_args = crate::parse_service_args();
+    let args = Args::from_run_args(&start_args);
+
+    let effective_log_file = if args.log_file.is_some() {
+        args.log_file.clone()
+    } else {
+        std::env::current_exe()
+            .ok()
+            .map(|mut path| {
+                path.set_file_name("proxy.log");
+                path
+            })
+    };
+
+    let _guard = logging::setup_logging(&effective_log_file, &args.log_level)
+        .context("Failed to setup logging")?;
+
+    info!("Rust Proxy Service starting... port={}", args.port);
+
+    let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
+    if let Err(e) = runtime.block_on(server::run_server(&args, None)) {
+        error!("Server error: {}", e);
+        return Err(e.into());
+    }
+
+    Ok(())
 }

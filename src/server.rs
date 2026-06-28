@@ -9,7 +9,6 @@ use tracing::{error, info};
 
 use crate::buffer_pool::BufferPool;
 use crate::config::Args;
-use crate::dns_cache::DnsCache;
 use crate::proxy::handle_client;
 
 /// Start the proxy server with the given configuration
@@ -23,15 +22,13 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
     let buffer_pool = Arc::new(BufferPool::new());
     info!("Buffer pool initialized for zero-copy operations");
 
-    let dns_cache = Arc::new(DnsCache::new(5).await);
-
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("Failed to bind to {}", bind_addr))?;
 
     info!("Proxy server listening on {}", bind_addr);
 
-    accept_connections(listener, args.timeout, buffer_pool, dns_cache, shutdown_rx).await;
+    accept_connections(listener, args.timeout, buffer_pool, shutdown_rx).await;
     
     Ok(())
 }
@@ -41,7 +38,6 @@ async fn accept_connections(
     listener: TcpListener, 
     timeout: u64, 
     buffer_pool: Arc<BufferPool>,
-    dns_cache: Arc<DnsCache>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut join_set = JoinSet::new();
@@ -68,9 +64,8 @@ async fn accept_connections(
             Ok((client, _addr)) => {
                 let timeout = timeout;
                 let buffer_pool = Arc::clone(&buffer_pool);
-                let dns_cache = Arc::clone(&dns_cache);
                 join_set.spawn(async move {
-                    handle_client(client, timeout, buffer_pool, dns_cache).await;
+                    handle_client(client, timeout, buffer_pool).await;
                 });
             }
             Err(e) => {

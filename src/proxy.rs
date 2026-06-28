@@ -1,7 +1,6 @@
 //! Proxy module containing HTTP proxy request handling logic with zero-copy optimization and DNS caching
 
 use crate::buffer_pool::BufferPool;
-use crate::dns_cache::DnsCache;
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,12 +14,11 @@ use tracing::{error, info, warn};
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
-/// Handle an HTTP proxy client connection with buffer reuse and DNS caching
+/// Handle an HTTP proxy client connection with buffer reuse
 pub async fn handle_client(
     mut client: TcpStream, 
     timeout: u64, 
     buffer_pool: Arc<BufferPool>,
-    dns_cache: Arc<DnsCache>,
 ) {
     let client_addr = match client.peer_addr() {
         Ok(addr) => addr,
@@ -33,7 +31,7 @@ pub async fn handle_client(
     let timeout_duration = Duration::from_secs(timeout);
     
     // Get a buffer from the pool (zero-copy, no allocation if available)
-    let mut buf = buffer_pool.get().await;
+    let mut buf = buffer_pool.get();
     let buf_slice = buf.as_mut_slice();
     
     // Read request data directly into the pooled buffer
@@ -76,23 +74,21 @@ pub async fn handle_client(
 
     // Handle CONNECT method (HTTPS tunneling)
     if method == "CONNECT" {
-        handle_connect(client, url, client_addr, timeout_duration, dns_cache).await;
+        handle_connect(client, url, client_addr, timeout_duration).await;
         return;
     }
 
-    // Handle HTTP proxy request with buffer pool and DNS caching
-    handle_http_request(client, &request_data, client_addr, timeout_duration, buffer_pool, dns_cache).await;
+    // Handle HTTP proxy request with buffer pool
+    handle_http_request(client, &request_data, client_addr, timeout_duration, buffer_pool).await;
 }
 
-/// Handle CONNECT method for HTTPS tunneling with DNS caching
+/// Handle CONNECT method for HTTPS tunneling
 async fn handle_connect(
     client: TcpStream,
     host_port: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
-    dns_cache: Arc<DnsCache>,
 ) {
-    // Parse host and port from host_port string
     let (host, port) = match parse_host_port(host_port) {
         Ok((h, p)) => (h, p),
         Err(e) => {
@@ -101,19 +97,8 @@ async fn handle_connect(
         }
     };
 
-    // Use DNS cache for async DNS resolution
-    let ip = match dns_cache.get_or_resolve(host).await {
-        Ok(ip) => ip,
-        Err(e) => {
-            error!("DNS resolution failed for {} from {}: {}", host, client_addr, e);
-            return;
-        }
-    };
-
-    let target_addr = SocketAddr::new(ip, port);
-
-    // Connect to target using resolved IP
-    let target = match tokio::time::timeout(timeout_duration, TcpStream::connect(target_addr)).await
+    // 直接使用主机名连接，由操作系统负责 DNS 解析和缓存
+    let target = match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port))).await
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
@@ -154,14 +139,13 @@ async fn handle_connect(
     }
 }
 
-/// Handle standard HTTP proxy request with buffer reuse and DNS caching
+/// Handle standard HTTP proxy request with buffer reuse
 async fn handle_http_request(
     client: TcpStream,
     request_data: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
     buffer_pool: Arc<BufferPool>,
-    dns_cache: Arc<DnsCache>,
 ) {
     let mut lines = request_data.lines();
     let request_line = match lines.next() {
@@ -198,19 +182,8 @@ async fn handle_http_request(
 
     info!("{} -> {} {}:{} -> {}", client_addr, method, host, port, url);
 
-    // Use DNS cache for async DNS resolution
-    let ip = match dns_cache.get_or_resolve(host).await {
-        Ok(ip) => ip,
-        Err(e) => {
-            error!("DNS resolution failed for {} from {}: {}", host, client_addr, e);
-            return;
-        }
-    };
-
-    let target_addr = SocketAddr::new(ip, port);
-
-    // Connect to target using resolved IP
-    let mut target = match tokio::time::timeout(timeout_duration, TcpStream::connect(target_addr))
+    // 直接使用主机名连接，由操作系统负责 DNS 解析和缓存
+    let mut target = match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port)))
         .await
     {
         Ok(Ok(t)) => t,
@@ -260,7 +233,7 @@ async fn handle_http_request(
     }
 
     // Read response and forward to client using pooled buffer
-    let mut response_buf = buffer_pool.get().await;
+    let mut response_buf = buffer_pool.get();
     let response_slice = response_buf.as_mut_slice();
     let mut client = client;
 

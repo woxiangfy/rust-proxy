@@ -384,10 +384,10 @@ pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
     let request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
-         User-Agent: rust-proxy/0.1.2\r\n\
+         User-Agent: rust-proxy/{}\r\n\
          Accept: */*\r\n\
          Connection: close\r\n\r\n",
-        request_target, host_header
+        request_target, host_header, env!("CARGO_PKG_VERSION")
     );
     tokio::time::timeout(Duration::from_secs(30), stream.write_all(request.as_bytes()))
         .await

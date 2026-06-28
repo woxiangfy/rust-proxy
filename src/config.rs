@@ -67,8 +67,8 @@ pub struct Cli {
     pub command: Commands,
 }
 
-#[derive(clap::Parser, Debug)]
-pub struct StartArgs {
+#[derive(clap::Parser, Debug, Clone)]
+pub struct ServerRunArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -87,7 +87,7 @@ pub struct StartArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
-    Start(StartArgs),
+    Start(ServerRunArgs),
 
     Test {
         proxy_addr: String,
@@ -102,26 +102,11 @@ pub enum Commands {
 pub struct ServerArgs {
     #[command(subcommand)]
     pub subcommand: ServerSubcommand,
-
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-
-    #[arg(long)]
-    pub port: Option<u16>,
-
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
-
-    #[arg(long)]
-    pub timeout: Option<u64>,
-
-    #[arg(long)]
-    pub log_level: Option<LogLevel>,
 }
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ServerSubcommand {
-    Install,
+    Install(ServerRunArgs),
     Uninstall,
     Start,
     Stop,
@@ -133,20 +118,8 @@ pub struct RunAsServiceArgs {
     #[arg(long)]
     pub run_as_service: bool,
 
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-
-    #[arg(long)]
-    pub port: Option<u16>,
-
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
-
-    #[arg(long)]
-    pub timeout: Option<u64>,
-
-    #[arg(long)]
-    pub log_level: Option<LogLevel>,
+    #[command(flatten)]
+    pub run_args: ServerRunArgs,
 }
 
 /// Final merged server configuration
@@ -165,31 +138,74 @@ impl Args {
     pub const DEFAULT_CONFIG_FILE: &'static str = "config.toml";
 
     fn find_default_config() -> Option<PathBuf> {
-        let config_path = std::env::current_dir().ok()?.join(Self::DEFAULT_CONFIG_FILE);
-        if config_path.exists() && config_path.is_file() {
-            Some(config_path)
-        } else {
-            None
+        if let Some(current_dir) = std::env::current_dir().ok() {
+            let config_path = current_dir.join(Self::DEFAULT_CONFIG_FILE);
+            if config_path.exists() && config_path.is_file() {
+                return Some(config_path);
+            }
         }
+        
+        if let Some(exe_path) = std::env::current_exe().ok() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let config_path = exe_dir.join(Self::DEFAULT_CONFIG_FILE);
+                if config_path.exists() && config_path.is_file() {
+                    return Some(config_path);
+                }
+            }
+        }
+        
+        None
     }
 
-    pub fn from_start_args(start_args: &StartArgs) -> Self {
-        let config_path = start_args.config.clone().or_else(Self::find_default_config);
+    pub fn from_run_args(run_args: &ServerRunArgs) -> Self {
+        let config_path = run_args.config.clone().or_else(Self::find_default_config);
         let config = config_path.as_ref().and_then(|path| load_config(path).ok());
 
+        let mut log_file = run_args.log_file.clone();
+        if log_file.is_none() {
+            if let Some(c) = &config {
+                if let Some(lf) = &c.log_file {
+                    log_file = Some(Self::resolve_log_file_path(lf, config_path.as_ref()));
+                }
+            }
+        }
+
         Args {
-            port: start_args.port
+            port: run_args.port
                 .or(config.as_ref().and_then(|c| c.port))
                 .unwrap_or(Self::DEFAULT_PORT),
-            log_file: start_args.log_file.clone()
-                .or(config.as_ref().and_then(|c| c.log_file.clone())),
-            timeout: start_args.timeout
+            log_file,
+            timeout: run_args.timeout
                 .or(config.as_ref().and_then(|c| c.timeout))
                 .unwrap_or(Self::DEFAULT_TIMEOUT),
-            log_level: start_args.log_level
+            log_level: run_args.log_level
                 .or(config.as_ref().and_then(|c| c.log_level))
                 .unwrap_or(Self::DEFAULT_LOG_LEVEL),
         }
+    }
+
+    fn resolve_log_file_path(log_file: &PathBuf, config_path: Option<&PathBuf>) -> PathBuf {
+        if log_file.is_absolute() {
+            return log_file.clone();
+        }
+
+        if let Some(config_path) = config_path {
+            if let Some(config_dir) = config_path.parent() {
+                let resolved = config_dir.join(log_file);
+                if let Ok(canonical) = resolved.canonicalize() {
+                    return canonical;
+                }
+                return resolved;
+            }
+        }
+
+        if let Some(exe_path) = std::env::current_exe().ok() {
+            if let Some(exe_dir) = exe_path.parent() {
+                return exe_dir.join(log_file);
+            }
+        }
+
+        log_file.clone()
     }
 }
 

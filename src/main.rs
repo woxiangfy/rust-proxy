@@ -13,13 +13,11 @@ mod service;
 use anyhow::Result;
 use clap::Parser;
 
-use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerSubcommand, StartArgs};
+use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerRunArgs, ServerSubcommand};
 
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--run-as-service") {
-        let start_args = parse_service_args();
-        let args = Args::from_start_args(&start_args);
-        service::run_as_service(&args)?;
+        service::run_as_service()?;
         return Ok(());
     }
 
@@ -28,7 +26,7 @@ fn main() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async move {
         match cli.command {
             Commands::Start(start_args) => {
-                let args = Args::from_start_args(&start_args);
+                let args = Args::from_run_args(&start_args);
                 let _guard = logging::setup_logging(&args.log_file, &args.log_level)?;
                 server::run_server(&args, None).await?;
             }
@@ -45,9 +43,9 @@ fn main() -> Result<()> {
     })
 }
 
-fn parse_service_args() -> StartArgs {
+fn parse_service_args() -> ServerRunArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut start_args = StartArgs {
+    let mut start_args = ServerRunArgs {
         config: None,
         port: None,
         log_file: None,
@@ -103,17 +101,9 @@ fn parse_service_args() -> StartArgs {
 }
 
 async fn handle_server_command(server_args: ServerArgs) -> Result<()> {
-    let args = Args::from_start_args(&StartArgs {
-        config: server_args.config,
-        port: server_args.port,
-        log_file: server_args.log_file,
-        timeout: server_args.timeout,
-        log_level: server_args.log_level,
-    });
-
     match server_args.subcommand {
-        ServerSubcommand::Install => {
-            service::install_service(&args)?;
+        ServerSubcommand::Install(run_args) => {
+            service::install_service(&run_args)?;
         }
         ServerSubcommand::Uninstall => {
             service::uninstall_service()?;

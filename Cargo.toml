@@ -1,6 +1,6 @@
 [package]
 name = "rust-proxy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [profile.release]
@@ -27,3 +27,6 @@ service-manager = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.6"
+
+[target.x86_64-unknown-linux-musl.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }

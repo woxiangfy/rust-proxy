@@ -15,16 +15,22 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: windows
-            runner: windows-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
             suffix: .exe
-          - target: linux
-            runner: ubuntu-latest
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+            suffix: .exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: ''
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
             suffix: ''
 
     steps:
@@ -33,36 +39,53 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           cache-key: ${{ matrix.target }}
 
-      - name: Install OpenSSL (Linux)
-        if: matrix.target == 'linux'
+      - name: Install OpenSSL (Linux GNU)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
+      - name: Install musl-tools (Linux musl)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install MinGW (Windows GNU)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: choco install mingw -y
+
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifact (Windows)
-        if: matrix.target == 'windows'
-        run: |
-          mkdir -p release
-          copy target\release\rust-proxy.exe release\rust-proxy.exe
+      - name: Prepare artifact directory
+        run: mkdir -p release
 
-      - name: Prepare artifact (Linux)
-        if: matrix.target == 'linux'
-        run: |
-          mkdir -p release
-          cp target/release/rust-proxy release/rust-proxy
+      - name: Copy binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: cp target/${{ matrix.target }}/release/rust-proxy${{ matrix.suffix }} release/rust-proxy${{ matrix.suffix }}
+
+      - name: Copy binary (Linux)
+        if: contains(matrix.target, 'linux')
+        run: cp target/${{ matrix.target }}/release/rust-proxy release/rust-proxy
+
+      - name: Create tar.gz (Linux)
+        if: contains(matrix.target, 'linux')
+        run: cd release && tar -czf ../rust-proxy-${{ matrix.target }}.tar.gz rust-proxy
+
+      - name: Create tar.gz (Windows)
+        if: contains(matrix.target, 'windows')
+        run: cd release && tar -czf ../rust-proxy-${{ matrix.target }}.tar.gz rust-proxy${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-proxy-${{ matrix.target }}
-          path: release/
+          path: rust-proxy-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -78,8 +101,10 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: |
-            artifacts/rust-proxy-windows/rust-proxy.exe
-            artifacts/rust-proxy-linux/rust-proxy
+            artifacts/rust-proxy-x86_64-pc-windows-msvc/rust-proxy-x86_64-pc-windows-msvc.tar.gz
+            artifacts/rust-proxy-x86_64-pc-windows-gnu/rust-proxy-x86_64-pc-windows-gnu.tar.gz
+            artifacts/rust-proxy-x86_64-unknown-linux-gnu/rust-proxy-x86_64-unknown-linux-gnu.tar.gz
+            artifacts/rust-proxy-x86_64-unknown-linux-musl/rust-proxy-x86_64-unknown-linux-musl.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

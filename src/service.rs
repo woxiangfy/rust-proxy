@@ -5,33 +5,59 @@ use service_manager::{
 };
 use std::ffi::OsString;
 
-use crate::config::Args;
+use crate::config::ServerRunArgs;
 
 const SERVICE_LABEL: &str = "rust-proxy";
 
-pub fn install_service(args: &Args) -> Result<()> {
+pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
     let exe_path = std::env::current_exe()
         .context("Failed to get current executable path")?;
+    
+    let exe_dir = exe_path.parent()
+        .context("Failed to get executable directory")?
+        .to_path_buf();
     
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
     
     let mut command_args = vec![OsString::from("--run-as-service")];
     
-    if let Some(log_file) = &args.log_file {
+    if let Some(mut config) = run_args.config.clone() {
+        if config.is_relative() {
+            config = std::env::current_dir()
+                .context("Failed to get current directory")?
+                .join(config);
+        }
+        config = config.canonicalize()
+            .context("Failed to canonicalize config path")?;
+        command_args.push(OsString::from("--config"));
+        command_args.push(OsString::from(config.display().to_string()));
+    }
+    
+    if let Some(port) = run_args.port {
+        command_args.push(OsString::from("--port"));
+        command_args.push(OsString::from(port.to_string()));
+    }
+    
+    if let Some(log_file) = &run_args.log_file {
+        let log_file = if log_file.is_absolute() {
+            log_file.clone()
+        } else {
+            std::env::current_dir()
+                .context("Failed to get current directory")?
+                .join(log_file)
+        };
         command_args.push(OsString::from("--log-file"));
         command_args.push(OsString::from(log_file.display().to_string()));
     }
-    if args.port != Args::DEFAULT_PORT {
-        command_args.push(OsString::from("--port"));
-        command_args.push(OsString::from(args.port.to_string()));
-    }
-    if args.timeout != Args::DEFAULT_TIMEOUT {
+    
+    if let Some(timeout) = run_args.timeout {
         command_args.push(OsString::from("--timeout"));
-        command_args.push(OsString::from(args.timeout.to_string()));
+        command_args.push(OsString::from(timeout.to_string()));
     }
-    if args.log_level != Args::DEFAULT_LOG_LEVEL {
+    
+    if let Some(log_level) = run_args.log_level {
         command_args.push(OsString::from("--log-level"));
-        command_args.push(OsString::from(args.log_level.to_string()));
+        command_args.push(OsString::from(log_level.to_string()));
     }
 
     let manager = <dyn ServiceManager>::native()
@@ -46,7 +72,7 @@ pub fn install_service(args: &Args) -> Result<()> {
         autostart: true,
         environment: None,
         restart_policy: RestartPolicy::default(),
-        working_directory: None,
+        working_directory: Some(exe_dir),
     })
     .context("Failed to install service")?;
 
@@ -140,17 +166,10 @@ mod windows_service {
 
     define_windows_service!(ffi_service_main, service_main);
 
-    pub fn run_as_service(args: &Args) -> Result<()> {
-        ARGS.with(|cell| {
-            *cell.borrow_mut() = Some(args.clone());
-        });
+    pub fn run_as_service() -> Result<()> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
             .context("Failed to start service dispatcher")?;
         Ok(())
-    }
-
-    thread_local! {
-        static ARGS: std::cell::RefCell<Option<Args>> = std::cell::RefCell::new(None);
     }
 
     fn service_main(_arguments: Vec<OsString>) {
@@ -160,15 +179,8 @@ mod windows_service {
     }
 
     fn run_service() -> Result<()> {
-        let args = ARGS.with(|cell| cell.borrow().clone().unwrap_or_else(|| {
-            Args::from_start_args(&crate::config::StartArgs {
-                config: None,
-                port: None,
-                log_file: None,
-                timeout: None,
-                log_level: None,
-            })
-        }));
+        let start_args = crate::parse_service_args();
+        let args = Args::from_run_args(&start_args);
 
         let log_file = args.log_file.clone().unwrap_or_else(|| {
             let mut path = std::env::current_exe().unwrap();
@@ -176,10 +188,16 @@ mod windows_service {
             path
         });
 
-        let _guard = logging::setup_logging(&Some(log_file), &args.log_level)
+        let _guard = logging::setup_logging(&Some(log_file.clone()), &args.log_level)
             .context("Failed to setup logging")?;
 
-        info!("Rust Proxy Service starting...");
+        let working_dir = std::env::current_dir().ok();
+        info!(
+            "Rust Proxy Service starting... port={}, log_file={:?}, working_dir={:?}",
+            args.port,
+            log_file,
+            working_dir
+        );
 
         let status_handle = service_control_handler::register(SERVICE_NAME, handle_control)
             .context("Failed to register service control handler")?;
@@ -262,6 +280,6 @@ mod windows_service {
 pub use windows_service::run_as_service;
 
 #[cfg(not(windows))]
-pub fn run_as_service(_args: &Args) -> Result<()> {
+pub fn run_as_service() -> Result<()> {
     Err(anyhow::anyhow!("Service mode is only supported on Windows"))
 }

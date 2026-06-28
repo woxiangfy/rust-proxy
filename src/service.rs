@@ -68,7 +68,7 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         use service_manager::SystemdServiceManager;
         
         let mut manager = SystemdServiceManager::system();
-        manager.config.install.description = Some(description.clone());
+        manager.config.unit.description = Some(description.clone());
         
         manager.install(ServiceInstallCtx {
             label: label.clone(),

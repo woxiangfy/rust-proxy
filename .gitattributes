@@ -1,0 +1,9 @@
+# Rust project - use LF line endings
+* text=auto eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.exe binary

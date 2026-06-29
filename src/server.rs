@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use log::{error, info};
 
 use crate::buffer_pool::BufferPool;
 use crate::config::Args;

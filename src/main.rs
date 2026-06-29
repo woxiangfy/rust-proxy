@@ -50,12 +50,12 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Start(start_args) => {
             let args = Args::from_run_args(&start_args);
-            let _guard = logging::setup_logging(&args.log_file, &args.log_level)?;
+            logging::setup_logging(&args.log_file, &args.log_level)?;
             let runtime = create_runtime(args.multi_thread)?;
             runtime.block_on(server::run_server(&args, None))?;
         }
         Commands::Test { proxy_addr, url } => {
-            let _guard = logging::setup_logging(&None, &LogLevel::Info)?;
+            logging::setup_logging(&None, &LogLevel::Info)?;
             let runtime = create_runtime(false)?;
             runtime.block_on(proxy::test_proxy(&proxy_addr, &url))?;
         }

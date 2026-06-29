@@ -227,7 +227,7 @@ pub fn status_service() -> Result<()> {
 mod windows_service {
     use anyhow::{Context, Result};
     use tokio::sync::oneshot;
-    use tracing::{error, info};
+    use log::{error, info};
     use windows_service::{
         define_windows_service,
         service::{
@@ -272,7 +272,7 @@ mod windows_service {
             path
         });
 
-        let _guard = logging::setup_logging(&Some(log_file.clone()), &args.log_level)
+        logging::setup_logging(&Some(log_file.clone()), &args.log_level)
             .context("Failed to setup logging")?;
 
         // let working_dir = std::env::current_dir().ok();
@@ -374,7 +374,7 @@ pub fn run_as_service() -> Result<()> {
     use crate::logging;
     use crate::server;
     use tokio::runtime::Runtime;
-    use tracing::{error, info};
+    use log::{error, info};
 
     let start_args = crate::parse_service_args();
     let args = Args::from_run_args(&start_args);
@@ -390,7 +390,7 @@ pub fn run_as_service() -> Result<()> {
             })
     };
 
-    let _guard = logging::setup_logging(&effective_log_file, &args.log_level)
+    logging::setup_logging(&effective_log_file, &args.log_level)
         .context("Failed to setup logging")?;
 
     info!("Rust Proxy Service starting... port={}", args.port);

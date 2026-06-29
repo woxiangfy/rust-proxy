@@ -1,87 +1,42 @@
-//! Logging module for initializing tracing logger with rotation support
+//! Logging module for initializing logger with rotation support
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{Days, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt, fmt::format::Writer, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use env_logger::Builder;
+use log::LevelFilter;
 
 use crate::config::LogLevel;
 
 const MAX_LOG_FILES: usize = 10;
 
-struct CustomFormatEvent;
-
-impl<S, N> fmt::FormatEvent<S, N> for CustomFormatEvent
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    N: for<'writer> fmt::FormatFields<'writer> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &fmt::FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> std::fmt::Result {
-        let now = SystemTime::now();
-        let datetime: chrono::DateTime<chrono::Local> = now.into();
-        write!(writer, "{} ", datetime.format("%Y-%m-%d %H:%M:%S"))?;
-        
-        write!(writer, "{} ", event.metadata().level())?;
-        
-        write!(writer, "{}: ", event.metadata().target())?;
-        
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-        writeln!(writer)
-    }
+fn get_current_date_str() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days_since_epoch = now / (24 * 60 * 60);
+    format!("{}", days_since_epoch)
 }
 
-pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result<Option<WorkerGuard>> {
-    let level = log_level.to_tracing_level();
-    let filter = EnvFilter::from_default_env()
-        .add_directive(level.into());
-
-    if let Some(path) = log_file {
-        let writer = RollingWriter::builder(path)
-            .max_files(MAX_LOG_FILES)
-            .build()?;
-
-        let (non_blocking_writer, guard) = tracing_appender::non_blocking(writer);
-
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer()
-                    .with_writer(non_blocking_writer)
-                    .with_ansi(false)
-                    .event_format(CustomFormatEvent)
-            )
-            .init();
-
-        Ok(Some(guard))
-    } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer()
-                    .event_format(CustomFormatEvent)
-            )
-            .init();
-
-        Ok(None)
-    }
+fn next_local_midnight() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let seconds_since_midnight = now % (24 * 60 * 60);
+    now + (24 * 60 * 60 - seconds_since_midnight)
 }
 
 struct RollingWriterInner {
     base_path: PathBuf,
     current_file: Option<File>,
     current_size: u64,
-    next_rotation: chrono::DateTime<Local>,
+    next_rotation: u64,
     max_files: usize,
 }
 
@@ -95,8 +50,13 @@ impl RollingWriter {
     }
 
     fn check_rotation(&self) -> io::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
         let mut inner = self.inner.lock().expect("rolling writer mutex poisoned");
-        if chrono::Local::now() < inner.next_rotation {
+        if now < inner.next_rotation {
             return Ok(());
         }
 
@@ -105,7 +65,7 @@ impl RollingWriter {
         let _ = inner.current_file.take();
         drop(inner);
 
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date = get_current_date_str();
         let file_name = base_path
             .file_name()
             .expect("log path must have a file name")
@@ -119,13 +79,12 @@ impl RollingWriter {
         }
 
         let new_file = open_log_file(&base_path)?;
-        let next_rotation = next_local_midnight();
 
         {
             let mut inner = self.inner.lock().expect("rolling writer mutex poisoned");
             inner.current_file = Some(new_file);
             inner.current_size = 0;
-            inner.next_rotation = next_rotation;
+            inner.next_rotation = next_local_midnight();
         }
 
         if max_files > 0 {
@@ -200,48 +159,32 @@ impl Write for &RollingWriter {
     }
 }
 
-impl std::fmt::Debug for RollingWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("rolling writer mutex poisoned");
-        f.debug_struct("RollingWriter")
-            .field("path", &inner.base_path)
-            .finish_non_exhaustive()
-    }
-}
-
 pub struct RollingWriterBuilder {
     path: PathBuf,
     max_files: usize,
 }
 
 impl RollingWriterBuilder {
-    fn new<P: AsRef<Path>>(path: P) -> Self {
-        Self {
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        RollingWriterBuilder {
             path: path.as_ref().to_path_buf(),
-            max_files: 0,
+            max_files: MAX_LOG_FILES,
         }
     }
 
-    pub fn max_files(mut self, max: usize) -> Self {
-        self.max_files = max;
+    pub fn max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files;
         self
     }
 
     pub fn build(self) -> io::Result<RollingWriter> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
         let file = open_log_file(&self.path)?;
-        let current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let next_rotation = next_local_midnight();
-
         Ok(RollingWriter {
             inner: Mutex::new(RollingWriterInner {
                 base_path: self.path,
                 current_file: Some(file),
-                current_size,
-                next_rotation,
+                current_size: 0,
+                next_rotation: next_local_midnight(),
                 max_files: self.max_files,
             }),
         })
@@ -249,59 +192,205 @@ impl RollingWriterBuilder {
 }
 
 fn open_log_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
-}
-
-fn next_local_midnight() -> chrono::DateTime<Local> {
-    let now = chrono::Local::now();
-    let tomorrow = now.date_naive() + Days::new(1);
-    let midnight = NaiveDateTime::new(tomorrow, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-    match Local.from_local_datetime(&midnight) {
-        LocalResult::Single(dt) => dt,
-        _ => now + chrono::Duration::days(1),
-    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 fn prune_old_files(base_path: &Path, max_files: usize) {
-    let dir = base_path
-        .parent()
-        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let base_name = match base_path.file_name() {
-        Some(n) => n.to_string_lossy().to_string(),
+    let file_name = match base_path.file_name() {
+        Some(name) => name.to_string_lossy().to_string(),
         None => return,
     };
 
-    let prefix = format!("{}.", base_name);
+    let dir = base_path
+        .parent()
+        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+        .unwrap_or_else(|| Path::new("."));
 
-    let mut archives: Vec<(PathBuf, NaiveDate)> = Vec::new();
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let mut entries: Vec<_> = match fs::read_dir(dir) {
+        Ok(dir) => dir.filter_map(|e| e.ok()).collect(),
+        Err(_) => Vec::new(),
+    };
+    
+    entries.retain(|e| {
+        let name = e.file_name().to_string_lossy().to_string();
+        name.starts_with(&file_name) && name != file_name
+    });
+
+    entries.sort_by_key(|e| e.path());
+    entries.reverse();
+
+    for entry in entries.into_iter().skip(max_files) {
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result<()> {
+    let level = match log_level {
+        LogLevel::Trace => LevelFilter::Trace,
+        LogLevel::Debug => LevelFilter::Debug,
+        LogLevel::Info => LevelFilter::Info,
+        LogLevel::Warn => LevelFilter::Warn,
+        LogLevel::Error => LevelFilter::Error,
     };
 
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
-            continue;
-        }
+    let mut builder = Builder::new();
+    builder.filter_level(level);
+    let tz_offset = get_local_offset_seconds();
+    builder.format(move |buf, record| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs() as i64 + tz_offset;
+        let date = ((secs / 86400) as u64) + 2440588;
+        let seconds_in_day = (secs.rem_euclid(86400)) as u64;
+        let hours = seconds_in_day / 3600;
+        let minutes = (seconds_in_day % 3600) / 60;
+        let seconds = seconds_in_day % 60;
+        
+        writeln!(
+            buf,
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {} {}: {}",
+            julian_to_year(date),
+            julian_to_month(date),
+            julian_to_day(date),
+            hours,
+            minutes,
+            seconds,
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
 
-        let suffix = &name[prefix.len()..];
-        let date_part = suffix.split('.').next().unwrap_or(suffix);
-        if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-            archives.push((entry.path(), date));
-        }
+    if let Some(path) = log_file {
+        let writer = RollingWriter::builder(path)
+            .max_files(MAX_LOG_FILES)
+            .build()?;
+        builder.target(env_logger::Target::Pipe(Box::new(writer)));
     }
 
-    if archives.len() <= max_files {
-        return;
+    builder.init();
+    Ok(())
+}
+
+fn julian_to_year(julian: u64) -> u64 {
+    let a = julian as i64 + 32044;
+    let b = (4 * a + 3) / 146097;
+    let c = a - (146097 * b) / 4;
+    let d = (4 * c + 3) / 1461;
+    let e = c - (1461 * d) / 4;
+    let m = (5 * e + 2) / 153;
+    100 * b as u64 + d as u64 - 4800 + (m / 10) as u64
+}
+
+fn julian_to_month(julian: u64) -> u64 {
+    let a = julian as i64 + 32044;
+    let b = (4 * a + 3) / 146097;
+    let c = a - (146097 * b) / 4;
+    let d = (4 * c + 3) / 1461;
+    let e = c - (1461 * d) / 4;
+    let m = (5 * e + 2) / 153;
+    (m + 3 - 12 * (m / 10)) as u64
+}
+
+fn julian_to_day(julian: u64) -> u64 {
+    let a = julian as i64 + 32044;
+    let b = (4 * a + 3) / 146097;
+    let c = a - (146097 * b) / 4;
+    let d = (4 * c + 3) / 1461;
+    let e = c - (1461 * d) / 4;
+    let m = (5 * e + 2) / 153;
+    (e - (153 * m + 2) / 5 + 1) as u64
+}
+
+/// 获取本地时区偏移量（秒）
+#[cfg(windows)]
+fn get_local_offset_seconds() -> i64 {
+    use std::mem::MaybeUninit;
+
+    #[repr(C)]
+    struct SystemTimeRaw {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
     }
 
-    archives.sort_by(|a, b| b.1.cmp(&a.1));
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTimeRaw,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTimeRaw,
+        daylight_bias: i32,
+    }
 
-    for (path, _) in archives.iter().skip(max_files) {
-        let _ = fs::remove_file(path);
+    extern "system" {
+        fn GetTimeZoneInformation(
+            lptimezoneinformation: *mut TimeZoneInformation,
+        ) -> u32;
+    }
+
+    unsafe {
+        let mut tz_info: MaybeUninit<TimeZoneInformation> = MaybeUninit::uninit();
+        let result = GetTimeZoneInformation(tz_info.as_mut_ptr());
+        let tz_info = tz_info.assume_init();
+
+        // bias 是 UTC 偏移量（分钟），值为正表示 UTC 之前（如 UTC+8 的 bias = -480）
+        let bias = tz_info.bias;
+        // 根据当前是否处于夏令时，附加额外偏移
+        let additional_bias = if result == 2 {
+            // TIME_ZONE_ID_DAYLIGHT
+            tz_info.daylight_bias
+        } else {
+            // TIME_ZONE_ID_STANDARD 或 TIME_ZONE_ID_UNKNOWN
+            tz_info.standard_bias
+        };
+
+        let total_bias = bias + additional_bias;
+        -(total_bias as i64) * 60
+    }
+}
+
+/// 获取本地时区偏移量（秒）
+#[cfg(not(windows))]
+fn get_local_offset_seconds() -> i64 {
+    use std::ffi::CStr;
+
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        tm_gmtoff: i64,
+        tm_zone: *const i8,
+    }
+
+    extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+
+    unsafe {
+        let mut t: i64 = 0;
+        time(&mut t);
+        let mut tm: Tm = std::mem::zeroed();
+        localtime_r(&t, &mut tm);
+        tm.tm_gmtoff
     }
 }

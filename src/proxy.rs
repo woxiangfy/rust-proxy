@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsConnector, native_tls};
-use tracing::{error, info, warn};
+use log::{error, info, warn};
 
 /// Combined trait for stream types used by `test_proxy`.
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}

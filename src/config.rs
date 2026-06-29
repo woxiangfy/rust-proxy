@@ -4,9 +4,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::Level;
 
-/// Log level for tracing
+/// Log level for logging
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 #[derive(PartialEq)]
@@ -19,18 +18,7 @@ pub enum LogLevel {
     Trace,
 }
 
-impl LogLevel {
-    /// Convert to tracing::Level
-    pub fn to_tracing_level(&self) -> Level {
-        match self {
-            LogLevel::Trace => Level::TRACE,
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Error => Level::ERROR,
-        }
-    }
-}
+impl LogLevel {}
 
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

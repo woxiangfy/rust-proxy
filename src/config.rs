@@ -83,6 +83,10 @@ pub struct ServerRunArgs {
 
     #[arg(long)]
     pub log_level: Option<LogLevel>,
+
+    /// 启用多线程运行时（默认使用单线程）
+    #[arg(long)]
+    pub multi_thread: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -130,6 +134,7 @@ pub struct Args {
     pub log_file: Option<PathBuf>,
     pub timeout: u64,
     pub log_level: LogLevel,
+    pub multi_thread: bool,
 }
 
 impl Args {
@@ -182,6 +187,8 @@ impl Args {
             log_level: run_args.log_level
                 .or(config.as_ref().and_then(|c| c.log_level))
                 .unwrap_or(Self::DEFAULT_LOG_LEVEL),
+            multi_thread: run_args.multi_thread
+                || config.as_ref().map(|c| c.multi_thread).unwrap_or(false),
         }
     }
 
@@ -221,6 +228,9 @@ pub struct Config {
     pub timeout: Option<u64>,
     /// Log level
     pub log_level: Option<LogLevel>,
+    /// Use multi-threaded runtime
+    #[serde(default)]
+    pub multi_thread: bool,
 }
 
 /// Load configuration from a TOML file

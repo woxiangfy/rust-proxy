@@ -13,3 +13,6 @@ timeout = 30
 
 # Log level: trace, debug, info, warn, error (default: info)
 log_level = "info"
+
+# 启用多线程运行时 (default: false)
+# multi_thread = false

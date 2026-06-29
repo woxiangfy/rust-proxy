@@ -226,7 +226,6 @@ pub fn status_service() -> Result<()> {
 #[cfg(windows)]
 mod windows_service {
     use anyhow::{Context, Result};
-    use tokio::runtime::Runtime;
     use tokio::sync::oneshot;
     use tracing::{error, info};
     use windows_service::{
@@ -308,7 +307,14 @@ mod windows_service {
             process_id: None,
         })?;
 
-        let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
+        let runtime = if args.multi_thread {
+            tokio::runtime::Runtime::new().context("Failed to create multi-thread Tokio runtime")?
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create single-thread Tokio runtime")?
+        };
         runtime.block_on(async {
             if let Err(e) = server::run_server(&args, Some(shutdown_rx)).await {
                 error!("Server error: {}", e);
@@ -389,7 +395,14 @@ pub fn run_as_service() -> Result<()> {
 
     info!("Rust Proxy Service starting... port={}", args.port);
 
-    let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
+    let runtime = if args.multi_thread {
+        Runtime::new().context("Failed to create multi-thread Tokio runtime")?
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create single-thread Tokio runtime")?
+    };
     if let Err(e) = runtime.block_on(server::run_server(&args, None)) {
         error!("Server error: {}", e);
         return Err(e.into());

@@ -13,10 +13,22 @@ mod proxy;
 mod server;
 mod service;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerRunArgs, ServerSubcommand};
+
+/// 创建 Tokio 运行时，根据参数选择单线程或多线程
+fn create_runtime(multi_thread: bool) -> Result<tokio::runtime::Runtime> {
+    if multi_thread {
+        tokio::runtime::Runtime::new().context("无法创建多线程 Tokio 运行时")
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("无法创建单线程 Tokio 运行时")
+    }
+}
 
 /// 程序主入口函数
 ///
@@ -34,24 +46,26 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    tokio::runtime::Runtime::new()?.block_on(async move {
-        match cli.command {
-            Commands::Start(start_args) => {
-                let args = Args::from_run_args(&start_args);
-                let _guard = logging::setup_logging(&args.log_file, &args.log_level)?;
-                server::run_server(&args, None).await?;
-            }
-            Commands::Test { proxy_addr, url } => {
-                let _guard = logging::setup_logging(&None, &LogLevel::Info)?;
-                proxy::test_proxy(&proxy_addr, &url).await?;
-            }
-            Commands::Server(server_args) => {
-                handle_server_command(server_args).await?;
-            }
+    // 仅 Start 命令支持多线程运行时，Test 和 Server 管理命令始终使用单线程
+    match cli.command {
+        Commands::Start(start_args) => {
+            let args = Args::from_run_args(&start_args);
+            let _guard = logging::setup_logging(&args.log_file, &args.log_level)?;
+            let runtime = create_runtime(args.multi_thread)?;
+            runtime.block_on(server::run_server(&args, None))?;
         }
+        Commands::Test { proxy_addr, url } => {
+            let _guard = logging::setup_logging(&None, &LogLevel::Info)?;
+            let runtime = create_runtime(false)?;
+            runtime.block_on(proxy::test_proxy(&proxy_addr, &url))?;
+        }
+        Commands::Server(server_args) => {
+            let runtime = create_runtime(false)?;
+            runtime.block_on(handle_server_command(server_args))?;
+        }
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 /// 服务模式下的命令行参数解析函数
@@ -63,6 +77,7 @@ fn main() -> Result<()> {
 ///   --log-file 指定日志文件路径
 ///   --timeout  指定连接超时时间（秒）
 ///   --log-level 指定日志级别
+///   --multi-thread 启用多线程运行时
 fn parse_service_args() -> ServerRunArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut start_args = ServerRunArgs {
@@ -71,6 +86,7 @@ fn parse_service_args() -> ServerRunArgs {
         log_file: None,
         timeout: None,
         log_level: None,
+        multi_thread: false,
     };
 
     let mut i = 0;
@@ -112,6 +128,11 @@ fn parse_service_args() -> ServerRunArgs {
                 }
             }
             "--run-as-service" => {}
+            "--multi-thread" => {
+                start_args.multi_thread = true;
+                i += 1;
+                continue;
+            }
             _ => {}
         }
         i += 1;

@@ -203,7 +203,7 @@ async fn handle_http_request(
         if line.is_empty() {
             break;
         }
-        let line_lower = line.to_lowercase();
+        let line_lower = line.to_ascii_lowercase();
         if !line_lower.contains("proxy-connection") && !line_lower.contains("transfer-encoding") {
             // Modify connection header
             let line_to_send = if line_lower.starts_with("connection:") {

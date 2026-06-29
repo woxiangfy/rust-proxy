@@ -63,6 +63,7 @@ impl BufferPool {
 
         if let Some(buf) = state.buffers.pop() {
             state.outstanding += 1;
+            state.idle_drops = 0; // 活跃使用中，重置缩容计数器
             PooledBuffer {
                 data: buf,
                 state: Arc::clone(&self.state),
@@ -74,6 +75,8 @@ impl BufferPool {
                 state.idle_drops = 0; // 重置缩容计数器
             }
             state.outstanding += 1;
+            // 释放锁后再分配内存，避免在锁内执行 8KB 零初始化
+            drop(state);
             PooledBuffer {
                 data: vec![0u8; BUFFER_SIZE],
                 state: Arc::clone(&self.state),
@@ -190,15 +193,26 @@ mod tests {
         assert_eq!(pool.max_size(), INITIAL_MAX_POOL_SIZE * 2);
         drop(bufs);
 
-        // 此时池中有 INITIAL_MAX_POOL_SIZE + 1 个缓冲区
-        // 反复借还但不触发扩容，积累 idle_drops
+        // 活跃使用中不应缩容：每次从池中取出会重置 idle_drops
         for _ in 0..SHRINK_THRESHOLD + 2 {
             let buf = pool.get();
             drop(buf);
         }
+        assert_eq!(
+            pool.max_size(),
+            INITIAL_MAX_POOL_SIZE * 2,
+            "活跃使用的池不应缩容"
+        );
 
-        // 缩容后容量应减半
-        assert_eq!(pool.max_size(), INITIAL_MAX_POOL_SIZE);
+        // 借出大量缓冲区后一次性归还，累积 idle_drops 触发缩容
+        let held: Vec<_> = (0..SHRINK_THRESHOLD + 1).map(|_| pool.get()).collect();
+        let expanded_max = pool.max_size();
+        drop(held);
+        assert!(
+            pool.max_size() < expanded_max,
+            "长期闲置的池应触发缩容，当前 max_size={}",
+            pool.max_size()
+        );
     }
 
     #[test]

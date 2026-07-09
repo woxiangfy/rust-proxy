@@ -252,7 +252,7 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
         
         writeln!(
             buf,
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {} {}: {}",
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}: {}",
             julian_to_year(date),
             julian_to_month(date),
             julian_to_day(date),
@@ -260,7 +260,6 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
             minutes,
             seconds,
             record.level(),
-            record.target(),
             record.args()
         )
     });

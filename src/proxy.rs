@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsConnector, native_tls};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 /// Combined trait for stream types used by `test_proxy`.
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -135,7 +135,7 @@ async fn handle_connect(
     .await
     {
         Ok(_) => info!("CONNECT tunnel closed: {}:{}", host, port),
-        Err(_) => error!("CONNECT tunnel timed out: {}:{}", host, port),
+        Err(_) => debug!("CONNECT tunnel timed out: {}:{}", host, port),
     }
 }
 

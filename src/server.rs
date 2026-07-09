@@ -19,19 +19,16 @@ use crate::proxy::handle_client;
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{}", args.port);
 
-    info!("正在启动 HTTP 代理服务器，绑定地址: {}", bind_addr);
-    info!("超时时间: {} 秒", args.timeout);
-    info!("日志级别: {}", args.log_level);
+    info!("Binding address: {}", bind_addr);
 
     // 初始化缓冲区池，用于零拷贝数据传输
     let buffer_pool = Arc::new(BufferPool::new());
-    info!("缓冲区池已初始化（零拷贝模式）");
 
     let listener = TcpListener::bind(&bind_addr)
         .await
-        .with_context(|| format!("无法绑定到 {}", bind_addr))?;
+        .with_context(|| format!("Failed to bind to {}", bind_addr))?;
 
-    info!("代理服务器已开始监听 {}", bind_addr);
+    info!("rust_proxy is running");
 
     accept_connections(listener, args.timeout, buffer_pool, shutdown_rx).await;
 
@@ -57,11 +54,11 @@ async fn accept_connections(
             tokio::select! {
                 res = accept_future => res,
                 _ = shutdown => {
-                    info!("收到关闭信号，正在停止服务器...");
-                    info!("等待 {} 个活跃连接完成...", join_set.len());
+                    info!("Received shutdown signal, stopping server...");
+                    info!("Waiting for {} active connections to complete...", join_set.len());
                     // 等待所有正在处理的连接完成
                     while join_set.join_next().await.is_some() {}
-                    info!("所有连接已完成，服务器已停止");
+                    info!("All active connections completed, server stopped");
                     return;
                 }
             }
@@ -77,7 +74,7 @@ async fn accept_connections(
                 });
             }
             Err(e) => {
-                error!("接受连接失败: {}", e);
+                error!("Failed to accept connection: {}", e);
             }
         }
     }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use service_manager::{
-    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
-    ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
+    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStatus,
+    ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
 
@@ -11,34 +11,35 @@ const SERVICE_LABEL: &str = "rust-proxy";
 const DEFAULT_SERVICE_DESCRIPTION: &str = "Rust HTTP Proxy Server";
 
 pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
-    let exe_path = std::env::current_exe()
-        .context("Failed to get current executable path")?;
-    
-    let exe_dir = exe_path.parent()
+    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+
+    let exe_dir = exe_path
+        .parent()
         .context("Failed to get executable directory")?
         .to_path_buf();
-    
+
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
-    
+
     let mut command_args = vec![OsString::from("--run-as-service")];
-    
+
     if let Some(mut config) = run_args.config.clone() {
         if config.is_relative() {
             config = std::env::current_dir()
                 .context("Failed to get current directory")?
                 .join(config);
         }
-        config = config.canonicalize()
+        config = config
+            .canonicalize()
             .context("Failed to canonicalize config path")?;
         command_args.push(OsString::from("--config"));
         command_args.push(OsString::from(config.display().to_string()));
     }
-    
+
     if let Some(port) = run_args.port {
         command_args.push(OsString::from("--port"));
         command_args.push(OsString::from(port.to_string()));
     }
-    
+
     if let Some(log_file) = &run_args.log_file {
         let log_file = if log_file.is_absolute() {
             log_file.clone()
@@ -50,12 +51,12 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from("--log-file"));
         command_args.push(OsString::from(log_file.display().to_string()));
     }
-    
+
     if let Some(timeout) = run_args.timeout {
         command_args.push(OsString::from("--timeout"));
         command_args.push(OsString::from(timeout.to_string()));
     }
-    
+
     if let Some(log_level) = run_args.log_level {
         command_args.push(OsString::from("--log-level"));
         command_args.push(OsString::from(log_level.to_string()));
@@ -66,69 +67,75 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         use service_manager::SystemdServiceManager;
-        
+
         let mut manager = SystemdServiceManager::system();
         // manager.config.unit.description = Some(description.clone());
-        
-        manager.install(ServiceInstallCtx {
-            label: label.clone(),
-            program: exe_path,
-            args: command_args,
-            contents: None,
-            username: None,
-            autostart: true,
-            environment: None,
-            restart_policy: RestartPolicy::default(),
-            working_directory: Some(exe_dir),
-        })
-        .context("Failed to install service")?;
+
+        manager
+            .install(ServiceInstallCtx {
+                label: label.clone(),
+                program: exe_path,
+                args: command_args,
+                contents: None,
+                username: None,
+                autostart: true,
+                environment: None,
+                restart_policy: RestartPolicy::default(),
+                working_directory: Some(exe_dir),
+            })
+            .context("Failed to install service")?;
     }
-    
+
     #[cfg(windows)]
     {
         let manager = <dyn ServiceManager>::native()
             .context("Failed to detect service management platform")?;
 
-        manager.install(ServiceInstallCtx {
-            label: label.clone(),
-            program: exe_path,
-            args: command_args,
-            contents: None,
-            username: None,
-            autostart: true,
-            environment: None,
-            restart_policy: RestartPolicy::default(),
-            working_directory: Some(exe_dir),
-        })
-        .context("Failed to install service")?;
+        manager
+            .install(ServiceInstallCtx {
+                label: label.clone(),
+                program: exe_path,
+                args: command_args,
+                contents: None,
+                username: None,
+                autostart: true,
+                environment: None,
+                restart_policy: RestartPolicy::default(),
+                working_directory: Some(exe_dir),
+            })
+            .context("Failed to install service")?;
 
         let output = std::process::Command::new("sc")
             .args(["description", SERVICE_LABEL, &description])
             .output()
             .context("Failed to set service description")?;
-        
+
         if !output.status.success() {
-            println!("Warning: Failed to set service description: {}", String::from_utf8_lossy(&output.stderr));
+            println!(
+                "Warning: Failed to set service description: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
-    
+
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         let manager = <dyn ServiceManager>::native()
             .context("Failed to detect service management platform")?;
 
-        manager.install(ServiceInstallCtx {
-            label: label.clone(),
-            program: exe_path,
-            args: command_args,
-            contents: None,
-            username: None,
-            autostart: true,
-            environment: None,
-            restart_policy: RestartPolicy::default(),
-            working_directory: Some(exe_dir),
-        })
-        .context("Failed to install service")?;
+        manager
+            .install(ServiceInstallCtx {
+                label: label.clone(),
+                program: exe_path,
+                args: command_args,
+                contents: None,
+                username: None,
+                autostart: true,
+                environment: None,
+                restart_policy: RestartPolicy::default(),
+                working_directory: Some(exe_dir),
+            })
+            .context("Failed to install service")?;
     }
 
     println!("Service installed successfully: {}", label);
@@ -138,18 +145,19 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
 pub fn uninstall_service() -> Result<()> {
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
 
-    let manager = <dyn ServiceManager>::native()
-        .context("Failed to detect service management platform")?;
+    let manager =
+        <dyn ServiceManager>::native().context("Failed to detect service management platform")?;
 
     let _ = manager.stop(ServiceStopCtx {
         label: label.clone(),
     });
     std::thread::sleep(std::time::Duration::from_secs(2));
-    
-    manager.uninstall(ServiceUninstallCtx {
-        label: label.clone(),
-    })
-    .context("Failed to uninstall service")?;
+
+    manager
+        .uninstall(ServiceUninstallCtx {
+            label: label.clone(),
+        })
+        .context("Failed to uninstall service")?;
 
     println!("Service uninstalled successfully");
     Ok(())
@@ -158,13 +166,14 @@ pub fn uninstall_service() -> Result<()> {
 pub fn start_service() -> Result<()> {
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
 
-    let manager = <dyn ServiceManager>::native()
-        .context("Failed to detect service management platform")?;
+    let manager =
+        <dyn ServiceManager>::native().context("Failed to detect service management platform")?;
 
-    manager.start(ServiceStartCtx {
-        label: label.clone(),
-    })
-    .context("Failed to start service")?;
+    manager
+        .start(ServiceStartCtx {
+            label: label.clone(),
+        })
+        .context("Failed to start service")?;
 
     println!("Service started successfully");
     Ok(())
@@ -173,13 +182,14 @@ pub fn start_service() -> Result<()> {
 pub fn stop_service() -> Result<()> {
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
 
-    let manager = <dyn ServiceManager>::native()
-        .context("Failed to detect service management platform")?;
+    let manager =
+        <dyn ServiceManager>::native().context("Failed to detect service management platform")?;
 
-    manager.stop(ServiceStopCtx {
-        label: label.clone(),
-    })
-    .context("Failed to stop service")?;
+    manager
+        .stop(ServiceStopCtx {
+            label: label.clone(),
+        })
+        .context("Failed to stop service")?;
 
     println!("Service stopped successfully");
     Ok(())
@@ -196,13 +206,14 @@ pub fn restart_service() -> Result<()> {
 pub fn status_service() -> Result<()> {
     let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
 
-    let manager = <dyn ServiceManager>::native()
-        .context("Failed to detect service management platform")?;
+    let manager =
+        <dyn ServiceManager>::native().context("Failed to detect service management platform")?;
 
-    let status = manager.status(ServiceStatusCtx {
-        label: label.clone(),
-    })
-    .context("Failed to get service status")?;
+    let status = manager
+        .status(ServiceStatusCtx {
+            label: label.clone(),
+        })
+        .context("Failed to get service status")?;
 
     match status {
         ServiceStatus::Running => {
@@ -226,8 +237,10 @@ pub fn status_service() -> Result<()> {
 #[cfg(windows)]
 mod windows_service {
     use anyhow::{Context, Result};
-    use tokio::sync::oneshot;
     use log::{error, info};
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
     use windows_service::{
         define_windows_service,
         service::{
@@ -237,8 +250,6 @@ mod windows_service {
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
     };
-    use std::ffi::OsString;
-    use std::sync::Mutex;
 
     use crate::config::Args;
     use crate::logging;
@@ -276,10 +287,7 @@ mod windows_service {
             .context("Failed to setup logging")?;
 
         // let working_dir = std::env::current_dir().ok();
-        info!(
-            "Rust Proxy Service starting... port={}",
-            args.port
-        );
+        info!("Rust Proxy Service starting...");
 
         let status_handle = service_control_handler::register(SERVICE_NAME, handle_control)
             .context("Failed to register service control handler")?;
@@ -348,8 +356,14 @@ mod windows_service {
     fn handle_control(control: ServiceControl) -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                info!("Received {} control signal", 
-                    if control == ServiceControl::Stop { "stop" } else { "shutdown" });
+                info!(
+                    "Received {} control signal",
+                    if control == ServiceControl::Stop {
+                        "stop"
+                    } else {
+                        "shutdown"
+                    }
+                );
                 if let Ok(mut tx) = SHUTDOWN_TX.lock() {
                     if let Some(sender) = tx.take() {
                         let _ = sender.send(());
@@ -357,9 +371,7 @@ mod windows_service {
                 }
                 ServiceControlHandlerResult::NoError
             }
-            ServiceControl::Interrogate => {
-                ServiceControlHandlerResult::NoError
-            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     }
@@ -373,8 +385,8 @@ pub fn run_as_service() -> Result<()> {
     use crate::config::Args;
     use crate::logging;
     use crate::server;
-    use tokio::runtime::Runtime;
     use log::{error, info};
+    use tokio::runtime::Runtime;
 
     let start_args = crate::parse_service_args();
     let args = Args::from_run_args(&start_args);
@@ -382,12 +394,10 @@ pub fn run_as_service() -> Result<()> {
     let effective_log_file = if args.log_file.is_some() {
         args.log_file.clone()
     } else {
-        std::env::current_exe()
-            .ok()
-            .map(|mut path| {
-                path.set_file_name("proxy.log");
-                path
-            })
+        std::env::current_exe().ok().map(|mut path| {
+            path.set_file_name("proxy.log");
+            path
+        })
     };
 
     logging::setup_logging(&effective_log_file, &args.log_level)

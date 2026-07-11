@@ -49,33 +49,36 @@ async fn accept_connections(
     loop {
         let accept_future = listener.accept();
 
-        // 如果有 shutdown 接收器，则同时监听接受连接和关闭信号
         let result = if let Some(shutdown) = shutdown_rx.as_mut() {
             tokio::select! {
-                res = accept_future => res,
+                res = accept_future => Some(res),
                 _ = shutdown => {
                     info!("Received shutdown signal, stopping server...");
                     info!("Waiting for {} active connections to complete...", join_set.len());
-                    // 等待所有正在处理的连接完成
                     while join_set.join_next().await.is_some() {}
                     info!("All active connections completed, server stopped");
                     return;
                 }
+                _ = join_set.join_next(), if !join_set.is_empty() => None,
             }
         } else {
-            accept_future.await
+            tokio::select! {
+                res = accept_future => Some(res),
+                _ = join_set.join_next(), if !join_set.is_empty() => None,
+            }
         };
 
         match result {
-            Ok((client, _addr)) => {
+            Some(Ok((client, _addr))) => {
                 let buffer_pool = Arc::clone(&buffer_pool);
                 join_set.spawn(async move {
                     handle_client(client, timeout, buffer_pool).await;
                 });
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 error!("Failed to accept connection: {}", e);
             }
+            None => {}
         }
     }
 }

@@ -16,3 +16,16 @@ log_level = "info"
 
 # 启用多线程运行时 (default: false)
 # multi_thread = false
+
+# 用户认证配置（可选）
+# 配置任意数量的 [[auth]] 段后，代理将要求客户端通过 HTTP Basic 认证
+# （携带 Proxy-Authorization 头）才能使用。省略整个 [[auth]] 段则不启用认证。
+# 客户端示例: curl -x http://admin:secret@127.0.0.1:8080 http://example.com
+#
+# [[auth]]
+# username = "admin"
+# password = "secret"
+#
+# [[auth]]
+# username = "user2"
+# password = "another-password"

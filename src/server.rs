@@ -23,6 +23,8 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
 
     // 初始化缓冲区池，用于零拷贝数据传输
     let buffer_pool = Arc::new(BufferPool::new());
+    // 认证用户列表包装为 Arc，零开销地分发给每个连接任务
+    let auth = Arc::new(args.auth.clone());
 
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -30,7 +32,7 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
 
     info!("rust_proxy is running");
 
-    accept_connections(listener, args.timeout, buffer_pool, shutdown_rx).await;
+    accept_connections(listener, args.timeout, buffer_pool, auth, shutdown_rx).await;
 
     Ok(())
 }
@@ -42,6 +44,7 @@ async fn accept_connections(
     listener: TcpListener,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
+    auth: Arc<Option<Vec<crate::config::AuthUser>>>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut join_set = JoinSet::new();
@@ -71,8 +74,9 @@ async fn accept_connections(
         match result {
             Some(Ok((client, _addr))) => {
                 let buffer_pool = Arc::clone(&buffer_pool);
+                let auth = Arc::clone(&auth);
                 join_set.spawn(async move {
-                    handle_client(client, timeout, buffer_pool).await;
+                    handle_client(client, timeout, buffer_pool, auth).await;
                 });
             }
             Some(Err(e)) => {

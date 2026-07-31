@@ -115,6 +115,18 @@ pub struct RunAsServiceArgs {
     pub run_args: ServerRunArgs,
 }
 
+/// 单个代理认证用户
+///
+/// 通过配置文件的 `[[auth]]` 段定义。配置后，客户端必须通过 HTTP Basic 认证
+/// （携带 `Proxy-Authorization` 头）才能使用代理。
+#[derive(Deserialize, Debug, Clone)]
+pub struct AuthUser {
+    /// 用户名
+    pub username: String,
+    /// 密码（明文存储于配置文件中）
+    pub password: String,
+}
+
 /// Final merged server configuration
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -123,6 +135,9 @@ pub struct Args {
     pub timeout: u64,
     pub log_level: LogLevel,
     pub multi_thread: bool,
+    /// 代理认证用户列表。为 `None` 时不启用认证；为 `Some(空)` 时表示
+    /// 配置了 `[auth]` 段但没有有效用户（此时任何客户端都无法通过认证）。
+    pub auth: Option<Vec<AuthUser>>,
 }
 
 impl Args {
@@ -177,6 +192,8 @@ impl Args {
                 .unwrap_or(Self::DEFAULT_LOG_LEVEL),
             multi_thread: run_args.multi_thread
                 || config.as_ref().map(|c| c.multi_thread).unwrap_or(false),
+            // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
+            auth: config.as_ref().and_then(|c| c.auth.clone()),
         }
     }
 
@@ -219,6 +236,8 @@ pub struct Config {
     /// Use multi-threaded runtime
     #[serde(default)]
     pub multi_thread: bool,
+    /// 代理认证用户列表。省略整个 `[[auth]]` 段时不启用认证。
+    pub auth: Option<Vec<AuthUser>>,
 }
 
 /// Load configuration from a TOML file
@@ -228,4 +247,55 @@ pub fn load_config(config_path: &PathBuf) -> Result<Config> {
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_auth_multiple_users() {
+        let toml_str = r#"
+port = 8080
+
+[[auth]]
+username = "admin"
+password = "secret"
+
+[[auth]]
+username = "user2"
+password = "pass2"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let auth = config.auth.expect("auth should be present");
+        assert_eq!(auth.len(), 2);
+        assert_eq!(auth[0].username, "admin");
+        assert_eq!(auth[0].password, "secret");
+        assert_eq!(auth[1].username, "user2");
+        assert_eq!(auth[1].password, "pass2");
+    }
+
+    #[test]
+    fn test_parse_no_auth_keeps_backward_compatibility() {
+        // 不配置 [[auth]] 段时应解析为 None，保持向后兼容
+        let toml_str = r#"
+port = 9090
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.auth.is_none());
+    }
+
+    #[test]
+    fn test_parse_single_auth_user() {
+        let toml_str = r#"
+[[auth]]
+username = "admin"
+password = "p@ss"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let auth = config.auth.expect("auth should be present");
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].username, "admin");
+        assert_eq!(auth[0].password, "p@ss");
+    }
 }

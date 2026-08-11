@@ -73,11 +73,15 @@ async fn handle_client_generic<S>(
     let n = match tokio::time::timeout(timeout_duration, client.read(buf_slice)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
-            error!("Failed to read from client {}: {}", client_addr, e);
+            if is_benign_close_error(&e) {
+                debug!("Read from client {} ended: {}", client_addr, e);
+            } else {
+                warn!("Failed to read from client {}: {}", client_addr, e);
+            }
             return;
         }
         Err(_) => {
-            error!("Read from client {} timed out", client_addr);
+            warn!("Read from client {} timed out", client_addr);
             return;
         }
     };
@@ -249,10 +253,18 @@ async fn handle_connect_generic<S>(
     match tokio::time::timeout(timeout_duration * 2, async {
         let (ct_result, tc_result) = tokio::join!(client_to_target, target_to_client);
         if let Err(e) = ct_result {
-            error!("Client to target copy error: {}", e);
+            if is_benign_close_error(&e) {
+                debug!("Client to target copy ended: {}", e);
+            } else {
+                warn!("Client to target copy error: {}", e);
+            }
         }
         if let Err(e) = tc_result {
-            error!("Target to client copy error: {}", e);
+            if is_benign_close_error(&e) {
+                debug!("Target to client copy ended: {}", e);
+            } else {
+                warn!("Target to client copy error: {}", e);
+            }
         }
     })
     .await
@@ -260,6 +272,23 @@ async fn handle_connect_generic<S>(
         Ok(_) => info!("CONNECT tunnel closed: {}:{}", host, port),
         Err(_) => debug!("CONNECT tunnel timed out: {}:{}", host, port),
     }
+}
+
+/// 判断 IO 错误是否为"对端正常/半正常关闭连接"类（不应记为 ERROR）
+///
+/// 这些错误在 TLS 隧道场景中极其常见，绝大多数并非代理本身的问题：
+/// - `UnexpectedEof`：TLS 对端未发送 close_notify 就关闭连接（浏览器、curl 等常用做法）
+/// - `ConnectionReset`：对端发送 TCP RST（移动网络切换、NAT 超时等）
+/// - `ConnectionAborted`：本地或对端中止连接
+/// - `BrokenPipe`：写入已关闭的管道（对端先关闭，己方仍在写）
+fn is_benign_close_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 /// Handle standard HTTP proxy request with buffer reuse（泛型版本，支持 TCP/TLS 客户端流）
@@ -376,11 +405,15 @@ async fn handle_http_request_generic<S>(
                 }
             }
             Ok(Err(e)) => {
-                error!("Error reading from {}:{}: {}", host, port, e);
+                if is_benign_close_error(&e) {
+                    debug!("Read from {}:{} ended: {}", host, port, e);
+                } else {
+                    warn!("Error reading from {}:{}: {}", host, port, e);
+                }
                 break;
             }
             Err(_) => {
-                error!("Response from {}:{} timed out", host, port);
+                warn!("Response from {}:{} timed out", host, port);
                 break;
             }
         }
@@ -567,6 +600,32 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_benign_close_error_classifies_tls_close_notify_as_benign() {
+        // rustls 对端未发送 close_notify 时返回的错误 → 应判定为良性
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify");
+        assert!(is_benign_close_error(&e),
+            "UnexpectedEof (TLS close_notify missing) must be benign");
+    }
+
+    #[test]
+    fn test_is_benign_close_error_classifies_network_resets_as_benign() {
+        // TCP RST / 连接中止 / 管道破裂 → 良性（网络中极常见）
+        assert!(is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+        assert!(is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::ConnectionAborted)));
+        assert!(is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+    }
+
+    #[test]
+    fn test_is_benign_close_error_rejects_real_errors() {
+        // 真异常不应降级（保留 warn/error 日志通道）
+        assert!(!is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(!is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::AddrInUse)));
+        assert!(!is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        assert!(!is_benign_close_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)));
+    }
 
     fn make_users() -> Vec<AuthUser> {
         vec![AuthUser {

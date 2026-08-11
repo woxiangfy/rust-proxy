@@ -2,7 +2,11 @@
 # Copy this file to config.toml and modify as needed
 # Command line arguments take precedence over config file settings
 
-# Port to bind (default: 8080)
+# Port to bind for HTTP proxy.
+# 启用规则：
+#   - 显式指定 port → 启用 HTTP 代理
+#   - 未指定 port 且未指定 https_port → 使用默认值 8080 启用 HTTP 代理
+#   - 未指定 port 但指定了 https_port → 不启用 HTTP 代理（仅 HTTPS 模式）
 port = 8080
 
 # Log file path (optional, defaults to console output)

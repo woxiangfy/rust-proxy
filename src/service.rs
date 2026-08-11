@@ -431,7 +431,15 @@ pub fn run_as_service() -> Result<()> {
     logging::setup_logging(&effective_log_file, &args.log_level)
         .context("Failed to setup logging")?;
 
-    info!("Rust Proxy Service starting... port={}", args.port);
+    match (args.port, args.tls.as_ref().map(|t| t.https_port)) {
+        (Some(http_port), Some(https_port)) => info!(
+            "Rust Proxy Service starting... HTTP port: {}, HTTPS port: {}",
+            http_port, https_port
+        ),
+        (Some(http_port), None) => info!("Rust Proxy Service starting... HTTP port: {}", http_port),
+        (None, Some(https_port)) => info!("Rust Proxy Service starting... HTTPS port: {} (HTTP disabled)", https_port),
+        (None, None) => info!("Rust Proxy Service starting... (no listener enabled)"),
+    }
 
     let runtime = if args.multi_thread {
         Runtime::new().context("Failed to create multi-thread Tokio runtime")?

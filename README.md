@@ -36,11 +36,12 @@
 
 ### 启用 HTTPS 代理接入
 
-启用 HTTPS 代理后，服务器会同时监听 HTTP 和 HTTPS 两个端口。客户端可通过任一协议接入代理：
+启用 HTTPS 代理后，服务器会监听 HTTPS 端口（如同时指定 `--port` 则还监听 HTTP 端口）。客户端可通过 HTTPS 协议接入代理：
 
-> **启用规则**：只有显式指定 `--https-port`（或配置文件 `https_port`）才会启用 HTTPS 代理监听。
-> 即使配置了 `--tls-cert` + `--tls-key` 但未指定 `--https-port`，也不会启用 HTTPS。
-> 若 `--https-port` 已指定但证书缺失或加载失败，会自动生成 10 年有效期自签证书并输出 warn 日志。
+> **启用规则**：
+> - **HTTPS**：只有显式指定 `--https-port`（或配置文件 `https_port`）才会启用。即使配置了 `--tls-cert` + `--tls-key` 但未指定 `--https-port`，也不会启用 HTTPS。
+>   - 若 `--https-port` 已指定但证书缺失或加载失败，会自动生成 10 年有效期自签证书并输出 warn 日志。
+> - **HTTP**：`--port` 默认值 8080。但若**只指定了 `--https-port` 而未指定 `--port`**，则不启用 HTTP 代理（仅 HTTPS 模式）。
 
 ```bash
 # 方式 A：使用自备证书
@@ -49,10 +50,14 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 # 启动代理（HTTP=8080，HTTPS=8443）
 ./rust-proxy start --tls-cert cert.pem --tls-key key.pem --https-port 8443
 
-# 方式 B：仅指定端口，让代理自动生成自签证书（适合测试，不推荐生产）
+# 方式 B：仅指定 HTTPS 端口，自动生成自签证书（适合测试，不推荐生产）
+# 由于未指定 --port，HTTP 代理不启用，仅监听 HTTPS
 ./rust-proxy start --https-port 8443
 
-# 通过 HTTP 接入代理（兼容模式）
+# 方式 C：同时启用 HTTP 和 HTTPS（需要同时指定 --port 和 --https-port）
+./rust-proxy start --port 8080 --https-port 8443 --tls-cert cert.pem --tls-key key.pem
+
+# 通过 HTTP 接入代理（仅当 --port 启用时可用）
 curl -x http://127.0.0.1:8080 https://example.com
 
 # 通过 HTTPS 接入代理（加密通道，防中间人篡改代理流量）
@@ -75,7 +80,7 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 
 | 参数             | 说明                              | 默认值                    |
 | -------------- | ------------------------------- | ---------------------- |
-| `--port`       | HTTP 监听端口                       | 8080                   |
+| `--port`       | HTTP 监听端口（不指定时：若同时未指定 `--https-port` 则默认 8080；否则不启用 HTTP） | 8080（条件默认）            |
 | `--timeout`    | 请求超时时间（秒）                       | 30                     |
 | `--log-level`  | 日志级别                            | info                   |
 | `--log-file`   | 日志文件路径                          | 无（输出到控制台）              |
@@ -138,7 +143,7 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 
 | 参数             | 说明           | 默认值                  |
 | -------------- | ------------ | -------------------- |
-| `--port`       | HTTP 监听端口    | 8080                 |
+| `--port`       | HTTP 监听端口（不指定时：若同时未指定 `--https-port` 则默认 8080；否则不启用 HTTP） | 8080（条件默认）            |
 | `--timeout`    | 请求超时时间（秒）    | 30                   |
 | `--log-level`  | 日志级别         | info                 |
 | `--log-file`   | 日志文件路径       | 可执行文件同目录下的 proxy.log |
@@ -179,7 +184,7 @@ rust-proxy server uninstall
 
 | 参数               | 说明                              | 默认值              |
 | ---------------- | ------------------------------- | ---------------- |
-| `--port`         | HTTP 监听端口                       | 8080             |
+| `--port`         | HTTP 监听端口（不指定时：若同时未指定 `--https-port` 则默认 8080；否则不启用 HTTP） | 8080（条件默认）        |
 | `--https-port`   | HTTPS 代理监听端口（显式指定后启用 HTTPS） | 无（不指定则不启用 HTTPS）   |
 | `--tls-cert`     | TLS 证书文件路径（PEM 格式）              | 无（缺失时自动生成自签证书）   |
 | `--tls-key`      | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无（缺失时自动生成自签证书）   |

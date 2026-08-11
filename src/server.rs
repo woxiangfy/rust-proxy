@@ -72,22 +72,41 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         None
     };
 
-    // ── 绑定 HTTP 端口 ──
-    let http_bind_addr = format!("0.0.0.0:{}", args.port);
-    info!("Binding HTTP address: {}", http_bind_addr);
-    let http_listener = TcpListener::bind(&http_bind_addr)
-        .await
-        .with_context(|| format!("Failed to bind HTTP to {}", http_bind_addr))?;
+    // ── 校验：HTTP 与 HTTPS 至少启用其一 ──
+    if args.port.is_none() && tls_reloader.is_none() {
+        anyhow::bail!(
+            "Neither HTTP nor HTTPS proxy is enabled. Specify --port and/or --https-port."
+        );
+    }
+
+    // ── 端口冲突检测（仅在两者都启用时检查） ──
+    if let (Some(http_port), Some(tls)) = (args.port, args.tls.as_ref()) {
+        if http_port == tls.https_port {
+            anyhow::bail!(
+                "HTTP port {} conflicts with HTTPS port {}; please specify different ports",
+                http_port,
+                tls.https_port
+            );
+        }
+    }
+
+    // ── 绑定 HTTP 端口（如启用） ──
+    let http_listener = if let Some(port) = args.port {
+        let http_bind_addr = format!("0.0.0.0:{}", port);
+        info!("Binding HTTP address: {}", http_bind_addr);
+        Some(
+            TcpListener::bind(&http_bind_addr)
+                .await
+                .with_context(|| format!("Failed to bind HTTP to {}", http_bind_addr))?,
+        )
+    } else {
+        info!("HTTP proxy disabled (only --https-port was specified)");
+        None
+    };
 
     // ── 绑定 HTTPS 端口（如启用） ──
     let https_listener = if let Some(reloader) = tls_reloader.as_ref() {
         let https_port = args.tls.as_ref().expect("tls config must exist").https_port;
-        if https_port == args.port {
-            anyhow::bail!(
-                "HTTPS port {} conflicts with HTTP port; please specify a different --https-port",
-                https_port
-            );
-        }
         let https_bind_addr = format!("0.0.0.0:{}", https_port);
         info!("Binding HTTPS address: {}", https_bind_addr);
         let listener = TcpListener::bind(&https_bind_addr)
@@ -100,24 +119,45 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
 
     // ── 启动日志 ──
     info!("rust_proxy is running");
-    if let Some(tls) = &args.tls {
-        let tls_reloader = tls_reloader.as_ref().expect("reloader must exist");
-        match &tls_reloader.source {
-            TlsSource::UserProvided { cert_path, .. } => info!(
-                "HTTP port: {}, HTTPS (TLS) port: {}, cert: {} (hot reload enabled, check every {}s)",
-                args.port,
-                tls.https_port,
-                cert_path.display(),
-                TLS_RELOAD_CHECK_INTERVAL_SECS
-            ),
-            TlsSource::AutoSelfSigned => info!(
-                "HTTP port: {}, HTTPS (TLS) port: {} (auto-generated self-signed cert)",
-                args.port,
-                tls.https_port
-            ),
+    match (args.port, &args.tls) {
+        (Some(http_port), Some(tls)) => {
+            let tls_reloader = tls_reloader.as_ref().expect("reloader must exist");
+            match &tls_reloader.source {
+                TlsSource::UserProvided { cert_path, .. } => info!(
+                    "HTTP port: {}, HTTPS (TLS) port: {}, cert: {} (hot reload enabled, check every {}s)",
+                    http_port,
+                    tls.https_port,
+                    cert_path.display(),
+                    TLS_RELOAD_CHECK_INTERVAL_SECS
+                ),
+                TlsSource::AutoSelfSigned => info!(
+                    "HTTP port: {}, HTTPS (TLS) port: {} (auto-generated self-signed cert, \
+                    {} years validity). NOT recommended for production use!",
+                    http_port,
+                    tls.https_port,
+                    SELF_SIGNED_VALIDITY_YEARS
+                ),
+            }
         }
-    } else {
-        info!("HTTP port: {} (TLS not enabled)", args.port);
+        (Some(http_port), None) => info!("HTTP port: {} (TLS not enabled)", http_port),
+        (None, Some(tls)) => {
+            let tls_reloader = tls_reloader.as_ref().expect("reloader must exist");
+            match &tls_reloader.source {
+                TlsSource::UserProvided { cert_path, .. } => info!(
+                    "HTTP disabled, HTTPS (TLS) port: {}, cert: {} (hot reload enabled, check every {}s)",
+                    tls.https_port,
+                    cert_path.display(),
+                    TLS_RELOAD_CHECK_INTERVAL_SECS
+                ),
+                TlsSource::AutoSelfSigned => info!(
+                    "HTTP disabled, HTTPS (TLS) port: {} (auto-generated self-signed cert, \
+                    {} years validity). NOT recommended for production use!",
+                    tls.https_port,
+                    SELF_SIGNED_VALIDITY_YEARS
+                ),
+            }
+        }
+        (None, None) => unreachable!("validated above: at least one listener is enabled"),
     }
 
     accept_connections_dual(
@@ -376,9 +416,14 @@ enum DualAccept {
     ),
 }
 
-/// 主循环：同时接受 HTTP 和 HTTPS（如启用）连接，共用线程池与优雅关闭逻辑
+/// 主循环：根据启用的 listener（HTTP/HTTPS）接受连接，共用线程池与优雅关闭逻辑
+///
+/// 支持三种模式：
+///   - 仅 HTTP（`http_listener=Some, https_listener=None`）
+///   - 仅 HTTPS（`http_listener=None, https_listener=Some`）
+///   - HTTP + HTTPS 双通道（两者都 `Some`）
 async fn accept_connections_dual(
-    http_listener: TcpListener,
+    http_listener: Option<TcpListener>,
     https_listener: Option<(TcpListener, Arc<TlsReloader>)>,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
@@ -386,6 +431,15 @@ async fn accept_connections_dual(
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut join_set = JoinSet::new();
+
+    if http_listener.is_none() && https_listener.is_none() {
+        error!("No listeners enabled, server cannot accept connections");
+        return;
+    }
+
+    // 提前克隆 HTTPS reloader 引用，供热重载 tick 触发时使用
+    let https_reloader: Option<Arc<TlsReloader>> =
+        https_listener.as_ref().map(|(_, r)| Arc::clone(r));
 
     // 证书热重载定时器：
     //   - 仅 HTTPS 启用 且 证书为"用户提供"（来自 PEM 文件）时才创建
@@ -401,96 +455,80 @@ async fn accept_connections_dual(
     };
 
     loop {
-        let http_accept = http_listener.accept();
+        // 每轮循环根据启用的 listener 构造 accept future；
+        // 未启用的 listener 用 pending() 占位，select 不会选中它的分支。
+        // 注意：先计算启用标志（避免后续对 tls_check_interval 的多重借用冲突）
+        let http_enabled = http_listener.is_some();
+        let https_enabled = https_listener.is_some();
+        let tick_enabled = tls_check_interval.is_some();
 
-        if let Some((https_listener, tls_reloader)) = https_listener.as_ref() {
-            // 双通道模式：HTTP + HTTPS
-            // 仅当需要热重载时才把 tls_tick 加入 select；否则跳过定时器分支
-            if let Some(interval) = tls_check_interval.as_mut() {
-                let tls_tick = interval.tick();
-                tokio::pin!(tls_tick);
-                let https_accept = https_listener.accept();
-                tokio::pin!(https_accept);
+        let http_accept = async {
+            match &http_listener {
+                Some(l) => l.accept().await,
+                None => std::future::pending::<std::io::Result<(tokio::net::TcpStream, SocketAddr)>>().await,
+            }
+        };
+        let https_accept = async {
+            match &https_listener {
+                Some((l, _)) => l.accept().await,
+                None => std::future::pending::<std::io::Result<(tokio::net::TcpStream, SocketAddr)>>().await,
+            }
+        };
+        let tls_tick = async {
+            match &mut tls_check_interval {
+                Some(iv) => iv.tick().await,
+                None => std::future::pending::<tokio::time::Instant>().await,
+            }
+        };
+        tokio::pin!(http_accept, https_accept, tls_tick);
 
-                let result = if let Some(shutdown) = shutdown_rx.as_mut() {
-                    tokio::select! {
-                        res = http_accept => Some(DualAccept::Http(res)),
-                        res = https_accept => Some(DualAccept::Https(res, Arc::clone(tls_reloader))),
-                        _ = &mut tls_tick => {
-                            handle_tls_reload(tls_reloader);
-                            continue;
-                        }
-                        _ = shutdown => {
-                            info!("Received shutdown signal, stopping server...");
-                            info!("Waiting for {} active connections to complete...", join_set.len());
-                            while join_set.join_next().await.is_some() {}
-                            info!("All active connections completed, server stopped");
-                            return;
-                        }
-                        _ = join_set.join_next(), if !join_set.is_empty() => continue,
-                    }
-                } else {
-                    tokio::select! {
-                        res = http_accept => Some(DualAccept::Http(res)),
-                        res = https_accept => Some(DualAccept::Https(res, Arc::clone(tls_reloader))),
-                        _ = &mut tls_tick => {
-                            handle_tls_reload(tls_reloader);
-                            continue;
-                        }
-                        _ = join_set.join_next(), if !join_set.is_empty() => continue,
-                    }
-                };
-                dispatch_accept_result(result, &mut join_set, timeout, &buffer_pool, &auth);
-            } else {
-                // 自签证书场景：无热重载定时器，仅 select HTTP/HTTPS/shutdown
-                let https_accept = https_listener.accept();
-                tokio::pin!(https_accept);
+        // HTTP/HTTPS 启用情况决定 select 分支是否参与（用条件守卫）
 
-                let result = if let Some(shutdown) = shutdown_rx.as_mut() {
-                    tokio::select! {
-                        res = http_accept => Some(DualAccept::Http(res)),
-                        res = https_accept => Some(DualAccept::Https(res, Arc::clone(tls_reloader))),
-                        _ = shutdown => {
-                            info!("Received shutdown signal, stopping server...");
-                            info!("Waiting for {} active connections to complete...", join_set.len());
-                            while join_set.join_next().await.is_some() {}
-                            info!("All active connections completed, server stopped");
-                            return;
-                        }
-                        _ = join_set.join_next(), if !join_set.is_empty() => continue,
-                    }
-                } else {
-                    tokio::select! {
-                        res = http_accept => Some(DualAccept::Http(res)),
-                        res = https_accept => Some(DualAccept::Https(res, Arc::clone(tls_reloader))),
-                        _ = join_set.join_next(), if !join_set.is_empty() => continue,
-                    }
-                };
-                dispatch_accept_result(result, &mut join_set, timeout, &buffer_pool, &auth);
+        let result: Option<DualAccept> = if let Some(shutdown) = shutdown_rx.as_mut() {
+            tokio::select! {
+                res = &mut http_accept, if http_enabled => Some(DualAccept::Http(res)),
+                res = &mut https_accept, if https_enabled => {
+                    let (_, reloader) = https_listener.as_ref().expect("https_accept fired means https_listener exists");
+                    Some(DualAccept::Https(res, Arc::clone(reloader)))
+                }
+                _ = &mut tls_tick, if tick_enabled => {
+                    handle_tls_reload(https_reloader.as_ref().expect("tick fired means reloader exists"));
+                    None
+                }
+                _ = shutdown => {
+                    drain_joinset(&mut join_set).await;
+                    return;
+                }
+                _ = join_set.join_next(), if !join_set.is_empty() => None,
             }
         } else {
-            // 单通道模式：仅 HTTP（未启用 TLS，不创建任何证书重载定时器）
-            let result = if let Some(shutdown) = shutdown_rx.as_mut() {
-                tokio::select! {
-                    res = http_accept => Some(DualAccept::Http(res)),
-                    _ = shutdown => {
-                        info!("Received shutdown signal, stopping server...");
-                        info!("Waiting for {} active connections to complete...", join_set.len());
-                        while join_set.join_next().await.is_some() {}
-                        info!("All active connections completed, server stopped");
-                        return;
-                    }
-                    _ = join_set.join_next(), if !join_set.is_empty() => continue,
+            tokio::select! {
+                res = &mut http_accept, if http_enabled => Some(DualAccept::Http(res)),
+                res = &mut https_accept, if https_enabled => {
+                    let (_, reloader) = https_listener.as_ref().expect("https_accept fired means https_listener exists");
+                    Some(DualAccept::Https(res, Arc::clone(reloader)))
                 }
-            } else {
-                tokio::select! {
-                    res = http_accept => Some(DualAccept::Http(res)),
-                    _ = join_set.join_next(), if !join_set.is_empty() => continue,
+                _ = &mut tls_tick, if tick_enabled => {
+                    handle_tls_reload(https_reloader.as_ref().expect("tick fired means reloader exists"));
+                    None
                 }
-            };
-            dispatch_accept_result(result, &mut join_set, timeout, &buffer_pool, &auth);
+                _ = join_set.join_next(), if !join_set.is_empty() => None,
+            }
+        };
+
+        if let Some(da) = result {
+            dispatch_accept_result(Some(da), &mut join_set, timeout, &buffer_pool, &auth);
         }
+        // result == None：定时器触发或 task 完成，直接进入下一轮循环
     }
+}
+
+/// 等待所有活跃连接完成（用于优雅关闭）
+async fn drain_joinset(join_set: &mut JoinSet<()>) {
+    info!("Received shutdown signal, stopping server...");
+    info!("Waiting for {} active connections to complete...", join_set.len());
+    while join_set.join_next().await.is_some() {}
+    info!("All active connections completed, server stopped");
 }
 
 /// 将 accept 结果分发到连接处理任务

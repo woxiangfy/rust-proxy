@@ -160,7 +160,11 @@ pub struct TlsConfig {
 /// Final merged server configuration
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub port: u16,
+    /// HTTP 代理监听端口
+    ///
+    /// - `Some(port)`：启用 HTTP 代理监听
+    /// - `None`：不启用 HTTP 代理（仅在用户指定了 `https_port` 但未指定 `port` 时出现）
+    pub port: Option<u16>,
     pub log_file: Option<PathBuf>,
     pub timeout: u64,
     pub log_level: LogLevel,
@@ -168,7 +172,7 @@ pub struct Args {
     /// 代理认证用户列表。为 `None` 时不启用认证；为 `Some(空)` 时表示
     /// 配置了 `[auth]` 段但没有有效用户（此时任何客户端都无法通过认证）。
     pub auth: Option<Vec<AuthUser>>,
-    /// TLS 配置。为 `None` 时仅监听普通 HTTP 端口。
+    /// TLS 配置。为 `None` 时不监听 HTTPS 端口。
     pub tls: Option<TlsConfig>,
 }
 
@@ -245,9 +249,18 @@ impl Args {
         };
 
         Args {
-            port: run_args.port
-                .or(config.as_ref().and_then(|c| c.port))
-                .unwrap_or(Self::DEFAULT_PORT),
+            // port 合并语义：
+            //   - port 显式指定 → Some(port)
+            //   - port 未指定 + https_port 显式指定 → None（仅 HTTPS 模式，不启用 HTTP）
+            //   - port 未指定 + https_port 未指定 → Some(DEFAULT_PORT)（默认仅 HTTP 模式）
+            port: match (
+                run_args.port.or(config.as_ref().and_then(|c| c.port)),
+                https_port.is_some(),
+            ) {
+                (Some(p), _) => Some(p),
+                (None, true) => None,
+                (None, false) => Some(Self::DEFAULT_PORT),
+            },
             log_file,
             timeout: run_args.timeout
                 .or(config.as_ref().and_then(|c| c.timeout))
@@ -542,6 +555,91 @@ tls_key = "key.pem"
         // 证书路径应解析为配置文件目录下的相对路径
         assert_eq!(tls.cert_path, Some(tmp_dir.join("cert.pem")));
         assert_eq!(tls.key_path, Some(tmp_dir.join("key.pem")));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_port_none_when_only_https_port_specified() {
+        // 新语义：指定 https_port 但未指定 port → args.port == None（仅 HTTPS 模式）
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: Some(8443),
+            tls_cert: None,
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.port, None, "port must be None when only https_port is specified");
+        assert!(args.tls.is_some(), "TLS must be enabled");
+    }
+
+    #[test]
+    fn test_port_uses_default_when_neither_specified() {
+        // 都未指定 → args.port == Some(DEFAULT_PORT)（默认仅 HTTP 模式）
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.port, Some(Args::DEFAULT_PORT));
+        assert!(args.tls.is_none(), "TLS must be disabled when https_port not specified");
+    }
+
+    #[test]
+    fn test_port_explicit_overrides_default() {
+        // 显式指定 port → 使用指定值（即使 https_port 也指定）
+        let run_args = ServerRunArgs {
+            config: None,
+            port: Some(9090),
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: Some(8443),
+            tls_cert: None,
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.port, Some(9090), "explicit port should be preserved");
+        assert!(args.tls.is_some());
+    }
+
+    #[test]
+    fn test_port_from_config_when_only_port_in_config() {
+        // 配置文件指定 port 但未指定 https_port → args.port == Some(配置 port)
+        let toml_str = r#"
+port = 7777
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_port_from_config_dir");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.port, Some(7777));
+        assert!(args.tls.is_none());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

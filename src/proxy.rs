@@ -433,6 +433,80 @@ fn parse_host_port(host_port: &str) -> Result<(&str, u16), String> {
     }
 }
 
+/// Extract `(username, password)` from the userinfo component of a proxy URL.
+///
+/// The `url` crate does not expose passwords by default (security feature),
+/// so we manually parse the `user:pass@host` portion from the raw URL string.
+///
+/// Returns `(None, None)` when no credentials are present.
+fn extract_userinfo(proxy_url: &str) -> (Option<String>, Option<String>) {
+    // Format: scheme://user:pass@host:port/path
+    // We look for '@' that separates userinfo from host, which must appear
+    // after "://" and before any '/', '?', or '#' in the authority component.
+    let after_scheme = match proxy_url.find("://") {
+        Some(idx) => &proxy_url[idx + 3..],
+        None => return (None, None),
+    };
+
+    // Find the last '@' before the authority ends (i.e. before '/', '?', '#')
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    if let Some(at_pos) = authority.rfind('@') {
+        let userinfo = &authority[..at_pos];
+        if userinfo.is_empty() {
+            return (None, None);
+        }
+        let (user, pass) = match userinfo.split_once(':') {
+            Some((u, p)) => (u.to_string(), p.to_string()),
+            None => (userinfo.to_string(), String::new()),
+        };
+        (Some(user), Some(pass))
+    } else {
+        (None, None)
+    }
+}
+
+/// Build `Proxy-Authorization: Basic <base64>` header value.
+///
+/// Credentials are resolved from (highest priority first):
+/// 1. Explicit `username`/`password` CLI arguments
+/// 2. `user:pass` embedded in the proxy URL (userinfo component)
+///
+/// Returns `None` when no credentials are provided at all.
+fn build_proxy_auth_header(
+    proxy_url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Option<String> {
+    let (user, pass) = match (username, password) {
+        (Some(u), Some(p)) => (u.to_string(), p.to_string()),
+        (Some(u), None) => (u.to_string(), String::new()),
+        (None, Some(p)) => {
+            // password given without username → empty user (matches curl behavior)
+            (String::new(), p.to_string())
+        }
+        (None, None) => {
+            // Fall back to URL userinfo (manual parsing, url crate hides password)
+            match extract_userinfo(proxy_url) {
+                (Some(u), Some(p)) => (u, p),
+                _ => return None,
+            }
+        }
+    };
+
+    // Format: Basic <base64(user:pass)>
+    let credentials = if pass.is_empty() {
+        user.to_string()
+    } else {
+        format!("{}:{}", user, pass)
+    };
+    let encoded = BASE64_STANDARD.encode(credentials.as_bytes());
+    Some(format!("Basic {}", encoded))
+}
+
 /// Test a proxy server.
 ///
 /// `proxy_url` 是代理服务器 URL，必须显式包含协议：
@@ -440,9 +514,18 @@ fn parse_host_port(host_port: &str) -> Result<(&str, u16), String> {
 ///   - `https://host:port` — 通过 TLS 连接代理，**跳过证书验证**
 ///     （等价于 `curl --proxy-insecure`），以支持自签证书场景
 ///
+/// 支持代理认证：
+///   - 在 URL 中嵌入：`http://user:pass@host:port`（curl 风格）
+///   - 或通过 `--username` / `--password` CLI 参数（优先级高于 URL）
+///
 /// `test_url` 是目标 URL，必须包含 `http://` 或 `https://` 协议头。
 /// 对 HTTPS 目标，会先通过代理建立 CONNECT 隧道，再与目标服务器做 TLS 握手。
-pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
+pub async fn test_proxy(
+    proxy_url: &str,
+    test_url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
     // 解析代理 URL，提取协议、主机、端口
     let proxy = url::Url::parse(proxy_url)
         .with_context(|| format!("Invalid proxy URL: {}. Must include http:// or https:// scheme.", proxy_url))?;
@@ -481,6 +564,9 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
         format!("{}:{}", host, port)
     };
 
+    // 解析代理认证（CLI 参数优先于 URL userinfo）
+    let proxy_auth_header = build_proxy_auth_header(proxy_url, username, password);
+
     let start = std::time::Instant::now();
     let tcp_stream = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(&proxy_addr))
         .await
@@ -506,11 +592,16 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
 
     // 对 HTTPS 目标：通过代理建立 CONNECT 隧道后再做 TLS
     let mut stream: Box<dyn AsyncStream> = if target_scheme == "https" {
-            // Establish CONNECT tunnel for HTTPS
-            let connect_req = format!(
-                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+            // Build CONNECT request with optional proxy auth header
+            let mut connect_req = format!(
+                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
                 host, port, host, port
             );
+            if let Some(ref auth) = proxy_auth_header {
+                connect_req.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+            }
+            connect_req.push_str("\r\n");
+
             let mut stream = proxy_stream;
             tokio::time::timeout(Duration::from_secs(30), stream.write_all(connect_req.as_bytes()))
                 .await
@@ -539,6 +630,15 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
 
             let connect_resp = String::from_utf8_lossy(&header_buf[..n]);
             let status_line = connect_resp.lines().next().unwrap_or("");
+
+            // Handle 407: proxy authentication required
+            if status_line.starts_with("HTTP/1.1 407") || status_line.starts_with("HTTP/1.0 407") {
+                anyhow::bail!(
+                    "CONNECT failed: {} — proxy requires authentication. \
+                     Provide credentials via URL (http://user:pass@host:port) or --username/--password flags.",
+                    status_line
+                );
+            }
             if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
                 anyhow::bail!("CONNECT failed: {}", status_line);
             }
@@ -560,14 +660,20 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
         test_url.to_string()
     };
 
-    let request = format!(
+    // Build final HTTP request with optional proxy auth header
+    let mut request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: rust-proxy/{}\r\n\
          Accept: */*\r\n\
-         Connection: close\r\n\r\n",
+         Connection: close\r\n",
         request_target, host_header, env!("CARGO_PKG_VERSION")
     );
+    if let Some(ref auth) = proxy_auth_header {
+        request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+    }
+    request.push_str("\r\n");
+
     tokio::time::timeout(Duration::from_secs(30), stream.write_all(request.as_bytes()))
         .await
         .with_context(|| "Timeout writing request")?
@@ -591,6 +697,9 @@ pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
 
     println!("Proxy:    {}", proxy_url);
     println!("Test URL: {}", test_url);
+    if let Some(ref auth) = proxy_auth_header {
+        println!("Auth:     Proxy-Authorization: {}", auth);
+    }
     println!("Duration: {:?}", elapsed);
     println!("Response:\n{}", response);
 
@@ -762,5 +871,83 @@ mod tests {
     fn test_extract_authorization_none_when_absent() {
         let req = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(extract_proxy_authorization(req), None);
+    }
+
+    // ─── extract_userinfo 测试 ───
+
+    #[test]
+    fn test_extract_userinfo_full_credentials() {
+        let (user, pass) = extract_userinfo("https://admin:secret@10.66.0.1:1011");
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_extract_userinfo_username_only() {
+        let (user, pass) = extract_userinfo("http://user@proxy.local:8080");
+        assert_eq!(user.as_deref(), Some("user"));
+        assert_eq!(pass.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_extract_userinfo_no_credentials() {
+        let (user, pass) = extract_userinfo("https://proxy.local:1011");
+        assert!(user.is_none());
+        assert!(pass.is_none());
+    }
+
+    #[test]
+    fn test_extract_userinfo_empty_at_sign() {
+        // 仅 @ 符号，无用户信息
+        let (user, pass) = extract_userinfo("http://@proxy.local:8080");
+        assert!(user.is_none());
+        assert!(pass.is_none());
+    }
+
+    #[test]
+    fn test_extract_userinfo_with_path() {
+        let (user, pass) = extract_userinfo("http://admin:secret@proxy.local:8080/some/path");
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_extract_userinfo_password_with_colon() {
+        // 密码包含冒号，按第一个冒号拆分
+        let (user, pass) = extract_userinfo("http://user:pass:word@proxy.local:8080");
+        assert_eq!(user.as_deref(), Some("user"));
+        assert_eq!(pass.as_deref(), Some("pass:word"));
+    }
+
+    // ─── build_proxy_auth_header 测试 ───
+
+    #[test]
+    fn test_build_proxy_auth_header_from_url_userinfo() {
+        let header = build_proxy_auth_header("http://admin:secret@proxy.local:8080", None, None);
+        assert_eq!(header.as_deref(), Some("Basic YWRtaW46c2VjcmV0"));
+    }
+
+    #[test]
+    fn test_build_proxy_auth_header_cli_overrides_url() {
+        // CLI 参数优先级高于 URL userinfo
+        let header = build_proxy_auth_header(
+            "http://admin:secret@proxy.local:8080",
+            Some("root"),
+            Some("pass123"),
+        );
+        assert_eq!(header.as_deref(), Some("Basic cm9vdDpwYXNzMTIz"));
+    }
+
+    #[test]
+    fn test_build_proxy_auth_header_no_credentials() {
+        let header = build_proxy_auth_header("http://proxy.local:8080", None, None);
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn test_build_proxy_auth_header_partial_cli_no_url() {
+        // 仅 --username 无 --password，URL 也无凭证
+        let header = build_proxy_auth_header("http://proxy.local:8080", Some("user"), None);
+        assert_eq!(header.as_deref(), Some("Basic dXNlcg=="));
     }
 }

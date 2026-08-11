@@ -54,10 +54,10 @@ fn main() -> Result<()> {
             let runtime = create_runtime(args.multi_thread)?;
             runtime.block_on(server::run_server(&args, None))?;
         }
-        Commands::Test { proxy_url, url } => {
+        Commands::Test { proxy_url, url, username, password } => {
             logging::setup_logging(&None, &LogLevel::Info)?;
             let runtime = create_runtime(false)?;
-            runtime.block_on(proxy::test_proxy(&proxy_url, &url))?;
+            runtime.block_on(proxy::test_proxy(&proxy_url, &url, username.as_deref(), password.as_deref()))?;
         }
         Commands::Server(server_args) => {
             let runtime = create_runtime(false)?;

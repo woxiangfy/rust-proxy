@@ -96,8 +96,15 @@ pub enum Commands {
     Test {
         /// 代理服务器 URL，必须包含 http:// 或 https:// 协议头
         /// 例：http://10.0.0.1:8080 / https://10.0.0.1:8443
+        /// 支持在 URL 中嵌入认证凭证：http://user:pass@host:port
         /// HTTPS 代理会跳过证书验证（等价于 curl --proxy-insecure），以支持自签证书
         proxy_url: String,
+        /// 代理用户名（优先级高于 URL 中的 userinfo 部分）
+        #[arg(long)]
+        username: Option<String>,
+        /// 代理密码（优先级高于 URL 中的 userinfo 部分）
+        #[arg(long)]
+        password: Option<String>,
         #[arg(default_value = "https://api.myip.la/cn")]
         url: String,
     },

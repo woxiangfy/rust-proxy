@@ -87,50 +87,58 @@ fn parse_service_args() -> ServerRunArgs {
         timeout: None,
         log_level: None,
         multi_thread: false,
+        https_port: None,
+        tls_cert: None,
+        tls_key: None,
     };
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" => {
-                if i + 1 < args.len() {
-                    start_args.port = args[i + 1].parse().ok();
-                    i += 2;
-                    continue;
-                }
+            "--port" if i + 1 < args.len() => {
+                start_args.port = args[i + 1].parse().ok();
+                i += 2;
+                continue;
             }
-            "--log-file" => {
-                if i + 1 < args.len() {
-                    start_args.log_file = Some(args[i + 1].clone().into());
-                    i += 2;
-                    continue;
-                }
+            "--log-file" if i + 1 < args.len() => {
+                start_args.log_file = Some(args[i + 1].clone().into());
+                i += 2;
+                continue;
             }
-            "--timeout" => {
-                if i + 1 < args.len() {
-                    start_args.timeout = args[i + 1].parse().ok();
-                    i += 2;
-                    continue;
-                }
+            "--timeout" if i + 1 < args.len() => {
+                start_args.timeout = args[i + 1].parse().ok();
+                i += 2;
+                continue;
             }
-            "--log-level" => {
-                if i + 1 < args.len() {
-                    start_args.log_level = args[i + 1].parse().ok();
-                    i += 2;
-                    continue;
-                }
+            "--log-level" if i + 1 < args.len() => {
+                start_args.log_level = args[i + 1].parse().ok();
+                i += 2;
+                continue;
             }
-            "--config" => {
-                if i + 1 < args.len() {
-                    start_args.config = Some(args[i + 1].clone().into());
-                    i += 2;
-                    continue;
-                }
+            "--config" if i + 1 < args.len() => {
+                start_args.config = Some(args[i + 1].clone().into());
+                i += 2;
+                continue;
             }
             "--run-as-service" => {}
             "--multi-thread" => {
                 start_args.multi_thread = true;
                 i += 1;
+                continue;
+            }
+            "--https-port" if i + 1 < args.len() => {
+                start_args.https_port = args[i + 1].parse().ok();
+                i += 2;
+                continue;
+            }
+            "--tls-cert" if i + 1 < args.len() => {
+                start_args.tls_cert = Some(args[i + 1].clone().into());
+                i += 2;
+                continue;
+            }
+            "--tls-key" if i + 1 < args.len() => {
+                start_args.tls_key = Some(args[i + 1].clone().into());
+                i += 2;
                 continue;
             }
             _ => {}

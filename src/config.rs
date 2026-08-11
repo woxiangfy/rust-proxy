@@ -75,6 +75,18 @@ pub struct ServerRunArgs {
     /// 启用多线程运行时（默认使用单线程）
     #[arg(long)]
     pub multi_thread: bool,
+
+    /// HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）
+    #[arg(long)]
+    pub https_port: Option<u16>,
+
+    /// TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供
+    #[arg(long)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供
+    #[arg(long)]
+    pub tls_key: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -127,6 +139,19 @@ pub struct AuthUser {
     pub password: String,
 }
 
+/// TLS 配置信息（证书+私钥+HTTPS监听端口）
+///
+/// 仅当同时提供了证书和私钥时才启用 HTTPS 代理监听。
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// HTTPS 代理监听端口
+    pub https_port: u16,
+    /// TLS 证书文件路径（PEM 格式）
+    pub cert_path: PathBuf,
+    /// TLS 私钥文件路径（PEM 格式）
+    pub key_path: PathBuf,
+}
+
 /// Final merged server configuration
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -138,23 +163,26 @@ pub struct Args {
     /// 代理认证用户列表。为 `None` 时不启用认证；为 `Some(空)` 时表示
     /// 配置了 `[auth]` 段但没有有效用户（此时任何客户端都无法通过认证）。
     pub auth: Option<Vec<AuthUser>>,
+    /// TLS 配置。为 `None` 时仅监听普通 HTTP 端口。
+    pub tls: Option<TlsConfig>,
 }
 
 impl Args {
     pub const DEFAULT_PORT: u16 = 8080;
+    pub const DEFAULT_HTTPS_PORT: u16 = 8443;
     pub const DEFAULT_TIMEOUT: u64 = 30;
     pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
     pub const DEFAULT_CONFIG_FILE: &'static str = "config.toml";
 
     fn find_default_config() -> Option<PathBuf> {
-        if let Some(current_dir) = std::env::current_dir().ok() {
+        if let Ok(current_dir) = std::env::current_dir() {
             let config_path = current_dir.join(Self::DEFAULT_CONFIG_FILE);
             if config_path.exists() && config_path.is_file() {
                 return Some(config_path);
             }
         }
         
-        if let Some(exe_path) = std::env::current_exe().ok() {
+        if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 let config_path = exe_dir.join(Self::DEFAULT_CONFIG_FILE);
                 if config_path.exists() && config_path.is_file() {
@@ -179,6 +207,35 @@ impl Args {
             }
         }
 
+        // TLS 配置合并：命令行参数优先于配置文件
+        // 只有同时提供证书和私钥时，才启用 TLS
+        let tls = {
+            let cert_path = run_args
+                .tls_cert
+                .clone()
+                .or_else(|| config.as_ref().and_then(|c| c.tls_cert.clone()));
+            let key_path = run_args
+                .tls_key
+                .clone()
+                .or_else(|| config.as_ref().and_then(|c| c.tls_key.clone()));
+            match (cert_path, key_path) {
+                (Some(cert), Some(key)) => {
+                    let cert_resolved = Self::resolve_path_relative_to_config(&cert, config_path.as_ref());
+                    let key_resolved = Self::resolve_path_relative_to_config(&key, config_path.as_ref());
+                    let https_port = run_args
+                        .https_port
+                        .or(config.as_ref().and_then(|c| c.https_port))
+                        .unwrap_or(Self::DEFAULT_HTTPS_PORT);
+                    Some(TlsConfig {
+                        https_port,
+                        cert_path: cert_resolved,
+                        key_path: key_resolved,
+                    })
+                }
+                _ => None,
+            }
+        };
+
         Args {
             port: run_args.port
                 .or(config.as_ref().and_then(|c| c.port))
@@ -194,7 +251,27 @@ impl Args {
                 || config.as_ref().map(|c| c.multi_thread).unwrap_or(false),
             // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
             auth: config.as_ref().and_then(|c| c.auth.clone()),
+            tls,
         }
+    }
+
+    /// 将相对路径解析为绝对路径（相对于配置文件所在目录）
+    fn resolve_path_relative_to_config(path: &PathBuf, config_path: Option<&PathBuf>) -> PathBuf {
+        if path.is_absolute() {
+            return path.clone();
+        }
+
+        if let Some(config_path) = config_path {
+            if let Some(config_dir) = config_path.parent() {
+                let resolved = config_dir.join(path);
+                if let Ok(canonical) = resolved.canonicalize() {
+                    return canonical;
+                }
+                return resolved;
+            }
+        }
+
+        path.clone()
     }
 
     fn resolve_log_file_path(log_file: &PathBuf, config_path: Option<&PathBuf>) -> PathBuf {
@@ -212,7 +289,7 @@ impl Args {
             }
         }
 
-        if let Some(exe_path) = std::env::current_exe().ok() {
+        if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 return exe_dir.join(log_file);
             }
@@ -238,6 +315,12 @@ pub struct Config {
     pub multi_thread: bool,
     /// 代理认证用户列表。省略整个 `[[auth]]` 段时不启用认证。
     pub auth: Option<Vec<AuthUser>>,
+    /// HTTPS 代理监听端口（需同时配置 tls_cert 和 tls_key）
+    pub https_port: Option<u16>,
+    /// TLS 证书文件路径（PEM 格式），需与 tls_key 同时配置
+    pub tls_cert: Option<PathBuf>,
+    /// TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置
+    pub tls_key: Option<PathBuf>,
 }
 
 /// Load configuration from a TOML file
@@ -297,5 +380,144 @@ password = "p@ss"
         assert_eq!(auth.len(), 1);
         assert_eq!(auth[0].username, "admin");
         assert_eq!(auth[0].password, "p@ss");
+    }
+
+    #[test]
+    fn test_parse_tls_full_config() {
+        // 完整 TLS 配置应正确解析
+        let toml_str = r#"
+port = 8080
+https_port = 8443
+tls_cert = "/etc/proxy/cert.pem"
+tls_key = "/etc/proxy/key.pem"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.https_port, Some(8443));
+        assert_eq!(
+            config.tls_cert.as_ref().map(|p| p.display().to_string()),
+            Some("/etc/proxy/cert.pem".into())
+        );
+        assert_eq!(
+            config.tls_key.as_ref().map(|p| p.display().to_string()),
+            Some("/etc/proxy/key.pem".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_tls_partial_config_uses_default_port() {
+        // 仅配置证书和私钥时，https_port 为 None，由 Args 合并时使用默认 8443
+        let toml_str = r#"
+tls_cert = "cert.pem"
+tls_key = "key.pem"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.https_port.is_none());
+        assert!(config.tls_cert.is_some());
+        assert!(config.tls_key.is_some());
+    }
+
+    #[test]
+    fn test_parse_no_tls_keeps_backward_compatibility() {
+        // 不配置 TLS 字段时，所有 TLS 相关字段应为 None
+        let toml_str = r#"
+port = 8080
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.https_port.is_none());
+        assert!(config.tls_cert.is_none());
+        assert!(config.tls_key.is_none());
+    }
+
+    #[test]
+    fn test_from_run_args_tls_enabled_when_both_cert_and_key_provided() {
+        // 同时提供证书和私钥时，Args.tls 应为 Some
+        let run_args = ServerRunArgs {
+            config: None,
+            port: Some(8080),
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: Some(9443),
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: Some("/tmp/key.pem".into()),
+        };
+        let args = Args::from_run_args(&run_args);
+        let tls = args.tls.expect("TLS should be enabled");
+        assert_eq!(tls.https_port, 9443);
+        assert_eq!(tls.cert_path.display().to_string(), "/tmp/cert.pem");
+        assert_eq!(tls.key_path.display().to_string(), "/tmp/key.pem");
+    }
+
+    #[test]
+    fn test_from_run_args_tls_disabled_when_only_cert_provided() {
+        // 仅提供证书而无私钥时，Args.tls 应为 None
+        let run_args = ServerRunArgs {
+            config: None,
+            port: Some(8080),
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: Some(9443),
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert!(args.tls.is_none(), "TLS should be disabled without key");
+    }
+
+    #[test]
+    fn test_from_run_args_tls_uses_default_https_port() {
+        // 提供证书和私钥但未指定 https_port 时，应使用 DEFAULT_HTTPS_PORT
+        let run_args = ServerRunArgs {
+            config: None,
+            port: Some(8080),
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: Some("/tmp/key.pem".into()),
+        };
+        let args = Args::from_run_args(&run_args);
+        let tls = args.tls.expect("TLS should be enabled");
+        assert_eq!(tls.https_port, Args::DEFAULT_HTTPS_PORT);
+    }
+
+    #[test]
+    fn test_from_run_args_command_line_overrides_config_tls() {
+        // 命令行参数的 https_port 应优先于配置文件
+        // 使用相对路径的证书文件（相对于配置文件目录解析）
+        let toml_str = r#"
+port = 8080
+https_port = 8443
+tls_cert = "cert.pem"
+tls_key = "key.pem"
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_tls_override_dir");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: Some(9999), // 命令行覆盖
+            tls_cert: None,
+            tls_key: None,
+        };
+        let args = Args::from_run_args(&run_args);
+        let tls = args.tls.expect("TLS should be enabled");
+        assert_eq!(tls.https_port, 9999, "命令行 https_port 应覆盖配置文件");
+        // 证书路径应解析为配置文件目录下的相对路径
+        assert_eq!(tls.cert_path, tmp_dir.join("cert.pem"));
+        assert_eq!(tls.key_path, tmp_dir.join("key.pem"));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

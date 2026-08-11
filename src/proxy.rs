@@ -16,12 +16,12 @@ use log::{debug, error, info, warn};
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
-/// Handle an HTTP proxy client connection with buffer reuse
+/// Handle an HTTP proxy client connection with buffer reuse (plain TCP entrypoint)
 ///
 /// `auth` 为 `None` 时不启用认证；为 `Some(用户列表)` 时要求客户端通过 HTTP Basic
 /// 认证（`Proxy-Authorization` 头），否则返回 407 并关闭连接。
 pub async fn handle_client(
-    mut client: TcpStream,
+    client: TcpStream,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<AuthUser>>>,
@@ -33,13 +33,42 @@ pub async fn handle_client(
             return;
         }
     };
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+}
 
+/// Handle an HTTP proxy client connection over a TLS-wrapped stream
+///
+/// 参数 `client_addr` 从 accept 时提前获取，因为 TlsStream 不直接暴露 peer_addr。
+pub async fn handle_client_tls<S>(
+    client: S,
+    client_addr: SocketAddr,
+    timeout: u64,
+    buffer_pool: Arc<BufferPool>,
+    auth: Arc<Option<Vec<AuthUser>>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+}
+
+/// 通用客户端连接处理逻辑（与具体传输层 TCP/TLS 无关）
+///
+/// 接受任意 AsyncRead + AsyncWrite 流，完成请求解析、认证、分发到 CONNECT 或 HTTP 处理。
+async fn handle_client_generic<S>(
+    mut client: S,
+    client_addr: SocketAddr,
+    timeout: u64,
+    buffer_pool: Arc<BufferPool>,
+    auth: Arc<Option<Vec<AuthUser>>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let timeout_duration = Duration::from_secs(timeout);
-    
+
     // Get a buffer from the pool (zero-copy, no allocation if available)
     let mut buf = buffer_pool.get();
     let buf_slice = buf.as_mut_slice();
-    
+
     // Read request data directly into the pooled buffer
     let n = match tokio::time::timeout(timeout_duration, client.read(buf_slice)).await {
         Ok(Ok(n)) => n,
@@ -52,20 +81,20 @@ pub async fn handle_client(
             return;
         }
     };
-    
+
     if n == 0 {
         return;
     }
-    
+
     // Use String::from_utf8_lossy without copying if possible
     let request_data = String::from_utf8_lossy(&buf_slice[..n]);
     let mut lines = request_data.lines();
-    
+
     let request_line = match lines.next() {
         Some(line) => line,
         None => return,
     };
-    
+
     info!("{} -> {}", client_addr, request_line);
 
     // Parse request
@@ -90,12 +119,12 @@ pub async fn handle_client(
 
     // Handle CONNECT method (HTTPS tunneling)
     if method == "CONNECT" {
-        handle_connect(client, url, client_addr, timeout_duration).await;
+        handle_connect_generic(client, url, client_addr, timeout_duration).await;
         return;
     }
 
     // Handle HTTP proxy request with buffer pool
-    handle_http_request(client, &request_data, client_addr, timeout_duration, buffer_pool).await;
+    handle_http_request_generic(client, &request_data, client_addr, timeout_duration, buffer_pool).await;
 }
 
 /// 校验请求中的 `Proxy-Authorization` 头是否符合配置的用户列表。
@@ -161,7 +190,9 @@ fn extract_proxy_authorization(request_data: &str) -> Option<&str> {
 }
 
 /// 向客户端发送 407 Proxy Authentication Required 响应，要求 Basic 认证。
-async fn send_auth_required(client: &mut TcpStream) {
+///
+/// 泛型版本兼容 TCP 和 TLS 流。
+async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     // Connection: close 使客户端重连时携带认证头重试
     let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
         Proxy-Authenticate: Basic realm=\"rust-proxy\"\r\n\
@@ -170,13 +201,15 @@ async fn send_auth_required(client: &mut TcpStream) {
     let _ = client.write_all(response.as_bytes()).await;
 }
 
-/// Handle CONNECT method for HTTPS tunneling
-async fn handle_connect(
-    client: TcpStream,
+/// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）
+async fn handle_connect_generic<S>(
+    client: S,
     host_port: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (host, port) = match parse_host_port(host_port) {
         Ok((h, p)) => (h, p),
         Err(e) => {
@@ -186,6 +219,7 @@ async fn handle_connect(
     };
 
     // 直接使用主机名连接，由操作系统负责 DNS 解析和缓存
+    // (&str, u16) 直接实现 ToSocketAddrs，无需额外的 String 分配
     let target = match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port))).await
     {
         Ok(Ok(t)) => t,
@@ -199,9 +233,10 @@ async fn handle_connect(
         }
     };
 
-    let (mut client_read, mut client_write) = client.into_split();
+    // 使用 tokio::io::split 将泛型流拆分为读写两半，便于双向 copy
+    let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut target_read, mut target_write) = target.into_split();
-    
+
     // Send 200 Connection Established
     if client_write.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
         return;
@@ -227,14 +262,16 @@ async fn handle_connect(
     }
 }
 
-/// Handle standard HTTP proxy request with buffer reuse
-async fn handle_http_request(
-    client: TcpStream,
+/// Handle standard HTTP proxy request with buffer reuse（泛型版本，支持 TCP/TLS 客户端流）
+async fn handle_http_request_generic<S>(
+    mut client: S,
     request_data: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
     buffer_pool: Arc<BufferPool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut lines = request_data.lines();
     let request_line = match lines.next() {
         Some(line) => line,
@@ -245,7 +282,7 @@ async fn handle_http_request(
     if parts.len() < 2 {
         return;
     }
-    
+
     let method = parts[0];
     let url = parts[1];
 
@@ -309,7 +346,7 @@ async fn handle_http_request(
         }
     }
     header_buffer.push_str("\r\n");
-    
+
     // Send headers in one write operation
     if target.write_all(header_buffer.as_bytes()).await.is_err() {
         return;
@@ -328,7 +365,6 @@ async fn handle_http_request(
     // Read response and forward to client using pooled buffer
     let mut response_buf = buffer_pool.get();
     let response_slice = response_buf.as_mut_slice();
-    let mut client = client;
 
     loop {
         match tokio::time::timeout(timeout_duration, target.read(response_slice)).await {

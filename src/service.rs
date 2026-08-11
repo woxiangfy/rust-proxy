@@ -62,6 +62,34 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from(log_level.to_string()));
     }
 
+    // HTTPS/TLS 配置参数
+    if let Some(https_port) = run_args.https_port {
+        command_args.push(OsString::from("--https-port"));
+        command_args.push(OsString::from(https_port.to_string()));
+    }
+    if let Some(tls_cert) = &run_args.tls_cert {
+        let tls_cert = if tls_cert.is_absolute() {
+            tls_cert.clone()
+        } else {
+            std::env::current_dir()
+                .context("Failed to get current directory")?
+                .join(tls_cert)
+        };
+        command_args.push(OsString::from("--tls-cert"));
+        command_args.push(OsString::from(tls_cert.display().to_string()));
+    }
+    if let Some(tls_key) = &run_args.tls_key {
+        let tls_key = if tls_key.is_absolute() {
+            tls_key.clone()
+        } else {
+            std::env::current_dir()
+                .context("Failed to get current directory")?
+                .join(tls_key)
+        };
+        command_args.push(OsString::from("--tls-key"));
+        command_args.push(OsString::from(tls_key.display().to_string()));
+    }
+
     let description = DEFAULT_SERVICE_DESCRIPTION.to_string();
 
     #[cfg(target_os = "linux")]

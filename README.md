@@ -2,14 +2,17 @@
 
 ## 简介
 
-rust-proxy 是一个轻量级 HTTP 代理服务器，支持异步高并发处理。AI辅组开发。
+rust-proxy 是一个轻量级 HTTP/HTTPS 代理服务器，支持异步高并发处理。AI辅组开发。
 
 ## 功能特性
 
-- HTTP/HTTPS 代理支持
+- HTTP/HTTPS 代理支持（CONNECT 隧道）
+- **HTTPS 代理接入支持（Secure Web Proxy）**：客户端可通过 HTTPS 协议接入代理服务器
 - 异步高并发处理
 - 支持多线程运行
 - 支持windows/linux平台, 可以安装为系统服务
+- HTTP Basic 代理认证（支持多用户）
+- 动态缓冲区池（自动扩缩容，零拷贝优化）
 
 ## 快速开始
 
@@ -29,6 +32,26 @@ rust-proxy 是一个轻量级 HTTP 代理服务器，支持异步高并发处理
 ./rust-proxy test 127.0.0.1:8080
 ```
 
+### 启用 HTTPS 代理接入
+
+启用 HTTPS 代理后，服务器会同时监听 HTTP 和 HTTPS 两个端口。客户端可通过任一协议接入代理：
+
+```bash
+# 生成自签证书（测试用，生产环境请使用 CA 签发的证书）
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# 启动代理（HTTP=8080，HTTPS=8443）
+./rust-proxy start --tls-cert cert.pem --tls-key key.pem --https-port 8443
+
+# 通过 HTTP 接入代理（兼容模式）
+curl -x http://127.0.0.1:8080 https://example.com
+
+# 通过 HTTPS 接入代理（加密通道，防中间人篡改代理流量）
+curl -x https://127.0.0.1:8443 --proxy-insecure https://example.com
+# 或指定 CA 证书验证代理身份：
+curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
+```
+
 ### 完整参数示例
 
 ```bash
@@ -43,11 +66,16 @@ rust-proxy 是一个轻量级 HTTP 代理服务器，支持异步高并发处理
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--port` | 监听端口 | 8080 |
+| `--port` | HTTP 监听端口 | 8080 |
 | `--timeout` | 请求超时时间（秒） | 30 |
 | `--log-level` | 日志级别 | info |
 | `--log-file` | 日志文件路径 | 无（输出到控制台） |
 | `--config` | 配置文件路径 | 自动寻找运行目录下的 config.toml |
+| `--https-port` | HTTPS 代理监听端口 | 8443（启用 TLS 时生效） |
+| `--tls-cert` | TLS 证书文件路径（PEM 格式） | 无 |
+| `--tls-key` | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无 |
+
+> **说明**：只有同时提供 `--tls-cert` 和 `--tls-key` 时才会启用 HTTPS 代理。证书/私钥支持相对路径（相对于配置文件目录解析）和绝对路径。
 
 ### test 命令
 
@@ -86,10 +114,13 @@ rust-proxy 是一个轻量级 HTTP 代理服务器，支持异步高并发处理
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--port` | 监听端口 | 8080 |
+| `--port` | HTTP 监听端口 | 8080 |
 | `--timeout` | 请求超时时间（秒） | 30 |
 | `--log-level` | 日志级别 | info |
 | `--log-file` | 日志文件路径 | 可执行文件同目录下的 proxy.log |
+| `--https-port` | HTTPS 代理监听端口 | 8443（启用 TLS 时生效） |
+| `--tls-cert` | TLS 证书文件路径 | 无 |
+| `--tls-key` | TLS 私钥文件路径 | 无 |
 
 #### 使用注意事项
 
@@ -124,11 +155,15 @@ rust-proxy server uninstall
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--port` | 监听端口 | 8080 |
+| `--port` | HTTP 监听端口 | 8080 |
+| `--https-port` | HTTPS 代理监听端口 | 8443（启用 TLS 时生效） |
+| `--tls-cert` | TLS 证书文件路径（PEM 格式） | 无 |
+| `--tls-key` | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无 |
 | `--timeout` | 请求超时时间（秒） | 30 |
 | `--log-level` | 日志级别 | info |
 | `--log-file` | 日志文件路径 | 无（输出到控制台） |
 | `--config` | 配置文件路径 | 自动寻找 |
+| `--multi-thread` | 启用多线程运行时 | false |
 
 ### 日志级别
 
@@ -149,7 +184,7 @@ rust-proxy server uninstall
 创建 `config.toml`：
 
 ```toml
-# 监听端口
+# HTTP 监听端口
 port = 8080
 
 # 日志文件路径（可选）
@@ -160,6 +195,18 @@ timeout = 60
 
 # 日志级别
 log_level = "info"
+
+# HTTPS 代理配置（可选）
+# 同时提供证书和私钥后，代理会额外监听 HTTPS 端口
+https_port = 8443
+tls_cert = "cert.pem"
+tls_key = "key.pem"
+
+# 代理认证配置（可选）
+# 配置后，客户端必须通过 HTTP Basic 认证才能使用代理
+# [[auth]]
+# username = "admin"
+# password = "secret"
 ```
 
 ### 配置优先级
@@ -197,6 +244,19 @@ log_level = "info"
 ./rust-proxy start --config config.toml --port 9090 --log-level debug
 ```
 
+### 方式四：启用 HTTPS 代理接入
+
+```bash
+# 命令行方式
+./rust-proxy start --tls-cert /etc/proxy/cert.pem --tls-key /etc/proxy/key.pem --https-port 8443
+
+# 配置文件方式（config.toml 中已配置 https_port/tls_cert/tls_key）
+./rust-proxy start --config /etc/proxy/config.toml
+
+# 安装为系统服务（含 HTTPS）
+./rust-proxy server install --port 8080 --tls-cert C:\certs\cert.pem --tls-key C:\certs\key.pem --https-port 8443
+```
+
 ## 代理设置
 
 ### 浏览器代理设置
@@ -215,6 +275,9 @@ curl -x http://127.0.0.1:8080 http://httpbin.org/ip
 
 # HTTPS测试（通过CONNECT隧道）
 curl -x http://127.0.0.1:8080 https://httpbin.org/ip
+
+# 通过 HTTPS 代理接入（需启用 TLS 监听）
+curl -x https://127.0.0.1:8443 --proxy-insecure https://httpbin.org/ip
 ```
 
 ### 命令行环境变量
@@ -293,6 +356,54 @@ sudo ./rust-proxy --log-file /var/log/proxy.log
 ### 4. HTTPS网站无法访问
 
 某些HTTPS网站可能不支持代理访问，属于正常现象。rust-proxy 通过 CONNECT 方法支持 HTTPS 隧道，但部分网站可能有访问限制。
+
+### 5. HTTPS 代理接入失败
+
+启用 HTTPS 代理接入（`--tls-cert` / `--tls-key`）时若启动失败，请检查：
+
+- 证书文件路径是否正确（相对路径相对于配置文件目录解析）
+- 证书文件是否为合法的 PEM 格式
+- 证书和私钥是否匹配
+- HTTP 端口与 HTTPS 端口是否冲突（`--port` 和 `--https-port` 不能相同）
+- 证书链是否完整（应包含中间证书，可使用 fullchain.pem）
+
+```bash
+# 验证证书文件格式
+openssl x509 -in cert.pem -text -noout
+
+# 验证私钥文件格式
+openssl rsa -in key.pem -check -noout
+```
+
+### 6. TLS 握手超时
+
+代理日志中出现 `TLS handshake timed out` 时，通常是客户端发起连接后未完成 TLS 握手。可能原因：
+
+- 客户端不支持服务器的 TLS 版本（rustls 默认支持 TLS 1.2 和 1.3）
+- 客户端未配置信任的服务器证书（自签证书需使用 `--proxy-insecure` 或导入 CA）
+- 网络中间设备拦截了 TLS 流量
+
+## 架构说明
+
+### 传输层抽象
+
+代理服务器支持两种传输模式，共用同一套请求处理逻辑：
+
+- **HTTP 模式**（默认）：监听明文 TCP，客户端通过 `http://host:port` 接入
+- **HTTPS 模式**（启用 TLS 后）：额外监听 TLS 加密端口，客户端通过 `https://host:port` 接入
+
+`proxy.rs` 中通过泛型 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关的请求处理，`server.rs` 负责 TCP/TLS 监听和 TLS 握手，握手成功后将 `TlsStream` 交给泛型处理函数。
+
+### 关键组件
+
+| 模块 | 职责 |
+|------|------|
+| `proxy.rs` | HTTP 请求解析、认证校验、CONNECT 隧道、HTTP 转发（泛型，支持 TCP/TLS 流） |
+| `server.rs` | 监听管理、TLS acceptor 构建、连接分发、优雅关闭 |
+| `config.rs` | 配置解析与合并（命令行 + TOML） |
+| `buffer_pool.rs` | 动态扩缩容的缓冲区池（零拷贝优化） |
+| `logging.rs` | 按天滚动的日志系统 |
+| `service.rs` | 系统服务安装与管理 |
 
 ## 日志级别选择建议
 

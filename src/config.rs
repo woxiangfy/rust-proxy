@@ -94,7 +94,10 @@ pub enum Commands {
     Start(ServerRunArgs),
 
     Test {
-        proxy_addr: String,
+        /// 代理服务器 URL，必须包含 http:// 或 https:// 协议头
+        /// 例：http://10.0.0.1:8080 / https://10.0.0.1:8443
+        /// HTTPS 代理会跳过证书验证（等价于 curl --proxy-insecure），以支持自签证书
+        proxy_url: String,
         #[arg(default_value = "https://api.myip.la/cn")]
         url: String,
     },
@@ -141,15 +144,17 @@ pub struct AuthUser {
 
 /// TLS 配置信息（证书+私钥+HTTPS监听端口）
 ///
-/// 仅当同时提供了证书和私钥时才启用 HTTPS 代理监听。
+/// **启用语义**：只有当用户**显式指定了 `https_port`**（命令行 `--https-port`
+/// 或配置文件 `https_port`）时才会启用 HTTPS 代理。
+/// 即使同时配置了 `tls_cert` + `tls_key` 但未指定 `https_port`，也**不会**启用 HTTPS。
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// HTTPS 代理监听端口
     pub https_port: u16,
-    /// TLS 证书文件路径（PEM 格式）
-    pub cert_path: PathBuf,
-    /// TLS 私钥文件路径（PEM 格式）
-    pub key_path: PathBuf,
+    /// TLS 证书文件路径（PEM 格式），None 表示需自动生成自签证书
+    pub cert_path: Option<PathBuf>,
+    /// TLS 私钥文件路径（PEM 格式），None 表示需自动生成自签证书
+    pub key_path: Option<PathBuf>,
 }
 
 /// Final merged server configuration
@@ -169,7 +174,6 @@ pub struct Args {
 
 impl Args {
     pub const DEFAULT_PORT: u16 = 8080;
-    pub const DEFAULT_HTTPS_PORT: u16 = 8443;
     pub const DEFAULT_TIMEOUT: u64 = 30;
     pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
     pub const DEFAULT_CONFIG_FILE: &'static str = "config.toml";
@@ -208,32 +212,36 @@ impl Args {
         }
 
         // TLS 配置合并：命令行参数优先于配置文件
-        // 只有同时提供证书和私钥时，才启用 TLS
-        let tls = {
+        // 新语义（严格）：
+        //   只有用户**显式指定 https_port**（命令行 --https-port 或配置 https_port）
+        //   才启用 HTTPS 代理。即使配置了 tls_cert + tls_key，未指定 https_port 也不启用。
+        //   - https_port 已指定 + cert+key 完整 → 使用用户证书（支持热重载）
+        //   - https_port 已指定 + cert/key 缺失/无效 → 自动生成 10 年自签证书
+        //   - https_port 未指定 → 不启用 HTTPS（忽略 cert+key 配置）
+        let https_port_from_cli = run_args.https_port;
+        let https_port_from_config = config.as_ref().and_then(|c| c.https_port);
+        let https_port = https_port_from_cli.or(https_port_from_config);
+
+        let tls = if let Some(port) = https_port {
+            // 用户显式启用了 HTTPS：携带 cert/key 路径（如有的话），由 server 层决定是否回退自签
             let cert_path = run_args
                 .tls_cert
                 .clone()
-                .or_else(|| config.as_ref().and_then(|c| c.tls_cert.clone()));
+                .or_else(|| config.as_ref().and_then(|c| c.tls_cert.clone()))
+                .map(|p| Self::resolve_path_relative_to_config(&p, config_path.as_ref()));
             let key_path = run_args
                 .tls_key
                 .clone()
-                .or_else(|| config.as_ref().and_then(|c| c.tls_key.clone()));
-            match (cert_path, key_path) {
-                (Some(cert), Some(key)) => {
-                    let cert_resolved = Self::resolve_path_relative_to_config(&cert, config_path.as_ref());
-                    let key_resolved = Self::resolve_path_relative_to_config(&key, config_path.as_ref());
-                    let https_port = run_args
-                        .https_port
-                        .or(config.as_ref().and_then(|c| c.https_port))
-                        .unwrap_or(Self::DEFAULT_HTTPS_PORT);
-                    Some(TlsConfig {
-                        https_port,
-                        cert_path: cert_resolved,
-                        key_path: key_resolved,
-                    })
-                }
-                _ => None,
-            }
+                .or_else(|| config.as_ref().and_then(|c| c.tls_key.clone()))
+                .map(|p| Self::resolve_path_relative_to_config(&p, config_path.as_ref()));
+            Some(TlsConfig {
+                https_port: port,
+                cert_path,
+                key_path,
+            })
+        } else {
+            // 未指定 https_port：不启用 HTTPS（即使配置了 cert/key 也忽略）
+            None
         };
 
         Args {
@@ -430,7 +438,7 @@ port = 8080
 
     #[test]
     fn test_from_run_args_tls_enabled_when_both_cert_and_key_provided() {
-        // 同时提供证书和私钥时，Args.tls 应为 Some
+        // 同时提供证书和私钥 + 显式 https_port → Args.tls 应为 Some
         let run_args = ServerRunArgs {
             config: None,
             port: Some(8080),
@@ -445,13 +453,21 @@ port = 8080
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
         assert_eq!(tls.https_port, 9443);
-        assert_eq!(tls.cert_path.display().to_string(), "/tmp/cert.pem");
-        assert_eq!(tls.key_path.display().to_string(), "/tmp/key.pem");
+        assert_eq!(
+            tls.cert_path.as_ref().map(|p| p.display().to_string()),
+            Some("/tmp/cert.pem".into())
+        );
+        assert_eq!(
+            tls.key_path.as_ref().map(|p| p.display().to_string()),
+            Some("/tmp/key.pem".into())
+        );
     }
 
     #[test]
     fn test_from_run_args_tls_disabled_when_only_cert_provided() {
-        // 仅提供证书而无私钥时，Args.tls 应为 None
+        // 新语义：显式 https_port → 必启用 HTTPS；
+        // 仅提供 cert 而无 key（cert/key 不完整）→ Args.tls 仍为 Some，
+        // cert_path=Some(key 文件缺失), key_path=None，由 server 层回退到自签证书
         let run_args = ServerRunArgs {
             config: None,
             port: Some(8080),
@@ -464,12 +480,18 @@ port = 8080
             tls_key: None,
         };
         let args = Args::from_run_args(&run_args);
-        assert!(args.tls.is_none(), "TLS should be disabled without key");
+        let tls = args.tls.expect(
+            "TLS should be enabled when https_port is explicitly set (even if only cert provided)",
+        );
+        assert_eq!(tls.https_port, 9443);
+        assert!(tls.cert_path.is_some());
+        assert!(tls.key_path.is_none());
     }
 
     #[test]
-    fn test_from_run_args_tls_uses_default_https_port() {
-        // 提供证书和私钥但未指定 https_port 时，应使用 DEFAULT_HTTPS_PORT
+    fn test_from_run_args_tls_disabled_when_no_https_port_even_with_cert_and_key() {
+        // 新语义（严格）：未指定 https_port → 不启用 HTTPS，
+        // 即使同时提供了 cert + key 也必须忽略
         let run_args = ServerRunArgs {
             config: None,
             port: Some(8080),
@@ -482,8 +504,10 @@ port = 8080
             tls_key: Some("/tmp/key.pem".into()),
         };
         let args = Args::from_run_args(&run_args);
-        let tls = args.tls.expect("TLS should be enabled");
-        assert_eq!(tls.https_port, Args::DEFAULT_HTTPS_PORT);
+        assert!(
+            args.tls.is_none(),
+            "TLS must NOT be enabled when https_port is not specified, even with cert+key"
+        );
     }
 
     #[test]
@@ -516,8 +540,8 @@ tls_key = "key.pem"
         let tls = args.tls.expect("TLS should be enabled");
         assert_eq!(tls.https_port, 9999, "命令行 https_port 应覆盖配置文件");
         // 证书路径应解析为配置文件目录下的相对路径
-        assert_eq!(tls.cert_path, tmp_dir.join("cert.pem"));
-        assert_eq!(tls.key_path, tmp_dir.join("key.pem"));
+        assert_eq!(tls.cert_path, Some(tmp_dir.join("cert.pem")));
+        assert_eq!(tls.key_path, Some(tmp_dir.join("key.pem")));
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

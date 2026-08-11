@@ -402,19 +402,45 @@ fn parse_host_port(host_port: &str) -> Result<(&str, u16), String> {
 
 /// Test a proxy server.
 ///
-/// For HTTP targets, sends an absolute-form GET request through the proxy.
-/// For HTTPS targets, opens a CONNECT tunnel and performs TLS to the origin.
+/// `proxy_url` 是代理服务器 URL，必须显式包含协议：
+///   - `http://host:port` — 通过明文 TCP 连接代理
+///   - `https://host:port` — 通过 TLS 连接代理，**跳过证书验证**
+///     （等价于 `curl --proxy-insecure`），以支持自签证书场景
 ///
-/// `proxy_addr` is the proxy host:port, e.g. `10.66.10.53:1010`.
-/// `test_url` is the target URL to fetch through the proxy.
-pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
+/// `test_url` 是目标 URL，必须包含 `http://` 或 `https://` 协议头。
+/// 对 HTTPS 目标，会先通过代理建立 CONNECT 隧道，再与目标服务器做 TLS 握手。
+pub async fn test_proxy(proxy_url: &str, test_url: &str) -> Result<()> {
+    // 解析代理 URL，提取协议、主机、端口
+    let proxy = url::Url::parse(proxy_url)
+        .with_context(|| format!("Invalid proxy URL: {}. Must include http:// or https:// scheme.", proxy_url))?;
+    let proxy_scheme = proxy.scheme();
+    if proxy_scheme != "http" && proxy_scheme != "https" {
+        anyhow::bail!(
+            "Proxy URL must start with http:// or https://, got: {}",
+            proxy_url
+        );
+    }
+    let proxy_host = proxy.host_str()
+        .with_context(|| format!("No host in proxy URL: {}", proxy_url))?
+        .to_string();
+    let proxy_port = proxy.port()
+        .unwrap_or(if proxy_scheme == "https" { 443 } else { 80 });
+    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+
+    // 解析目标 URL
     let parsed = url::Url::parse(test_url)
         .with_context(|| format!("Invalid test URL: {}", test_url))?;
+    let target_scheme = parsed.scheme();
+    if target_scheme != "http" && target_scheme != "https" {
+        anyhow::bail!(
+            "Test URL must start with http:// or https://, got: {}",
+            test_url
+        );
+    }
     let host = parsed.host_str()
         .with_context(|| format!("No host in URL: {}", test_url))?
         .to_string();
-    let scheme = parsed.scheme();
-    let default_port = if scheme == "https" { 443 } else { 80 };
+    let default_port = if target_scheme == "https" { 443 } else { 80 };
     let port = parsed.port().unwrap_or(default_port);
     let host_header = if port == default_port {
         host.clone()
@@ -423,18 +449,36 @@ pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
     };
 
     let start = std::time::Instant::now();
-    let stream = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(proxy_addr))
+    let tcp_stream = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(&proxy_addr))
         .await
         .with_context(|| format!("Timeout connecting to proxy {}", proxy_addr))?
         .with_context(|| format!("Failed to connect to proxy {}", proxy_addr))?;
 
-    let mut stream: Box<dyn AsyncStream> = if scheme == "https" {
+    // 若代理为 HTTPS：用 TLS 包装 TCP 连接
+    // danger_accept_invalid_certs=true 以支持自签证书（等价于 curl --proxy-insecure）
+    let proxy_stream: Box<dyn AsyncStream> = if proxy_scheme == "https" {
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        tls_builder.danger_accept_invalid_certs(true);
+        let native_connector = tls_builder.build()?;
+        let tls_connector = TlsConnector::from(native_connector);
+        Box::new(
+            tokio::time::timeout(Duration::from_secs(30), tls_connector.connect(&proxy_host, tcp_stream))
+                .await
+                .with_context(|| "Timeout during TLS handshake with proxy")?
+                .with_context(|| "TLS handshake with proxy failed")?,
+        )
+    } else {
+        Box::new(tcp_stream)
+    };
+
+    // 对 HTTPS 目标：通过代理建立 CONNECT 隧道后再做 TLS
+    let mut stream: Box<dyn AsyncStream> = if target_scheme == "https" {
             // Establish CONNECT tunnel for HTTPS
             let connect_req = format!(
                 "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
                 host, port, host, port
             );
-            let mut stream = stream;
+            let mut stream = proxy_stream;
             tokio::time::timeout(Duration::from_secs(30), stream.write_all(connect_req.as_bytes()))
                 .await
                 .with_context(|| "Timeout sending CONNECT")?
@@ -466,14 +510,14 @@ pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
                 anyhow::bail!("CONNECT failed: {}", status_line);
             }
 
-            // Upgrade to TLS
+            // Upgrade to TLS (use system CA roots to verify target cert)
             let cx = TlsConnector::from(native_tls::TlsConnector::new()?);
             Box::new(cx.connect(&host, stream).await?)
         } else {
-            Box::new(stream)
+            proxy_stream
         };
 
-    let request_target = if scheme == "https" {
+    let request_target = if target_scheme == "https" {
         format!(
             "{}{}",
             parsed.path(),
@@ -512,7 +556,7 @@ pub async fn test_proxy(proxy_addr: &str, test_url: &str) -> Result<()> {
     let elapsed = start.elapsed();
     let response = String::from_utf8_lossy(&buf);
 
-    println!("Proxy:    http://{}", proxy_addr);
+    println!("Proxy:    {}", proxy_url);
     println!("Test URL: {}", test_url);
     println!("Duration: {:?}", elapsed);
     println!("Response:\n{}", response);

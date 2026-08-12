@@ -87,6 +87,23 @@ pub struct ServerRunArgs {
     /// TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
+
+    /// 启用 PROXY Protocol 解析（v1/v2 自动检测）
+    ///
+    /// 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
+    /// `proxy_protocol on;` 转发真实客户端 IP 的场景。
+    /// 启用后，每个接入连接会先解析 PROXY Protocol 头，提取真实客户端
+    /// IP 用于日志和认证，而非使用 nginx/LB 的 IP。
+    #[arg(long)]
+    pub proxy_protocol: bool,
+
+    /// PROXY Protocol 可信代理 IP 列表
+    ///
+    /// 仅当 `proxy_protocol` 启用时生效。仅接受来自这些 IP 的连接
+    /// 发送的 PROXY Protocol 头，防止客户端伪造 IP。
+    /// 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
+    #[arg(long, value_delimiter = ',')]
+    pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -181,6 +198,10 @@ pub struct Args {
     pub auth: Option<Vec<AuthUser>>,
     /// TLS 配置。为 `None` 时不监听 HTTPS 端口。
     pub tls: Option<TlsConfig>,
+    /// 是否启用 PROXY Protocol 解析（v1/v2 自动检测）
+    pub proxy_protocol: bool,
+    /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
+    pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
 }
 
 impl Args {
@@ -280,6 +301,18 @@ impl Args {
             // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
             auth: config.as_ref().and_then(|c| c.auth.clone()),
             tls,
+            proxy_protocol: run_args.proxy_protocol
+                || config.as_ref().map(|c| c.proxy_protocol).unwrap_or(false),
+            proxy_protocol_trusted_ips: {
+                let cli_ips = run_args.proxy_protocol_trusted_ips.clone();
+                if !cli_ips.is_empty() {
+                    cli_ips
+                } else {
+                    config.as_ref()
+                        .map(|c| c.proxy_protocol_trusted_ips.clone())
+                        .unwrap_or_default()
+                }
+            },
         }
     }
 
@@ -349,6 +382,12 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     /// TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置
     pub tls_key: Option<PathBuf>,
+    /// 是否启用 PROXY Protocol 解析（v1/v2 自动检测）
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
+    #[serde(default)]
+    pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
 }
 
 /// Load configuration from a TOML file
@@ -469,6 +508,8 @@ port = 8080
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -498,6 +539,8 @@ port = 8080
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect(
@@ -522,6 +565,8 @@ port = 8080
             https_port: None,
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert!(
@@ -555,6 +600,8 @@ tls_key = "key.pem"
             https_port: Some(9999), // 命令行覆盖
             tls_cert: None,
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -578,6 +625,8 @@ tls_key = "key.pem"
             https_port: Some(8443),
             tls_cert: None,
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, None, "port must be None when only https_port is specified");
@@ -597,6 +646,8 @@ tls_key = "key.pem"
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(Args::DEFAULT_PORT));
@@ -616,6 +667,8 @@ tls_key = "key.pem"
             https_port: Some(8443),
             tls_cert: None,
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(9090), "explicit port should be preserved");
@@ -643,10 +696,109 @@ port = 7777
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(7777));
         assert!(args.tls.is_none());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ─── PROXY Protocol 可信 IP 测试 ───
+
+    #[test]
+    fn test_parse_proxy_protocol_trusted_ips_from_config() {
+        let toml_str = r#"
+port = 8080
+proxy_protocol = true
+proxy_protocol_trusted_ips = ["10.0.0.1", "192.168.1.100"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.proxy_protocol);
+        assert_eq!(config.proxy_protocol_trusted_ips.len(), 2);
+        assert_eq!(
+            config.proxy_protocol_trusted_ips[0],
+            "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            config.proxy_protocol_trusted_ips[1],
+            "192.168.1.100".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_proxy_protocol_trusted_ips_default_empty() {
+        let toml_str = r#"
+port = 8080
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.proxy_protocol_trusted_ips.is_empty());
+    }
+
+    #[test]
+    fn test_from_run_args_proxy_protocol_trusted_ips_cli_override() {
+        // CLI 参数应覆盖配置文件中的可信 IP
+        let toml_str = r#"
+port = 8080
+proxy_protocol = true
+proxy_protocol_trusted_ips = ["10.0.0.1"]
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_trusted_ips_dir");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let cli_ips = vec![
+            "192.168.1.1".parse().unwrap(),
+            "192.168.1.2".parse().unwrap(),
+        ];
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol: true,
+            proxy_protocol_trusted_ips: cli_ips.clone(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol_trusted_ips, cli_ips);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_from_run_args_proxy_protocol_trusted_ips_from_config() {
+        // CLI 未指定时应使用配置文件中的可信 IP
+        let toml_str = r#"
+port = 8080
+proxy_protocol = true
+proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_trusted_ips_dir2");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol: true,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol_trusted_ips.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -90,6 +90,8 @@ fn parse_service_args() -> ServerRunArgs {
         https_port: None,
         tls_cert: None,
         tls_key: None,
+        proxy_protocol: false,
+        proxy_protocol_trusted_ips: Vec::new(),
     };
 
     let mut i = 0;
@@ -138,6 +140,19 @@ fn parse_service_args() -> ServerRunArgs {
             }
             "--tls-key" if i + 1 < args.len() => {
                 start_args.tls_key = Some(args[i + 1].clone().into());
+                i += 2;
+                continue;
+            }
+            "--proxy-protocol" => {
+                start_args.proxy_protocol = true;
+                i += 1;
+                continue;
+            }
+            "--proxy-protocol-trusted-ips" if i + 1 < args.len() => {
+                start_args.proxy_protocol_trusted_ips = args[i + 1]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
                 i += 2;
                 continue;
             }

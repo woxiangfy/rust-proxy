@@ -90,6 +90,21 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from(tls_key.display().to_string()));
     }
 
+    if run_args.proxy_protocol {
+        command_args.push(OsString::from("--proxy-protocol"));
+    }
+
+    if !run_args.proxy_protocol_trusted_ips.is_empty() {
+        let ips_str = run_args
+            .proxy_protocol_trusted_ips
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        command_args.push(OsString::from("--proxy-protocol-trusted-ips"));
+        command_args.push(OsString::from(ips_str));
+    }
+
     let description = DEFAULT_SERVICE_DESCRIPTION.to_string();
 
     #[cfg(target_os = "linux")]

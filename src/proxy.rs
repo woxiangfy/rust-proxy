@@ -36,6 +36,22 @@ pub async fn handle_client(
     handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
 }
 
+/// Handle an HTTP proxy client connection with a pre-resolved address.
+///
+/// 用于 PROXY Protocol 场景：真实客户端 IP 从 PROXY Protocol 头提取，
+/// 而非从 `peer_addr()` 获取（后者返回的是 nginx/LB 的 IP）。
+pub async fn handle_client_with_addr<S>(
+    client: S,
+    client_addr: SocketAddr,
+    timeout: u64,
+    buffer_pool: Arc<BufferPool>,
+    auth: Arc<Option<Vec<AuthUser>>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+}
+
 /// Handle an HTTP proxy client connection over a TLS-wrapped stream
 ///
 /// 参数 `client_addr` 从 accept 时提前获取，因为 TlsStream 不直接暴露 peer_addr。

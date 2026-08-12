@@ -43,4 +43,26 @@ log_level = "info"
 #
 # https_port = 8443           # HTTPS 代理监听端口（必填，无默认值；不设置则不启用 HTTPS）
 # tls_cert = "cert.pem"       # TLS 证书文件路径（PEM 格式），可配置相对路径（相对于配置文件目录）
-# tls_key = "key.pem"         # TLS 私钥文件路径（PEM 格式，支持 PKCS#8 或 RSA）
+# tls_key = "key.pem"         # TLS 私钥文件路径（PEM 格式），支持 PKCS#8 或 RSA
+
+# PROXY Protocol 解析（可选，默认 false）
+# 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
+# `proxy_protocol on;` 转发真实客户端 IP 的场景。
+# 启用后，每个接入连接会先解析 PROXY Protocol 头（v1/v2 自动检测），
+# 提取真实客户端 IP 用于日志和认证。
+#
+# 安全提示：建议同时配置 proxy_protocol_trusted_ips 以限制仅接受
+# 来自可信代理 IP 的 PROXY Protocol 头，防止客户端伪造 IP。
+#
+# nginx 配置示例：
+#   stream {
+#       server {
+#           listen 443;
+#           proxy_pass $backend;
+#           ssl_preread on;
+#           proxy_protocol on;  # 启用 PROXY Protocol 转发真实 IP
+#       }
+#   }
+#
+# proxy_protocol = false
+# proxy_protocol_trusted_ips = ["10.0.0.1"]  # 仅接受来自 nginx IP 的 PROXY Protocol 头

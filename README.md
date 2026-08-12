@@ -88,8 +88,14 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--https-port` | HTTPS 代理监听端口（显式指定后启用 HTTPS） | 无（不指定则不启用 HTTPS）   |
 | `--tls-cert`   | TLS 证书文件路径（PEM 格式）              | 无（缺失时自动生成自签证书）      |
 | `--tls-key`    | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无（缺失时自动生成自签证书）      |
+| `--proxy-protocol` | 启用 PROXY Protocol 解析（v1/v2 自动检测），用于挂在 nginx/HAProxy 后的场景 | false            |
+| `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自这些 IP 的 PROXY Protocol 头 | 无（接受所有来源）            |
 
 > **启用规则**：只有显式指定 `--https-port` 才会启用 HTTPS 代理。若同时提供了合法 `--tls-cert` + `--tls-key`，则使用用户证书并支持热重载；若证书缺失或加载失败，则自动生成 10 年有效期自签证书（输出 warn 日志）。证书/私钥支持相对路径（相对于配置文件目录解析）和绝对路径。
+
+> **PROXY Protocol**：当代理服务部署在 nginx/HAProxy 后并通过 `proxy_protocol on;` 转发真实客户端 IP 时启用。启用后，每个接入连接会先解析 PROXY Protocol 头（自动识别 v1/v2 格式），提取真实客户端 IP 用于日志和认证。**必须**与上游反向代理同时启用，否则两端协议不匹配会导致连接异常。
+>
+> **安全提示**：建议同时配置 `--proxy-protocol-trusted-ips` 限制仅接受来自 nginx/HAProxy IP 的 PROXY Protocol 头，防止恶意客户端直接连接并伪造 IP。示例：`--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2`
 
 ### test 命令
 
@@ -150,6 +156,8 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--https-port` | HTTPS 代理监听端口（显式指定后启用 HTTPS） | 无（不指定则不启用 HTTPS） |
 | `--tls-cert`   | TLS 证书文件路径   | 无（缺失时自动生成自签证书）                    |
 | `--tls-key`    | TLS 私钥文件路径   | 无（缺失时自动生成自签证书）                    |
+| `--proxy-protocol` | 启用 PROXY Protocol 解析（用于挂在 nginx/HAProxy 后的场景） | false            |
+| `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔） | 无（接受所有来源）            |
 
 #### 使用注意事项
 
@@ -193,6 +201,8 @@ rust-proxy server uninstall
 | `--log-file`     | 日志文件路径                          | 无（输出到控制台）        |
 | `--config`       | 配置文件路径                          | 自动寻找             |
 | `--multi-thread` | 启用多线程运行时                        | false            |
+| `--proxy-protocol` | 启用 PROXY Protocol 解析（v1/v2 自动检测），用于挂在 nginx/HAProxy 后的场景 | false            |
+| `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自可信 IP 的 PROXY Protocol 头 | 无（接受所有来源）            |
 
 ### 日志级别
 
@@ -239,6 +249,15 @@ tls_key = "key.pem"
 # [[auth]]
 # username = "admin"
 # password = "secret"
+
+# PROXY Protocol 解析（可选，默认 false）
+# 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
+# `proxy_protocol on;` 转发真实客户端 IP 的场景。
+# 启用后，每个接入连接会先解析 PROXY Protocol 头（v1/v2 自动检测），
+# 提取真实客户端 IP 用于日志和认证。
+# 安全提示：建议配置 proxy_protocol_trusted_ips 限制仅接受来自可信代理 IP 的头。
+# proxy_protocol = false
+# proxy_protocol_trusted_ips = ["10.0.0.1"]
 ```
 
 ### 配置优先级
@@ -288,6 +307,38 @@ tls_key = "key.pem"
 # 安装为系统服务（含 HTTPS）
 ./rust-proxy server install --port 8080 --tls-cert C:\certs\cert.pem --tls-key C:\certs\key.pem --https-port 8443
 ```
+
+### 方式五：挂在 nginx/HAProxy 后（PROXY Protocol）
+
+当代理服务部署在 nginx/HAProxy 后面、通过 SNI 分流并使用 `proxy_protocol on;` 转发真实客户端 IP 时，必须启用 `--proxy-protocol` 以正确解析 PROXY Protocol 头。否则代理服务会因首字节非 HTTP/CONNECT 协议而处理异常。
+
+```bash
+# 命令行方式（推荐同时指定可信代理 IP）
+./rust-proxy start --https-port 8443 --tls-cert cert.pem --tls-key key.pem \
+    --proxy-protocol --proxy-protocol-trusted-ips 10.0.0.1
+
+# 配置文件方式（config.toml 中已设置 proxy_protocol = true）
+./rust-proxy start --config /etc/proxy/config.toml
+
+# 安装为系统服务
+./rust-proxy server install --https-port 8443 --tls-cert C:\certs\cert.pem \
+    --tls-key C:\certs\key.pem --proxy-protocol --proxy-protocol-trusted-ips 10.0.0.1
+```
+
+对应的 nginx 配置示例：
+
+```nginx
+stream {
+    server {
+        listen 443;
+        proxy_pass $backend;     # $backend 指向 rust-proxy 的 HTTPS 端口
+        ssl_preread on;          # 通过 SNI 分流
+        proxy_protocol on;       # 启用 PROXY Protocol 转发真实 IP
+    }
+}
+```
+
+> **注意**：`--proxy-protocol` 必须与上游反向代理同时启用或同时关闭，两端协议不匹配会导致连接异常。启用后所有接入连接都会先尝试解析 PROXY Protocol 头（v1/v2 自动检测），解析失败会丢弃该连接并输出 warn 日志。
 
 ## 代理设置
 

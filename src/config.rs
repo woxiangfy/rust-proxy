@@ -55,6 +55,44 @@ pub struct Cli {
     pub command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocolMode {
+    /// 完全禁用 PROXY Protocol
+    Disable,
+    /// 自动检测（默认）：连接开头匹配 PROXY v1/v2 签名时解析，否则按普通流量处理
+    #[default]
+    Auto,
+    /// 强制要求：所有连接必须以 PROXY Protocol 头开头，否则断开
+    Require,
+}
+
+impl std::fmt::Display for ProxyProtocolMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyProtocolMode::Disable => write!(f, "disable"),
+            ProxyProtocolMode::Auto => write!(f, "auto"),
+            ProxyProtocolMode::Require => write!(f, "require"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProxyProtocolMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "disable" | "off" | "false" => Ok(ProxyProtocolMode::Disable),
+            "auto" | "detect" => Ok(ProxyProtocolMode::Auto),
+            "require" | "on" | "true" | "forced" => Ok(ProxyProtocolMode::Require),
+            _ => Err(format!(
+                "Invalid proxy_protocol mode: {} (valid: disable, auto, require)",
+                s
+            )),
+        }
+    }
+}
+
 #[derive(clap::Parser, Debug, Clone)]
 pub struct ServerRunArgs {
     #[arg(long)]
@@ -88,19 +126,24 @@ pub struct ServerRunArgs {
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
-    /// 启用 PROXY Protocol 解析（v1/v2 自动检测）
+    /// PROXY Protocol 模式（disable / auto / require）
     ///
-    /// 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
-    /// `proxy_protocol on;` 转发真实客户端 IP 的场景。
-    /// 启用后，每个接入连接会先解析 PROXY Protocol 头，提取真实客户端
-    /// IP 用于日志和认证，而非使用 nginx/LB 的 IP。
+    /// - `disable`：完全禁用 PROXY Protocol（默认）
+    /// - `auto`：自动检测，连接开头匹配 PROXY v1/v2 签名时解析，否则按普通流量处理
+    /// - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
+    ///
+    /// 兼容旧参数 `--proxy-protocol`（等价于 `--proxy-protocol-mode require`）。
+    #[arg(long, value_name = "MODE")]
+    pub proxy_protocol_mode: Option<ProxyProtocolMode>,
+
+    /// 启用 PROXY Protocol 解析（等价于 --proxy-protocol-mode require）
     #[arg(long)]
     pub proxy_protocol: bool,
 
     /// PROXY Protocol 可信代理 IP 列表
     ///
-    /// 仅当 `proxy_protocol` 启用时生效。仅接受来自这些 IP 的连接
-    /// 发送的 PROXY Protocol 头，防止客户端伪造 IP。
+    /// 仅当 `proxy_protocol_mode` 为 auto/require 时生效。
+    /// 仅接受来自这些 IP 的连接发送的 PROXY Protocol 头，防止客户端伪造 IP。
     /// 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
     #[arg(long, value_delimiter = ',')]
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
@@ -198,8 +241,8 @@ pub struct Args {
     pub auth: Option<Vec<AuthUser>>,
     /// TLS 配置。为 `None` 时不监听 HTTPS 端口。
     pub tls: Option<TlsConfig>,
-    /// 是否启用 PROXY Protocol 解析（v1/v2 自动检测）
-    pub proxy_protocol: bool,
+    /// PROXY Protocol 解析模式
+    pub proxy_protocol: ProxyProtocolMode,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
 }
@@ -301,8 +344,29 @@ impl Args {
             // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
             auth: config.as_ref().and_then(|c| c.auth.clone()),
             tls,
-            proxy_protocol: run_args.proxy_protocol
-                || config.as_ref().map(|c| c.proxy_protocol).unwrap_or(false),
+            // PROXY Protocol 模式合并优先级：
+            // 1. CLI --proxy-protocol-mode（显式指定优先级最高）
+            // 2. CLI --proxy-protocol（旧参数，等价于 Require）
+            // 3. 配置文件 proxy_protocol_mode / proxy_protocol
+            // 4. 默认 Auto（自动检测）
+            proxy_protocol: {
+                let cli_mode = run_args.proxy_protocol_mode;
+                let cli_flag = run_args.proxy_protocol;
+                let cfg_mode = config.as_ref().and_then(|c| c.proxy_protocol_mode);
+                let cfg_flag = config.as_ref().map(|c| c.proxy_protocol).unwrap_or(false);
+
+                if let Some(m) = cli_mode {
+                    m
+                } else if cli_flag {
+                    ProxyProtocolMode::Require
+                } else if let Some(m) = cfg_mode {
+                    m
+                } else if cfg_flag {
+                    ProxyProtocolMode::Require
+                } else {
+                    ProxyProtocolMode::Auto
+                }
+            },
             proxy_protocol_trusted_ips: {
                 let cli_ips = run_args.proxy_protocol_trusted_ips.clone();
                 if !cli_ips.is_empty() {
@@ -382,7 +446,9 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     /// TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置
     pub tls_key: Option<PathBuf>,
-    /// 是否启用 PROXY Protocol 解析（v1/v2 自动检测）
+    /// PROXY Protocol 模式（disable / auto / require）
+    pub proxy_protocol_mode: Option<ProxyProtocolMode>,
+    /// 是否启用 PROXY Protocol 解析（旧字段，等价于 require 模式，为了向后兼容保留）
     #[serde(default)]
     pub proxy_protocol: bool,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
@@ -508,6 +574,7 @@ port = 8080
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -539,6 +606,7 @@ port = 8080
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -565,6 +633,7 @@ port = 8080
             https_port: None,
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -600,6 +669,7 @@ tls_key = "key.pem"
             https_port: Some(9999), // 命令行覆盖
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -625,6 +695,7 @@ tls_key = "key.pem"
             https_port: Some(8443),
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -646,6 +717,7 @@ tls_key = "key.pem"
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -667,6 +739,7 @@ tls_key = "key.pem"
             https_port: Some(8443),
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -696,6 +769,7 @@ port = 7777
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
         };
@@ -763,6 +837,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1"]
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: cli_ips.clone(),
         };
@@ -794,11 +869,215 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             https_port: None,
             tls_cert: None,
             tls_key: None,
+            proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol_trusted_ips.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ─── ProxyProtocolMode 枚举单元测试 ───
+
+    #[test]
+    fn test_pp_mode_default_is_auto() {
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+    }
+
+    #[test]
+    fn test_pp_mode_cli_flag_true_is_require() {
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: true,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Require);
+    }
+
+    #[test]
+    fn test_pp_mode_cli_mode_overrides_flag() {
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: Some(ProxyProtocolMode::Auto),
+            proxy_protocol: true,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+    }
+
+    #[test]
+    fn test_pp_mode_from_config_mode_field() {
+        let toml_str = r#"
+port = 8080
+proxy_protocol_mode = "auto"
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_mode_cfg");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_pp_mode_config_flag_true_maps_to_require() {
+        let toml_str = r#"
+port = 8080
+proxy_protocol = true
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_mode_flag_cfg");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Require);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_pp_mode_config_disable_overrides_default_auto() {
+        // 默认是 Auto，但配置文件显式指定 disable 应覆盖默认
+        let toml_str = r#"
+port = 8080
+proxy_protocol_mode = "disable"
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_mode_disable_cfg");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Disable);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_pp_mode_fromstr_aliases() {
+        use std::str::FromStr;
+        assert_eq!(
+            ProxyProtocolMode::from_str("disable").unwrap(),
+            ProxyProtocolMode::Disable
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("off").unwrap(),
+            ProxyProtocolMode::Disable
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("false").unwrap(),
+            ProxyProtocolMode::Disable
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("auto").unwrap(),
+            ProxyProtocolMode::Auto
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("detect").unwrap(),
+            ProxyProtocolMode::Auto
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("require").unwrap(),
+            ProxyProtocolMode::Require
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("on").unwrap(),
+            ProxyProtocolMode::Require
+        );
+        assert_eq!(
+            ProxyProtocolMode::from_str("true").unwrap(),
+            ProxyProtocolMode::Require
+        );
+        assert!(ProxyProtocolMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_pp_mode_display_roundtrip() {
+        for mode in [
+            ProxyProtocolMode::Disable,
+            ProxyProtocolMode::Auto,
+            ProxyProtocolMode::Require,
+        ] {
+            let s = mode.to_string();
+            assert_eq!(s.parse::<ProxyProtocolMode>().unwrap(), mode);
+        }
     }
 }

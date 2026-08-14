@@ -160,15 +160,19 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         (None, None) => unreachable!("validated above: at least one listener is enabled"),
     }
 
-    if args.proxy_protocol {
-        info!("PROXY Protocol: enabled (v1/v2 auto-detect)");
-        if !args.proxy_protocol_trusted_ips.is_empty() {
-            info!(
-                "PROXY Protocol trusted IPs: {:?}",
-                args.proxy_protocol_trusted_ips
-            );
-        } else {
-            info!("PROXY Protocol: no trusted IP whitelist (accepting from all sources)");
+    use crate::config::ProxyProtocolMode;
+    match args.proxy_protocol {
+        ProxyProtocolMode::Disable => {}
+        mode @ (ProxyProtocolMode::Auto | ProxyProtocolMode::Require) => {
+            info!("PROXY Protocol: mode={} (v1/v2 auto-detect)", mode);
+            if !args.proxy_protocol_trusted_ips.is_empty() {
+                info!(
+                    "PROXY Protocol trusted IPs: {:?}",
+                    args.proxy_protocol_trusted_ips
+                );
+            } else {
+                info!("PROXY Protocol: no trusted IP whitelist (accepting from all sources)");
+            }
         }
     }
 
@@ -456,43 +460,94 @@ const PP_MAX_HEADER_LEN: usize = 512;
 /// PROXY Protocol 头部读取超时（秒），防止慢速攻击（slowloris）
 const PP_HEADER_TIMEOUT_SECS: u64 = 10;
 
-/// 解析 PROXY Protocol 头，取得流所有权并返回真实客户端地址。
+/// 自动检测 PROXY Protocol 的结果类型
+enum PpDetectResult {
+    /// 成功解析 PROXY Protocol 头：真实 IP（可能为 None，表示 UNKNOWN/LOCAL）+ 后续数据流
+    Parsed(Option<SocketAddr>, PrefixedTcpStream),
+    /// 数据不匹配 PROXY Protocol 签名（仅在 `Auto` 模式返回）：已读取的前缀 + 流
+    NotMatched(Vec<u8>, tokio::net::TcpStream),
+}
+
+/// PROXY Protocol 解析/检测模式（内部使用，对应 config 中的模式）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PpParseMode {
+    /// 强制要求：不匹配则返回错误
+    Require,
+    /// 自动检测：不匹配则返回 `NotMatched`，携带已读数据供上层回退
+    Auto,
+}
+
+/// 解析或自动检测 PROXY Protocol 头。
 ///
-/// 自动检测 v1（文本）和 v2（二进制）格式。
-/// 成功时返回 `(Some(addr), PrefixedTcpStream)`；对于 `UNKNOWN` / `LOCAL` 类
-/// 无地址头返回 `(None, PrefixedTcpStream)`。解析失败返回 `Err`。
+/// - `Require` 模式：连接数据必须匹配 PROXY Protocol v1/v2 签名，解析失败返回 `Err`。
+///   成功时返回 `PpDetectResult::Parsed`。
+/// - `Auto` 模式：若数据匹配则解析并返回 `Parsed`；若不匹配 PROXY Protocol 签名，
+///   返回 `NotMatched`，携带已读取的前缀数据供上层通过 `PrefixedTcpStream`
+///   回退给应用层（HTTP/TLS）正常处理。
 ///
-/// 函数取得 `TcpStream` 所有权，返回的 `PrefixedTcpStream` 包装剩余数据
-/// 供后续 TLS 握手或 HTTP 请求处理使用。
-/// 整个解析过程在 `PP_HEADER_TIMEOUT_SECS` 内完成，防止慢速攻击。
+/// 整个读取过程在 `PP_HEADER_TIMEOUT_SECS` 内完成，防止慢速攻击。
 async fn parse_proxy_protocol(
     stream: tokio::net::TcpStream,
-) -> std::io::Result<(Option<SocketAddr>, PrefixedTcpStream)> {
+    mode: PpParseMode,
+) -> std::io::Result<PpDetectResult> {
     use tokio::io::AsyncReadExt;
 
-    let (addr, prefix) = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(PP_HEADER_TIMEOUT_SECS),
         async move {
-            // 先读前 6 字节判断 v1/v2
-            let mut header = [0u8; 6];
             let mut stream = stream;
-            stream.read_exact(&mut header).await?;
 
-            // 检查是否为 v2 签名的前 6 字节
-            if header == PP_V2_SIGNATURE[..6] {
-                // v2：继续读取剩余 6 字节签名
+            // ── 第一步：读取前 6 字节做签名快速检测 ──
+            let mut header = [0u8; 6];
+            if try_read_exact(&mut stream, &mut header).await?.is_none() {
+                // EOF：只有 Require 模式视为错误，Auto 模式返回 NotMatched 空前缀
+                return match mode {
+                    PpParseMode::Require => Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "PROXY protocol header EOF before signature",
+                    )),
+                    PpParseMode::Auto => Ok(PpDetectResult::NotMatched(Vec::new(), stream)),
+                };
+            }
+
+            // ── 判断签名类型 ──
+            let is_v2_candidate = header == PP_V2_SIGNATURE[..6];
+            let is_v1_candidate = header == *PP_V1_PREFIX;
+
+            if !is_v2_candidate && !is_v1_candidate {
+                // 不匹配任何 PROXY Protocol 签名
+                return match mode {
+                    PpParseMode::Require => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Data does not match PROXY protocol v1 or v2 format",
+                    )),
+                    PpParseMode::Auto => {
+                        Ok(PpDetectResult::NotMatched(header.to_vec(), stream))
+                    }
+                };
+            }
+
+            // ── v2 签名分支 ──
+            if is_v2_candidate {
+                // 继续读取剩余 6 字节签名
                 let mut rest_sig = [0u8; 6];
                 stream.read_exact(&mut rest_sig).await?;
-
-                // 完整签名验证
                 let mut full_sig = [0u8; 12];
                 full_sig[..6].copy_from_slice(&header);
                 full_sig[6..].copy_from_slice(&rest_sig);
                 if &full_sig != PP_V2_SIGNATURE {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "PROXY protocol v2 signature mismatch",
-                    ));
+                    return match mode {
+                        PpParseMode::Require => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "PROXY protocol v2 signature mismatch",
+                        )),
+                        PpParseMode::Auto => {
+                            // 前 6 字节命中 v2 前缀但完整签名不匹配 → 回退，携带已读 12 字节
+                            let mut prefix = Vec::with_capacity(12);
+                            prefix.extend_from_slice(&full_sig);
+                            Ok(PpDetectResult::NotMatched(prefix, stream))
+                        }
+                    };
                 }
 
                 // 读取 ver_cmd, fam, len（4 字节）
@@ -502,7 +557,7 @@ async fn parse_proxy_protocol(
                 let fam = fields[1];
                 let len = u16::from_be_bytes([fields[2], fields[3]]) as usize;
 
-                // ver_cmd 高 4 位是版本（必须为 2），低 4 位是命令
+                // 版本必须为 2
                 if ver_cmd >> 4 != 2 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -524,22 +579,29 @@ async fn parse_proxy_protocol(
                         // LOCAL 命令：读取并丢弃 len 字节
                         let mut discard = vec![0u8; len];
                         stream.read_exact(&mut discard).await?;
-                        Ok((None, PrefixedTcpStream::new(vec![], stream)))
+                        Ok(PpDetectResult::Parsed(
+                            None,
+                            PrefixedTcpStream::new(vec![], stream),
+                        ))
                     }
                     1 => {
                         // PROXY 命令：根据协议家族解析地址
                         let mut addr_data = vec![0u8; len];
                         stream.read_exact(&mut addr_data).await?;
                         let addr = parse_pp_v2_addr(fam, &addr_data)?;
-                        Ok((addr, PrefixedTcpStream::new(vec![], stream)))
+                        Ok(PpDetectResult::Parsed(
+                            addr,
+                            PrefixedTcpStream::new(vec![], stream),
+                        ))
                     }
                     _ => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("PROXY protocol v2 unknown command: {}", cmd),
                     )),
                 }
-            } else if header == *PP_V1_PREFIX {
-                // v1：读取直到 \r\n（最多 107 字节）
+            } else {
+                // ── v1 分支（必然命中，上面 is_v1_candidate 已保证） ──
+                // 读取直到 \r\n（最多 107 字节，规范上限）
                 let mut line = Vec::with_capacity(107);
                 line.extend_from_slice(&header);
                 loop {
@@ -563,11 +625,9 @@ async fn parse_proxy_protocol(
                     }
                 }
                 let addr = parse_pp_v1_line(&line)?;
-                Ok((addr, PrefixedTcpStream::new(vec![], stream)))
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Data does not match PROXY protocol v1 or v2 format",
+                Ok(PpDetectResult::Parsed(
+                    addr,
+                    PrefixedTcpStream::new(vec![], stream),
                 ))
             }
         },
@@ -578,9 +638,31 @@ async fn parse_proxy_protocol(
             std::io::ErrorKind::TimedOut,
             format!("PROXY protocol header read timed out after {}s", PP_HEADER_TIMEOUT_SECS),
         )
-    })??;
+    })?
+}
 
-    Ok((addr, prefix))
+/// 尝试读取精确字节数，EOF（0 字节）时返回 `Ok(None)` 而不是错误
+async fn try_read_exact<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<Option<()>> {
+    use tokio::io::AsyncReadExt;
+    let mut total_read = 0usize;
+    while total_read < buf.len() {
+        let n = reader.read(&mut buf[total_read..]).await?;
+        if n == 0 {
+            return if total_read == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF while reading exact bytes",
+                ))
+            };
+        }
+        total_read += n;
+    }
+    Ok(Some(()))
 }
 
 /// 解析 PROXY Protocol v1 文本行
@@ -764,7 +846,7 @@ async fn accept_connections_dual(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
-    proxy_protocol: bool,
+    proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
@@ -884,20 +966,25 @@ fn dispatch_accept_result(
     timeout: u64,
     buffer_pool: &Arc<BufferPool>,
     auth: &Arc<Option<Vec<crate::config::AuthUser>>>,
-    proxy_protocol: bool,
+    proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: &[std::net::IpAddr],
 ) {
+    use crate::config::ProxyProtocolMode;
     let trusted_ips = proxy_protocol_trusted_ips.to_vec();
     match result {
         Some(DualAccept::Http(Ok((client, addr)))) => {
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
             let t1 = trusted_ips.clone();
+            let pp_mode = proxy_protocol;
             join_set.spawn(async move {
-                if proxy_protocol {
-                    process_http_client_pp(client, addr, timeout, bp, au, t1).await;
-                } else {
-                    handle_client(client, timeout, bp, au).await;
+                match pp_mode {
+                    ProxyProtocolMode::Disable => {
+                        handle_client(client, timeout, bp, au).await;
+                    }
+                    ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
+                        process_http_client_pp(client, addr, timeout, bp, au, t1, pp_mode).await;
+                    }
                 }
             });
         }
@@ -908,11 +995,25 @@ fn dispatch_accept_result(
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
             let t2 = trusted_ips.clone();
+            let pp_mode = proxy_protocol;
             join_set.spawn(async move {
-                if proxy_protocol {
-                    process_tls_client_pp(client, addr, tls_reloader, timeout, bp, au, t2).await;
-                } else {
-                    process_tls_client(client, addr, tls_reloader, timeout, bp, au).await;
+                match pp_mode {
+                    ProxyProtocolMode::Disable => {
+                        process_tls_client(client, addr, tls_reloader, timeout, bp, au).await;
+                    }
+                    ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
+                        process_tls_client_pp(
+                            client,
+                            addr,
+                            tls_reloader,
+                            timeout,
+                            bp,
+                            au,
+                            t2,
+                            pp_mode,
+                        )
+                        .await;
+                    }
                 }
             });
         }
@@ -924,7 +1025,7 @@ fn dispatch_accept_result(
 }
 
 /// PROXY Protocol 启用时的 HTTP 连接处理：
-/// 先检查 peer IP 是否在可信列表中，再解析 PROXY Protocol 头获取真实 IP
+/// 先检查 peer IP 是否在可信列表中，再按模式解析/自动检测 PROXY Protocol 头
 async fn process_http_client_pp(
     client: tokio::net::TcpStream,
     fallback_addr: SocketAddr,
@@ -932,7 +1033,10 @@ async fn process_http_client_pp(
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
     trusted_ips: Vec<std::net::IpAddr>,
+    pp_mode: crate::config::ProxyProtocolMode,
 ) {
+    use crate::config::ProxyProtocolMode;
+
     // IP 白名单检查：若配置了可信列表且源 IP 不在列表中，跳过 PROXY Protocol 解析
     if !trusted_ips.is_empty() && !trusted_ips.contains(&fallback_addr.ip()) {
         debug!(
@@ -944,20 +1048,49 @@ async fn process_http_client_pp(
         return;
     }
 
-    let (real_addr, stream) = match parse_proxy_protocol(client).await {
-        Ok((Some(addr), stream)) => (addr, stream),
-        Ok((None, stream)) => (fallback_addr, stream),
-        Err(e) => {
-            warn!("PROXY Protocol parse failed from {}: {}", fallback_addr, e);
-            return;
-        }
+    let internal_mode = match pp_mode {
+        ProxyProtocolMode::Disable => unreachable!(),
+        ProxyProtocolMode::Auto => PpParseMode::Auto,
+        ProxyProtocolMode::Require => PpParseMode::Require,
     };
-    debug!("PROXY Protocol: {} -> real client {}", fallback_addr, real_addr);
-    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
+
+    match parse_proxy_protocol(client, internal_mode).await {
+        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
+            let real_addr = real_opt.unwrap_or(fallback_addr);
+            debug!(
+                "PROXY Protocol({}): {} -> real client {}",
+                pp_mode, fallback_addr, real_addr
+            );
+            handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
+        }
+        Ok(PpDetectResult::NotMatched(prefix, stream)) => {
+            // Auto 模式：数据不匹配 PROXY 签名 → 使用 prefix + stream 回退，IP 用 peer_addr
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain connection",
+                fallback_addr
+            );
+            let wrapped = PrefixedTcpStream::new(prefix, stream);
+            handle_client_with_addr(wrapped, fallback_addr, timeout, buffer_pool, auth).await;
+        }
+        Err(e) => {
+            if matches!(pp_mode, ProxyProtocolMode::Require) {
+                warn!(
+                    "PROXY Protocol(Require) parse failed from {}: {}",
+                    fallback_addr, e
+                );
+            } else {
+                debug!(
+                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
+                    fallback_addr, e
+                );
+            }
+        }
+    }
 }
 
 /// PROXY Protocol 启用时的 HTTPS 连接处理：
-/// 先检查 peer IP 是否在可信列表中，再解析 PROXY Protocol 头获取真实 IP
+/// 先检查 peer IP 是否在可信列表中，再按模式解析/自动检测 PROXY Protocol 头
+#[allow(clippy::too_many_arguments)]
 async fn process_tls_client_pp(
     client: tokio::net::TcpStream,
     fallback_addr: SocketAddr,
@@ -966,7 +1099,10 @@ async fn process_tls_client_pp(
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
     trusted_ips: Vec<std::net::IpAddr>,
+    pp_mode: crate::config::ProxyProtocolMode,
 ) {
+    use crate::config::ProxyProtocolMode;
+
     // IP 白名单检查：若配置了可信列表且源 IP 不在列表中，跳过 PROXY Protocol 解析
     if !trusted_ips.is_empty() && !trusted_ips.contains(&fallback_addr.ip()) {
         debug!(
@@ -978,15 +1114,44 @@ async fn process_tls_client_pp(
         return;
     }
 
-    let (real_addr, stream) = match parse_proxy_protocol(client).await {
-        Ok((Some(addr), stream)) => (addr, stream),
-        Ok((None, stream)) => (fallback_addr, stream),
+    let internal_mode = match pp_mode {
+        ProxyProtocolMode::Disable => unreachable!(),
+        ProxyProtocolMode::Auto => PpParseMode::Auto,
+        ProxyProtocolMode::Require => PpParseMode::Require,
+    };
+
+    let (real_addr, stream) = match parse_proxy_protocol(client, internal_mode).await {
+        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
+            let real_addr = real_opt.unwrap_or(fallback_addr);
+            debug!(
+                "PROXY Protocol({}): {} -> real client {}",
+                pp_mode, fallback_addr, real_addr
+            );
+            (real_addr, stream)
+        }
+        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
+            // Auto 模式：不匹配 → 回退，携带 prefix 供 TLS ClientHello 使用
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain TLS",
+                fallback_addr
+            );
+            (fallback_addr, PrefixedTcpStream::new(prefix, tcp))
+        }
         Err(e) => {
-            warn!("PROXY Protocol parse failed from {}: {}", fallback_addr, e);
+            if matches!(pp_mode, ProxyProtocolMode::Require) {
+                warn!(
+                    "PROXY Protocol(Require) parse failed from {}: {}",
+                    fallback_addr, e
+                );
+            } else {
+                debug!(
+                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
+                    fallback_addr, e
+                );
+            }
             return;
         }
     };
-    debug!("PROXY Protocol: {} -> real client {}", fallback_addr, real_addr);
 
     // TLS 握手（与 process_tls_client 逻辑一致，但流类型为 PrefixedTcpStream）
     let acceptor = tls_reloader.current_acceptor();

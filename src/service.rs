@@ -90,7 +90,10 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from(tls_key.display().to_string()));
     }
 
-    if run_args.proxy_protocol {
+    if let Some(pp_mode) = run_args.proxy_protocol_mode {
+        command_args.push(OsString::from("--proxy-protocol-mode"));
+        command_args.push(OsString::from(pp_mode.to_string()));
+    } else if run_args.proxy_protocol {
         command_args.push(OsString::from("--proxy-protocol"));
     }
 

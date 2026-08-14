@@ -90,6 +90,7 @@ fn parse_service_args() -> ServerRunArgs {
         https_port: None,
         tls_cert: None,
         tls_key: None,
+        proxy_protocol_mode: None,
         proxy_protocol: false,
         proxy_protocol_trusted_ips: Vec::new(),
     };
@@ -146,6 +147,11 @@ fn parse_service_args() -> ServerRunArgs {
             "--proxy-protocol" => {
                 start_args.proxy_protocol = true;
                 i += 1;
+                continue;
+            }
+            "--proxy-protocol-mode" if i + 1 < args.len() => {
+                start_args.proxy_protocol_mode = args[i + 1].parse().ok();
+                i += 2;
                 continue;
             }
             "--proxy-protocol-trusted-ips" if i + 1 < args.len() => {

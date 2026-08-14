@@ -201,8 +201,9 @@ rust-proxy server uninstall
 | `--log-file`     | 日志文件路径                          | 无（输出到控制台）        |
 | `--config`       | 配置文件路径                          | 自动寻找             |
 | `--multi-thread` | 启用多线程运行时                        | false            |
-| `--proxy-protocol` | 启用 PROXY Protocol 解析（v1/v2 自动检测），用于挂在 nginx/HAProxy 后的场景 | false            |
-| `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自可信 IP 的 PROXY Protocol 头 | 无（接受所有来源）            |
+| `--proxy-protocol-mode` | PROXY Protocol 模式：`auto`(默认,自动检测)/`disable`(禁用)/`require`(强制) | auto |
+| `--proxy-protocol` | 启用 PROXY Protocol（等价于 `--proxy-protocol-mode require`，兼容旧参数） | false |
+| `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自可信 IP 的 PROXY Protocol 头 | 无（接受所有来源） |
 
 ### 日志级别
 
@@ -250,13 +251,15 @@ tls_key = "key.pem"
 # username = "admin"
 # password = "secret"
 
-# PROXY Protocol 解析（可选，默认 false）
+# PROXY Protocol 解析模式（可选，默认 auto）
 # 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
 # `proxy_protocol on;` 转发真实客户端 IP 的场景。
-# 启用后，每个接入连接会先解析 PROXY Protocol 头（v1/v2 自动检测），
-# 提取真实客户端 IP 用于日志和认证。
+#   "auto"：自动检测（默认），匹配时解析获取真实 IP，不匹配时按普通流量处理（数据回退）
+#   "disable"：完全禁用
+#   "require"：强制要求所有连接必须带 PROXY Protocol 头，否则断开
+# 每个连接独立检测，支持 HTTP 直连 + HTTPS 经 nginx 的混合场景。
 # 安全提示：建议配置 proxy_protocol_trusted_ips 限制仅接受来自可信代理 IP 的头。
-# proxy_protocol = false
+# proxy_protocol_mode = "auto"
 # proxy_protocol_trusted_ips = ["10.0.0.1"]
 ```
 
@@ -310,19 +313,28 @@ tls_key = "key.pem"
 
 ### 方式五：挂在 nginx/HAProxy 后（PROXY Protocol）
 
-当代理服务部署在 nginx/HAProxy 后面、通过 SNI 分流并使用 `proxy_protocol on;` 转发真实客户端 IP 时，必须启用 `--proxy-protocol` 以正确解析 PROXY Protocol 头。否则代理服务会因首字节非 HTTP/CONNECT 协议而处理异常。
+当代理服务部署在 nginx/HAProxy 后面、通过 SNI 分流并使用 `proxy_protocol on;` 转发真实客户端 IP 时，通过 `proxy_protocol_mode` 配置解析模式。**默认即为 `auto` 自动检测**，无需显式配置：
+
+- **`auto`（默认，推荐）**：自动检测 —— 每个连接独立检测前 6 字节是否匹配 PROXY v1/v2 签名。匹配则解析真实 IP，不匹配则前缀数据回退给应用层正常处理（不会截断）。**支持 HTTP 直连 + HTTPS 经 nginx 的混合场景**：HTTP 端口无 PROXY 头照常工作，HTTPS 端口有 PROXY 头则解析真实 IP。
+- **`disable`**：完全禁用，所有连接按普通 HTTP/TLS 处理。
+- **`require`**：强制模式 —— 所有连接必须带 PROXY Protocol 头，否则断开，安全性更高（适合确认上游全是 nginx/LB 的环境）。
+- 旧参数 `--proxy-protocol` 等价于 `require` 模式，为了向后兼容保留。
 
 ```bash
-# 命令行方式（推荐同时指定可信代理 IP）
+# 命令行方式：auto 模式（推荐），同时指定可信代理 IP
 ./rust-proxy start --https-port 8443 --tls-cert cert.pem --tls-key key.pem \
-    --proxy-protocol --proxy-protocol-trusted-ips 10.0.0.1
+    --proxy-protocol-mode auto --proxy-protocol-trusted-ips 10.0.0.1
 
-# 配置文件方式（config.toml 中已设置 proxy_protocol = true）
+# 命令行方式：require 模式（严格）
+./rust-proxy start --https-port 8443 --tls-cert cert.pem --tls-key key.pem \
+    --proxy-protocol-mode require --proxy-protocol-trusted-ips 10.0.0.1
+
+# 配置文件方式（config.toml 中已设置 proxy_protocol_mode = "auto"）
 ./rust-proxy start --config /etc/proxy/config.toml
 
 # 安装为系统服务
 ./rust-proxy server install --https-port 8443 --tls-cert C:\certs\cert.pem \
-    --tls-key C:\certs\key.pem --proxy-protocol --proxy-protocol-trusted-ips 10.0.0.1
+    --tls-key C:\certs\key.pem --proxy-protocol-mode auto --proxy-protocol-trusted-ips 10.0.0.1
 ```
 
 对应的 nginx 配置示例：

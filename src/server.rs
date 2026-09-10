@@ -485,6 +485,19 @@ enum PpParseMode {
     Auto,
 }
 
+/// 判断 peek 到的字节开头是否为 PROXY Protocol v1/v2 签名候选。
+///
+/// `seen` 为通过 `peek`（未消费）获取的连接首字节，仅需至少 6 字节即可判断：
+/// - v1：以 ASCII `PROXY ` 开头
+/// - v2：前 6 字节与 v2 签名头一致
+/// 普通 HTTP 请求首行（如 `GET /`、`CONNECT h`）不会匹配，从而被当作直连流量处理。
+fn is_proxy_signature(seen: &[u8]) -> bool {
+    if seen.len() < 6 {
+        return false;
+    }
+    seen.starts_with(PP_V1_PREFIX) || seen[..6] == PP_V2_SIGNATURE[..6]
+}
+
 /// 解析或自动检测 PROXY Protocol 头。
 ///
 /// - `Require` 模式：连接数据必须匹配 PROXY Protocol v1/v2 签名，解析失败返回 `Err`。
@@ -970,6 +983,7 @@ async fn drain_joinset(join_set: &mut JoinSet<()>) {
 }
 
 /// 将 accept 结果分发到连接处理任务
+#[allow(clippy::too_many_arguments)]
 fn dispatch_accept_result(
     result: Option<DualAccept>,
     join_set: &mut JoinSet<()>,
@@ -1065,36 +1079,75 @@ async fn process_http_client_pp(
         ProxyProtocolMode::Require => PpParseMode::Require,
     };
 
-    match parse_proxy_protocol(client, internal_mode).await {
+    if internal_mode == PpParseMode::Auto {
+        // Auto 模式：先用 peek（不消费数据）探测 PROXY 签名。
+        // 避免"预读 6 字节 prefix + 回放"导致 HTTP 首包被截断：
+        // handle_client 只用一次 read 读请求，若数据被 PrefixedTcpStream 分成
+        // prefix+剩余 两段，首次 read 只拿到残缺前缀，HTTP 首行解析失败、代理失效。
+        // 改为 peek 后：非 PROXY 流量数据原样保留，直接交回普通 HTTP 处理，一次读全。
+        let mut probe = [0u8; 12];
+        let probe_res = tokio::time::timeout(
+            Duration::from_secs(PP_HEADER_TIMEOUT_SECS),
+            client.peek(&mut probe),
+        )
+        .await;
+        let signature_detected = match &probe_res {
+            Ok(Ok(n)) if *n >= 6 => is_proxy_signature(&probe[..*n]),
+            _ => false,
+        };
+
+        if signature_detected {
+            debug!(
+                "PROXY Protocol(Auto): signature detected from {}, parsing",
+                fallback_addr
+            );
+            // peek 不消费数据，强制解析会重新读取 PROXY 头
+            match parse_proxy_protocol(client, PpParseMode::Require).await {
+                Ok(PpDetectResult::Parsed(real_opt, stream)) => {
+                    let real_addr = real_opt.unwrap_or(fallback_addr);
+                    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "PROXY Protocol(Auto) parse failed from {}: {}",
+                        fallback_addr, e
+                    );
+                }
+            }
+        } else {
+            // 非 PROXY 流量：普通 HTTP 直连，数据未被消费，原样交给 HTTP 处理
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, plain HTTP connection",
+                fallback_addr
+            );
+            handle_client_with_addr(client, fallback_addr, timeout, buffer_pool, auth).await;
+        }
+        return;
+    }
+
+    // Require 模式：所有连接必须以 PROXY Protocol 头开头
+    match parse_proxy_protocol(client, PpParseMode::Require).await {
         Ok(PpDetectResult::Parsed(real_opt, stream)) => {
             let real_addr = real_opt.unwrap_or(fallback_addr);
             debug!(
-                "PROXY Protocol({}): {} -> real client {}",
-                pp_mode, fallback_addr, real_addr
+                "PROXY Protocol(Require): {} -> real client {}",
+                fallback_addr, real_addr
             );
             handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
         }
-        Ok(PpDetectResult::NotMatched(prefix, stream)) => {
-            // Auto 模式：数据不匹配 PROXY 签名 → 使用 prefix + stream 回退，IP 用 peer_addr
-            debug!(
-                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain connection",
+        Ok(PpDetectResult::NotMatched(_, _)) => {
+            // Require 模式下 parse 不会返回 NotMatched，此分支仅防御
+            warn!(
+                "PROXY Protocol(Require): unexpected NotMatched from {}",
                 fallback_addr
             );
-            let wrapped = PrefixedTcpStream::new(prefix, stream);
-            handle_client_with_addr(wrapped, fallback_addr, timeout, buffer_pool, auth).await;
         }
         Err(e) => {
-            if matches!(pp_mode, ProxyProtocolMode::Require) {
-                warn!(
-                    "PROXY Protocol(Require) parse failed from {}: {}",
-                    fallback_addr, e
-                );
-            } else {
-                debug!(
-                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
-                    fallback_addr, e
-                );
-            }
+            warn!(
+                "PROXY Protocol(Require) parse failed from {}: {}",
+                fallback_addr, e
+            );
         }
     }
 }
@@ -1407,5 +1460,33 @@ mod tests {
             assert!(PP_HEADER_TIMEOUT_SECS >= 5, "timeout should be at least 5s");
             assert!(PP_HEADER_TIMEOUT_SECS <= 60, "timeout should be at most 60s");
         }
+    }
+
+    #[test]
+    fn test_is_proxy_signature_detects_v1_prefix() {
+        assert!(is_proxy_signature(b"PROXY TCP4 1.2.3.4"));
+        assert!(is_proxy_signature(b"PROXY UNKNOWN"));
+    }
+
+    #[test]
+    fn test_is_proxy_signature_detects_v2_signature() {
+        // v2 签名前 6 字节：\r\n\r\n\0\r
+        assert!(is_proxy_signature(b"\r\n\r\n\x00\rQUIT"));
+    }
+
+    #[test]
+    fn test_is_proxy_signature_rejects_plain_http() {
+        // 普通 HTTP 代理请求首行不会被误判为 PROXY Protocol
+        assert!(!is_proxy_signature(b"GET http://example.com/"));
+        assert!(!is_proxy_signature(b"CONNECT example.com:443"));
+        assert!(!is_proxy_signature(b"POST /path HTTP/1.1"));
+    }
+
+    #[test]
+    fn test_is_proxy_signature_rejects_short_input() {
+        // 不足 6 字节无法判断签名，应视为非 PROXY（交给普通流量处理）
+        assert!(!is_proxy_signature(b""));
+        assert!(!is_proxy_signature(b"GET"));
+        assert!(!is_proxy_signature(b"PROX"));
     }
 }

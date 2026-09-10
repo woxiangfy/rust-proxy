@@ -161,19 +161,26 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
     }
 
     use crate::config::ProxyProtocolMode;
-    match args.proxy_protocol {
-        ProxyProtocolMode::Disable => {}
-        mode @ (ProxyProtocolMode::Auto | ProxyProtocolMode::Require) => {
-            info!("PROXY Protocol: mode={} (v1/v2 auto-detect)", mode);
-            if !args.proxy_protocol_trusted_ips.is_empty() {
-                info!(
-                    "PROXY Protocol trusted IPs: {:?}",
-                    args.proxy_protocol_trusted_ips
-                );
-            } else {
-                info!("PROXY Protocol: no trusted IP whitelist (accepting from all sources)");
-            }
+    // 分别展示 HTTP/HTTPS 两个端口实际使用的 PROXY Protocol 模式
+    let show_mode = |m: ProxyProtocolMode| {
+        if m == ProxyProtocolMode::Disable {
+            "disable".to_string()
+        } else {
+            format!("{} (v1/v2 auto-detect)", m)
         }
+    };
+    info!(
+        "PROXY Protocol: http={} https={}",
+        show_mode(args.http_proxy_protocol),
+        show_mode(args.https_proxy_protocol),
+    );
+    if !args.proxy_protocol_trusted_ips.is_empty() {
+        info!(
+            "PROXY Protocol trusted IPs: {:?}",
+            args.proxy_protocol_trusted_ips
+        );
+    } else {
+        info!("PROXY Protocol: no trusted IP whitelist (accepting from all sources)");
     }
 
     accept_connections_dual(
@@ -182,7 +189,8 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         args.timeout,
         buffer_pool,
         auth,
-        args.proxy_protocol,
+        args.http_proxy_protocol,
+        args.https_proxy_protocol,
         args.proxy_protocol_trusted_ips.clone(),
         shutdown_rx,
     )
@@ -321,7 +329,7 @@ fn generate_self_signed_reloader() -> Result<TlsReloader> {
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ]).map_err(|e| anyhow::anyhow!("Failed to build CertificateParams: {}", e))?;
-    params.distinguished_name.push(DnType::CommonName, "rust-proxy auto");
+    params.distinguished_name.push(DnType::CommonName, "auto");
     params.is_ca = IsCa::NoCa;
 
     // 有效期：SELF_SIGNED_VALIDITY_YEARS 年（基于当前 UTC 时间推算年月日）
@@ -846,7 +854,8 @@ async fn accept_connections_dual(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
-    proxy_protocol: crate::config::ProxyProtocolMode,
+    http_proxy_protocol: crate::config::ProxyProtocolMode,
+    https_proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
@@ -943,7 +952,8 @@ async fn accept_connections_dual(
                 timeout,
                 &buffer_pool,
                 &auth,
-                proxy_protocol,
+                http_proxy_protocol,
+                https_proxy_protocol,
                 &proxy_protocol_trusted_ips,
             );
         }
@@ -966,7 +976,8 @@ fn dispatch_accept_result(
     timeout: u64,
     buffer_pool: &Arc<BufferPool>,
     auth: &Arc<Option<Vec<crate::config::AuthUser>>>,
-    proxy_protocol: crate::config::ProxyProtocolMode,
+    http_proxy_protocol: crate::config::ProxyProtocolMode,
+    https_proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: &[std::net::IpAddr],
 ) {
     use crate::config::ProxyProtocolMode;
@@ -976,7 +987,7 @@ fn dispatch_accept_result(
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
             let t1 = trusted_ips.clone();
-            let pp_mode = proxy_protocol;
+            let pp_mode = http_proxy_protocol;
             join_set.spawn(async move {
                 match pp_mode {
                     ProxyProtocolMode::Disable => {
@@ -995,7 +1006,7 @@ fn dispatch_accept_result(
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
             let t2 = trusted_ips.clone();
-            let pp_mode = proxy_protocol;
+            let pp_mode = https_proxy_protocol;
             join_set.spawn(async move {
                 match pp_mode {
                     ProxyProtocolMode::Disable => {

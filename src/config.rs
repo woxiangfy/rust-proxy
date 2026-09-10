@@ -128,15 +128,19 @@ pub struct ServerRunArgs {
 
     /// PROXY Protocol 模式（disable / auto / require）
     ///
-    /// - `disable`：完全禁用 PROXY Protocol（默认）
-    /// - `auto`：自动检测，连接开头匹配 PROXY v1/v2 签名时解析，否则按普通流量处理
+    /// - `disable`：完全禁用 PROXY Protocol
+    /// - `auto`：自动检测（默认），连接开头匹配 PROXY v1/v2 签名时解析真实 IP，
+    ///   否则按普通流量处理（HTTP 直连、不带 PROXY 头的 HTTPS 均兼容）
     /// - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
     ///
-    /// 兼容旧参数 `--proxy-protocol`（等价于 `--proxy-protocol-mode require`）。
+    /// 注意：该模式同时作为 HTTP/HTTPS 端口的缺省值；如需分别控制可在配置文件中
+    /// 使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。
     #[arg(long, value_name = "MODE")]
     pub proxy_protocol_mode: Option<ProxyProtocolMode>,
 
-    /// 启用 PROXY Protocol 解析（等价于 --proxy-protocol-mode require）
+    /// 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
+    ///
+    /// 旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。
     #[arg(long)]
     pub proxy_protocol: bool,
 
@@ -241,7 +245,12 @@ pub struct Args {
     pub auth: Option<Vec<AuthUser>>,
     /// TLS 配置。为 `None` 时不监听 HTTPS 端口。
     pub tls: Option<TlsConfig>,
-    /// PROXY Protocol 解析模式
+    /// HTTP 端口实际使用的 PROXY Protocol 模式（缺省回退到全局默认）
+    pub http_proxy_protocol: ProxyProtocolMode,
+    /// HTTPS 端口实际使用的 PROXY Protocol 模式（缺省回退到全局默认）
+    pub https_proxy_protocol: ProxyProtocolMode,
+    /// PROXY Protocol 全局默认模式（供日志/回退使用；http/https 字段已给出每个端口的最终值）
+    #[allow(dead_code)]
     pub proxy_protocol: ProxyProtocolMode,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
@@ -319,6 +328,31 @@ impl Args {
             None
         };
 
+        // PROXY Protocol 全局默认模式合并优先级：
+        // 1. CLI --proxy-protocol-mode（显式指定优先级最高）
+        // 2. CLI --proxy-protocol（旧布尔参数，新语义等价于 Auto 全自动识别）
+        // 3. 配置文件 proxy_protocol_mode
+        // 4. 默认 Auto（自动检测）
+        // 之后：http/https 端口可用各自覆盖项（http_proxy_protocol / https_proxy_protocol）
+        //       覆盖全局默认，未覆盖的端口使用全局默认。
+        let global_pp = {
+            let cli_mode = run_args.proxy_protocol_mode;
+            let cli_flag = run_args.proxy_protocol;
+            let cfg_mode = config.as_ref().and_then(|c| c.proxy_protocol_mode);
+
+            if let Some(m) = cli_mode {
+                m
+            } else if cli_flag {
+                // 旧 `--proxy-protocol` 现在映射为 Auto（全自动识别），不再强制 Require，
+                // 避免 HTTP 直连流量被误判/强制解析而中断。
+                ProxyProtocolMode::Auto
+            } else if let Some(m) = cfg_mode {
+                m
+            } else {
+                ProxyProtocolMode::Auto
+            }
+        };
+
         Args {
             // port 合并语义：
             //   - port 显式指定 → Some(port)
@@ -344,29 +378,16 @@ impl Args {
             // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
             auth: config.as_ref().and_then(|c| c.auth.clone()),
             tls,
-            // PROXY Protocol 模式合并优先级：
-            // 1. CLI --proxy-protocol-mode（显式指定优先级最高）
-            // 2. CLI --proxy-protocol（旧参数，等价于 Require）
-            // 3. 配置文件 proxy_protocol_mode / proxy_protocol
-            // 4. 默认 Auto（自动检测）
-            proxy_protocol: {
-                let cli_mode = run_args.proxy_protocol_mode;
-                let cli_flag = run_args.proxy_protocol;
-                let cfg_mode = config.as_ref().and_then(|c| c.proxy_protocol_mode);
-                let cfg_flag = config.as_ref().map(|c| c.proxy_protocol).unwrap_or(false);
-
-                if let Some(m) = cli_mode {
-                    m
-                } else if cli_flag {
-                    ProxyProtocolMode::Require
-                } else if let Some(m) = cfg_mode {
-                    m
-                } else if cfg_flag {
-                    ProxyProtocolMode::Require
-                } else {
-                    ProxyProtocolMode::Auto
-                }
-            },
+            // PROXY Protocol 最终模式：http/https 端口使用全局默认或各自覆盖值
+            http_proxy_protocol: config
+                .as_ref()
+                .and_then(|c| c.http_proxy_protocol)
+                .unwrap_or(global_pp),
+            https_proxy_protocol: config
+                .as_ref()
+                .and_then(|c| c.https_proxy_protocol)
+                .unwrap_or(global_pp),
+            proxy_protocol: global_pp,
             proxy_protocol_trusted_ips: {
                 let cli_ips = run_args.proxy_protocol_trusted_ips.clone();
                 if !cli_ips.is_empty() {
@@ -446,11 +467,20 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     /// TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置
     pub tls_key: Option<PathBuf>,
-    /// PROXY Protocol 模式（disable / auto / require）
+    /// PROXY Protocol 全局默认模式（disable / auto / require）
+    ///
+    /// 均作为 HTTP/HTTPS 端口的缺省模式；若同时配置了
+    /// `http_proxy_protocol` / `https_proxy_protocol` 覆盖项，则对应端口优先使用覆盖值。
     pub proxy_protocol_mode: Option<ProxyProtocolMode>,
-    /// 是否启用 PROXY Protocol 解析（旧字段，等价于 require 模式，为了向后兼容保留）
+    /// HTTP 端口覆盖模式（可选；缺省回退到 `proxy_protocol_mode`）
+    ///
+    /// 典型用法：HTTP 为普通直连、HTTPS 走 PROXY Protocol 时，
+    /// 分别设 `http_proxy_protocol = "disable"`、`https_proxy_protocol = "auto"`。
     #[serde(default)]
-    pub proxy_protocol: bool,
+    pub http_proxy_protocol: Option<ProxyProtocolMode>,
+    /// HTTPS 端口覆盖模式（可选；缺省回退到 `proxy_protocol_mode`）
+    #[serde(default)]
+    pub https_proxy_protocol: Option<ProxyProtocolMode>,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     #[serde(default)]
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
@@ -785,11 +815,14 @@ port = 7777
     fn test_parse_proxy_protocol_trusted_ips_from_config() {
         let toml_str = r#"
 port = 8080
-proxy_protocol = true
+proxy_protocol_mode = "auto"
 proxy_protocol_trusted_ips = ["10.0.0.1", "192.168.1.100"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.proxy_protocol);
+        assert_eq!(
+            config.proxy_protocol_mode,
+            Some(ProxyProtocolMode::Auto)
+        );
         assert_eq!(config.proxy_protocol_trusted_ips.len(), 2);
         assert_eq!(
             config.proxy_protocol_trusted_ips[0],
@@ -901,7 +934,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
     }
 
     #[test]
-    fn test_pp_mode_cli_flag_true_is_require() {
+    fn test_pp_mode_cli_flag_true_is_auto() {
+        // 旧 `--proxy-protocol` 布尔参数现在映射为 Auto（全自动识别），不再强制 Require
         let run_args = ServerRunArgs {
             config: None,
             port: None,
@@ -917,7 +951,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
-        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Require);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
     }
 
     #[test]
@@ -971,7 +1005,9 @@ proxy_protocol_mode = "auto"
     }
 
     #[test]
-    fn test_pp_mode_config_flag_true_maps_to_require() {
+    fn test_pp_mode_config_bool_true_is_ignored_defaults_to_auto() {
+        // 配置里的布尔 `proxy_protocol = true` 字段已移除，不再映射为 Require，
+        // 未知字段被 TOML 忽略，最终回退到全局默认 Auto（全自动识别）
         let toml_str = r#"
 port = 8080
 proxy_protocol = true
@@ -996,7 +1032,68 @@ proxy_protocol = true
             proxy_protocol_trusted_ips: Vec::new(),
         };
         let args = Args::from_run_args(&run_args);
-        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Require);
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_pp_mode_http_https_independent_overrides() {
+        // 全局默认 auto，http 覆盖为 disable、https 覆盖为 require，
+        // 两个端口应各自使用覆盖值，互不影响
+        let toml_str = r#"
+port = 8080
+proxy_protocol_mode = "auto"
+http_proxy_protocol = "disable"
+https_proxy_protocol = "require"
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_pp_mode_http_https_cfg");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        };
+        let args = Args::from_run_args(&run_args);
+        // 全局默认仍为 auto
+        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+        // http/https 各用覆盖值
+        assert_eq!(args.http_proxy_protocol, ProxyProtocolMode::Disable);
+        assert_eq!(args.https_proxy_protocol, ProxyProtocolMode::Require);
+
+        // 未配置覆盖时，两端都回退到全局默认
+        let toml_str2 = r#"
+port = 8080
+proxy_protocol_mode = "auto"
+"#;
+        std::fs::write(&config_file, toml_str2).unwrap();
+        let args2 = Args::from_run_args(&ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+        });
+        assert_eq!(args2.http_proxy_protocol, ProxyProtocolMode::Auto);
+        assert_eq!(args2.https_proxy_protocol, ProxyProtocolMode::Auto);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 

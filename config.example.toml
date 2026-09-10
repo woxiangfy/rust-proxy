@@ -45,19 +45,23 @@ log_level = "info"
 # tls_cert = "cert.pem"       # TLS 证书文件路径（PEM 格式），可配置相对路径（相对于配置文件目录）
 # tls_key = "key.pem"         # TLS 私钥文件路径（PEM 格式），支持 PKCS#8 或 RSA
 
-# PROXY Protocol 解析模式（可选，默认 auto）
+# PROXY Protocol 全局默认模式（可选，默认 auto）
 # 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
 # `proxy_protocol on;` 转发真实客户端 IP 的场景。
 #
 # 可选值：
-#   - "auto"（默认）：自动检测 —— 连接开头匹配 PROXY v1/v2 签名时解析获取真实 IP，
-#             不匹配时按普通流量处理（前缀数据回退给应用层，不会截断）。
-#             每个连接独立检测，支持 HTTP 直连 + HTTPS 经 nginx 的混合场景。
+#   - "auto"（默认，推荐）：全自动识别 —— 连接开头匹配 PROXY v1/v2 签名时解析
+#             获取真实 IP；不匹配时按普通流量处理（前缀数据回退给应用层，不截断）。
+#             每个连接独立检测，天然兼容「HTTP 直连 + HTTPS 经 nginx」的混合场景，
+#             不会强制打断直连的 HTTP 请求。
 #   - "disable"：完全禁用 PROXY Protocol，所有连接按普通 HTTP/TLS 处理
 #   - "require"：强制模式 —— 所有连接必须以 PROXY Protocol 头开头，
 #                否则断开连接并记录警告。最安全，适合确认上游全部发 PROXY 头的场景。
 #
-# 兼容旧字段 `proxy_protocol = true`（等价于 require 模式）。
+# 该模式同时作为 HTTP/HTTPS 两个端口的缺省值。如需分别控制（例如 HTTP 普通直连、
+# HTTPS 走 PROXY Protocol），可用下列两项覆盖指定端口，未配置的端口回退到全局默认：
+#   http_proxy_protocol = "disable"   # HTTP 端口强制按普通直连处理
+#   https_proxy_protocol = "auto"     # HTTPS 端口自动识别 PROXY 头（解析真实 IP）
 #
 # 安全提示：建议同时配置 proxy_protocol_trusted_ips 以限制仅接受
 # 来自可信代理 IP 的 PROXY Protocol 头，防止客户端伪造 IP。
@@ -72,5 +76,7 @@ log_level = "info"
 #       }
 #   }
 #
-# proxy_protocol_mode = "auto"
+# proxy_protocol_mode = "auto"        # 全局默认：http 直连自动回退、https 带 PROXY 头自动识别
+# http_proxy_protocol = "disable"     # （可选覆盖）HTTP 端口关闭解析
+# https_proxy_protocol = "auto"       # （可选覆盖）HTTPS 端口自动识别
 # proxy_protocol_trusted_ips = ["10.0.0.1"]  # 仅接受来自 nginx IP 的 PROXY Protocol 头

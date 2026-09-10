@@ -88,12 +88,12 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--https-port` | HTTPS 代理监听端口（显式指定后启用 HTTPS） | 无（不指定则不启用 HTTPS）   |
 | `--tls-cert`   | TLS 证书文件路径（PEM 格式）              | 无（缺失时自动生成自签证书）      |
 | `--tls-key`    | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无（缺失时自动生成自签证书）      |
-| `--proxy-protocol` | 启用 PROXY Protocol 解析（v1/v2 自动检测），用于挂在 nginx/HAProxy 后的场景 | false            |
+| `--proxy-protocol` | 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`），用于挂在 nginx/HAProxy 后的场景 | false            |
 | `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自这些 IP 的 PROXY Protocol 头 | 无（接受所有来源）            |
 
 > **启用规则**：只有显式指定 `--https-port` 才会启用 HTTPS 代理。若同时提供了合法 `--tls-cert` + `--tls-key`，则使用用户证书并支持热重载；若证书缺失或加载失败，则自动生成 10 年有效期自签证书（输出 warn 日志）。证书/私钥支持相对路径（相对于配置文件目录解析）和绝对路径。
 
-> **PROXY Protocol**：当代理服务部署在 nginx/HAProxy 后并通过 `proxy_protocol on;` 转发真实客户端 IP 时启用。启用后，每个接入连接会先解析 PROXY Protocol 头（自动识别 v1/v2 格式），提取真实客户端 IP 用于日志和认证。**必须**与上游反向代理同时启用，否则两端协议不匹配会导致连接异常。
+> **PROXY Protocol**：当代理服务部署在 nginx/HAProxy 后并通过 `proxy_protocol on;` 转发真实客户端 IP 时启用。**默认即为 `auto` 全自动识别**：每个连接先尝试解析 PROXY v1/v2 头以提取真实客户端 IP（用于日志和认证），不匹配 PROXY 签名时自动按普通 HTTP/TLS 处理（前缀数据回退给应用层，不会截断）。因此 `auto` 同时支持 HTTP 普通直连和 HTTPS 经 nginx 转发 PROXY 头的混合场景，无需分别启用，也**不会**强制打断直连的 HTTP 请求。
 >
 > **安全提示**：建议同时配置 `--proxy-protocol-trusted-ips` 限制仅接受来自 nginx/HAProxy IP 的 PROXY Protocol 头，防止恶意客户端直接连接并伪造 IP。示例：`--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2`
 
@@ -156,7 +156,7 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--https-port` | HTTPS 代理监听端口（显式指定后启用 HTTPS） | 无（不指定则不启用 HTTPS） |
 | `--tls-cert`   | TLS 证书文件路径   | 无（缺失时自动生成自签证书）                    |
 | `--tls-key`    | TLS 私钥文件路径   | 无（缺失时自动生成自签证书）                    |
-| `--proxy-protocol` | 启用 PROXY Protocol 解析（用于挂在 nginx/HAProxy 后的场景） | false            |
+| `--proxy-protocol` | 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`） | false            |
 | `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔） | 无（接受所有来源）            |
 
 #### 使用注意事项
@@ -201,8 +201,7 @@ rust-proxy server uninstall
 | `--log-file`     | 日志文件路径                          | 无（输出到控制台）        |
 | `--config`       | 配置文件路径                          | 自动寻找             |
 | `--multi-thread` | 启用多线程运行时                        | false            |
-| `--proxy-protocol-mode` | PROXY Protocol 模式：`auto`(默认,自动检测)/`disable`(禁用)/`require`(强制) | auto |
-| `--proxy-protocol` | 启用 PROXY Protocol（等价于 `--proxy-protocol-mode require`，兼容旧参数） | false |
+| `--proxy-protocol-mode` | PROXY Protocol 全局默认模式：`auto`(默认,全自动识别)/`disable`(禁用)/`require`(强制)。作为 HTTP/HTTPS 端口的缺省值，也可由配置文件的 `http_proxy_protocol`/`https_proxy_protocol` 单独覆盖 | auto |
 | `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自可信 IP 的 PROXY Protocol 头 | 无（接受所有来源） |
 
 ### 日志级别
@@ -251,15 +250,18 @@ tls_key = "key.pem"
 # username = "admin"
 # password = "secret"
 
-# PROXY Protocol 解析模式（可选，默认 auto）
+# PROXY Protocol 全局默认模式（可选，默认 auto）
 # 适用于代理服务挂在 nginx/HAProxy 后面、通过 SNI 分流并使用
 # `proxy_protocol on;` 转发真实客户端 IP 的场景。
-#   "auto"：自动检测（默认），匹配时解析获取真实 IP，不匹配时按普通流量处理（数据回退）
+#   "auto"：全自动识别（默认），匹配时解析获取真实 IP，不匹配时按普通流量处理（数据回退）
 #   "disable"：完全禁用
 #   "require"：强制要求所有连接必须带 PROXY Protocol 头，否则断开
-# 每个连接独立检测，支持 HTTP 直连 + HTTPS 经 nginx 的混合场景。
+# 每个连接独立检测，天然兼容 HTTP 直连 + HTTPS 经 nginx 的混合场景。
+# 如需分别控制 http/https，可用 http_proxy_protocol / https_proxy_protocol 覆盖。
 # 安全提示：建议配置 proxy_protocol_trusted_ips 限制仅接受来自可信代理 IP 的头。
 # proxy_protocol_mode = "auto"
+# http_proxy_protocol = "disable"    # （可选覆盖）HTTP 端口关闭解析
+# https_proxy_protocol = "auto"      # （可选覆盖）HTTPS 端口自动识别
 # proxy_protocol_trusted_ips = ["10.0.0.1"]
 ```
 
@@ -313,12 +315,20 @@ tls_key = "key.pem"
 
 ### 方式五：挂在 nginx/HAProxy 后（PROXY Protocol）
 
-当代理服务部署在 nginx/HAProxy 后面、通过 SNI 分流并使用 `proxy_protocol on;` 转发真实客户端 IP 时，通过 `proxy_protocol_mode` 配置解析模式。**默认即为 `auto` 自动检测**，无需显式配置：
+当代理服务部署在 nginx/HAProxy 后面、通过 SNI 分流并使用 `proxy_protocol on;` 转发真实客户端 IP 时，通过 `proxy_protocol_mode` 配置解析模式。**默认即为 `auto` 全自动识别**，无需显式配置：
 
-- **`auto`（默认，推荐）**：自动检测 —— 每个连接独立检测前 6 字节是否匹配 PROXY v1/v2 签名。匹配则解析真实 IP，不匹配则前缀数据回退给应用层正常处理（不会截断）。**支持 HTTP 直连 + HTTPS 经 nginx 的混合场景**：HTTP 端口无 PROXY 头照常工作，HTTPS 端口有 PROXY 头则解析真实 IP。
+- **`auto`（默认，推荐）**：全自动识别 —— 每个连接独立检测是否符合 PROXY v1/v2 签名。匹配则解析真实 IP，不匹配则前缀数据回退给应用层正常处理（不会截断）。**天然兼容 HTTP 直连 + HTTPS 经 nginx 的混合场景**：HTTP 端口无 PROXY 头照常工作，HTTPS 端口有 PROXY 头则解析真实 IP。不会强制打断直连的 HTTP 请求。
 - **`disable`**：完全禁用，所有连接按普通 HTTP/TLS 处理。
 - **`require`**：强制模式 —— 所有连接必须带 PROXY Protocol 头，否则断开，安全性更高（适合确认上游全是 nginx/LB 的环境）。
-- 旧参数 `--proxy-protocol` 等价于 `require` 模式，为了向后兼容保留。
+- 旧参数 `--proxy-protocol` 等价于 `auto` 模式，为了向后兼容保留；配置中的布尔 `proxy_protocol = true` 已弃用并被忽略。
+
+`proxy_protocol_mode` 同时作为 HTTP 与 HTTPS 两个端口的缺省值。如需**分别控制**（例如 HTTP 普通直连、HTTPS 走 PROXY Protocol），可在配置文件中用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖指定端口，未覆盖的端口回退到全局默认：
+
+```toml
+proxy_protocol_mode = "auto"
+http_proxy_protocol = "disable"    # HTTP 端口按普通直连处理
+https_proxy_protocol = "auto"      # HTTPS 端口自动识别 PROXY 头
+```
 
 ```bash
 # 命令行方式：auto 模式（推荐），同时指定可信代理 IP
@@ -350,7 +360,7 @@ stream {
 }
 ```
 
-> **注意**：`--proxy-protocol` 必须与上游反向代理同时启用或同时关闭，两端协议不匹配会导致连接异常。启用后所有接入连接都会先尝试解析 PROXY Protocol 头（v1/v2 自动检测），解析失败会丢弃该连接并输出 warn 日志。
+> **注意**：若配置为 `require` 强制模式，则必须与上游反向代理同时启用 PROXY Protocol，否则普通连接会被强制解析失败而丢弃。而 `auto`（默认）模式两端可独立使用：没有 PROXY 头的连接自动按普通 HTTP/TLS 处理，带 PROXY 头的连接自动解析真实 IP。
 
 ## 代理设置
 

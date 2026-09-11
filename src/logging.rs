@@ -18,6 +18,18 @@ const MAX_LOG_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// 最多保留的日志文件数量（含当前活动文件）
 const MAX_LOG_FILES: usize = 10;
 
+/// 惰性缓存本地时区偏移（秒），避免每次写日志都调用系统调用。
+///
+/// 时区极少在进程运行期间变化；每次日志写入都调用 `GetTimeZoneInformation`
+/// 或 `localtime_r` 会成为高并发写日志时的热路径开销。这里用 `OnceLock`
+/// 缓存首次计算结果。
+static TZ_OFFSET_CACHE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// 获取本地时区偏移量（秒），带进程级缓存。
+fn get_local_offset_seconds() -> i64 {
+    *TZ_OFFSET_CACHE.get_or_init(compute_local_offset_seconds)
+}
+
 /// 获取当前本地时间的 (年, 月, 日, 时, 分, 秒) 元组
 fn get_local_datetime() -> (u64, u64, u64, u64, u64, u64) {
     let now = SystemTime::now()
@@ -135,7 +147,11 @@ macro_rules! impl_write_for {
     ($ty:ty) => {
         impl Write for $ty {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                let mut inner = self.inner.lock().expect("rolling writer mutex poisoned");
+                // 锁 poison 容错：滚动写入器临界区极短，panic 后继续使用内部状态
+                let mut inner = match self.inner.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => e.into_inner(),
+                };
 
                 let file = inner
                     .current_file
@@ -163,7 +179,10 @@ macro_rules! impl_write_for {
             }
 
             fn flush(&mut self) -> io::Result<()> {
-                let mut inner = self.inner.lock().expect("rolling writer mutex poisoned");
+                let mut inner = match self.inner.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => e.into_inner(),
+                };
                 if let Some(file) = inner.current_file.as_mut() {
                     file.flush()
                 } else {
@@ -331,9 +350,9 @@ fn julian_to_ymd(julian: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
-/// 获取本地时区偏移量（秒）
+/// 直接调用平台 API 计算时区偏移（不缓存）
 #[cfg(windows)]
-fn get_local_offset_seconds() -> i64 {
+fn compute_local_offset_seconds() -> i64 {
     use std::mem::MaybeUninit;
 
     #[repr(C)]
@@ -386,9 +405,9 @@ fn get_local_offset_seconds() -> i64 {
     }
 }
 
-/// 获取本地时区偏移量（秒）
+/// 直接调用平台 API 计算时区偏移（不缓存）
 #[cfg(not(windows))]
-fn get_local_offset_seconds() -> i64 {
+fn compute_local_offset_seconds() -> i64 {
     #[repr(C)]
     struct Tm {
         tm_sec: i32,
@@ -540,5 +559,32 @@ mod tests {
         assert!(log_path.exists(), "current log file should still exist");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ─── julian_to_ymd 测试 ───
+
+    #[test]
+    fn test_julian_to_ymd_known_dates() {
+        // 儒略日 2440588 = 1970-01-01
+        assert_eq!(julian_to_ymd(2440588), (1970, 1, 1));
+        // 2000-01-01 = 儒略日 2451545
+        assert_eq!(julian_to_ymd(2451545), (2000, 1, 1));
+        // 2026-08-14 = 2026-01-01(2461042) + 225 天
+        assert_eq!(julian_to_ymd(2461267), (2026, 8, 14));
+    }
+
+    #[test]
+    fn test_julian_to_ymd_leap_year() {
+        // 2024 是闰年：2024-02-29 有效
+        assert_eq!(julian_to_ymd(2460370), (2024, 2, 29));
+        // 2024-03-01
+        assert_eq!(julian_to_ymd(2460371), (2024, 3, 1));
+    }
+
+    #[test]
+    fn test_julian_to_ymd_year_boundary() {
+        // 跨年边界：2025-12-31 -> 2026-01-01
+        assert_eq!(julian_to_ymd(2461041), (2025, 12, 31));
+        assert_eq!(julian_to_ymd(2461042), (2026, 1, 1));
     }
 }

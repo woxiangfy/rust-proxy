@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinSet;
 use log::{debug, error, info, warn};
 use tokio_rustls::TlsAcceptor;
@@ -29,6 +29,7 @@ use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
 
 use crate::buffer_pool::BufferPool;
 use crate::config::{Args, TlsConfig};
+use crate::io::PrefixedStream;
 use crate::proxy::{handle_client, handle_client_tls, handle_client_with_addr};
 
 /// TLS 证书热重载检查间隔（秒）
@@ -36,6 +37,29 @@ const TLS_RELOAD_CHECK_INTERVAL_SECS: u64 = 3600;
 
 /// 自签证书有效期（年）
 const SELF_SIGNED_VALIDITY_YEARS: i32 = 10;
+
+/// 最大并发连接数（HTTP + HTTPS 合计）
+///
+/// 超出上限后新连接直接关闭（不排队），防止恶意批量连接打满文件句柄与内存。
+const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
+
+/// 容忍 `std::sync::Mutex` poison：锁在持有期间发生 panic 时仍继续使用内部数据。
+///
+/// 代理服务器的锁临界区极短且不跨 await，panic 后内部状态通常仍是自洽的；
+/// 与其让整个服务器因一次 panic 而崩溃，不如继续运行（仅丢弃一次操作）。
+fn mutex_guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 容忍 `std::sync::RwLock` 读锁 poison（语义同 [`mutex_guard`]）
+fn rwlock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 容忍 `std::sync::RwLock` 写锁 poison（语义同 [`mutex_guard`]）
+fn rwlock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 启动代理服务器，根据配置可能同时监听 HTTP 和 HTTPS (TLS) 端口
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
@@ -191,7 +215,7 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         auth,
         args.http_proxy_protocol,
         args.https_proxy_protocol,
-        args.proxy_protocol_trusted_ips.clone(),
+        Arc::new(args.proxy_protocol_trusted_ips.clone()),
         shutdown_rx,
     )
     .await;
@@ -254,7 +278,7 @@ impl TlsReloader {
 
     /// 获取当前 acceptor 的 Arc 引用（供 TLS 握手使用）
     fn current_acceptor(&self) -> Arc<TlsAcceptor> {
-        self.acceptor.read().unwrap().clone()
+        rwlock_read(&self.acceptor).clone()
     }
 
     /// 是否需要定期重载证书文件
@@ -281,8 +305,8 @@ impl TlsReloader {
         let key_mtime = file_mtime(key_path)?;
 
         let need_reload = {
-            let last_cert = *self.last_cert_mtime.lock().unwrap();
-            let last_key = *self.last_key_mtime.lock().unwrap();
+            let last_cert = *mutex_guard(&self.last_cert_mtime);
+            let last_key = *mutex_guard(&self.last_key_mtime);
             last_cert != Some(cert_mtime) || last_key != Some(key_mtime)
         };
 
@@ -293,9 +317,9 @@ impl TlsReloader {
         // 文件已变化，尝试重新加载
         let new_acceptor = build_tls_acceptor_from_files(cert_path, key_path)?;
 
-        *self.acceptor.write().unwrap() = Arc::new(new_acceptor);
-        *self.last_cert_mtime.lock().unwrap() = Some(cert_mtime);
-        *self.last_key_mtime.lock().unwrap() = Some(key_mtime);
+        *rwlock_write(&self.acceptor) = Arc::new(new_acceptor);
+        *mutex_guard(&self.last_cert_mtime) = Some(cert_mtime);
+        *mutex_guard(&self.last_key_mtime) = Some(key_mtime);
 
         Ok(true)
     }
@@ -471,7 +495,7 @@ const PP_HEADER_TIMEOUT_SECS: u64 = 10;
 /// 自动检测 PROXY Protocol 的结果类型
 enum PpDetectResult {
     /// 成功解析 PROXY Protocol 头：真实 IP（可能为 None，表示 UNKNOWN/LOCAL）+ 后续数据流
-    Parsed(Option<SocketAddr>, PrefixedTcpStream),
+    Parsed(Option<SocketAddr>, PrefixedStream<tokio::net::TcpStream>),
     /// 数据不匹配 PROXY Protocol 签名（仅在 `Auto` 模式返回）：已读取的前缀 + 流
     NotMatched(Vec<u8>, tokio::net::TcpStream),
 }
@@ -485,12 +509,16 @@ enum PpParseMode {
     Auto,
 }
 
-/// 判断 peek 到的字节开头是否为 PROXY Protocol v1/v2 签名候选。
+/// 判断字节开头是否为 PROXY Protocol v1/v2 签名候选。
 ///
-/// `seen` 为通过 `peek`（未消费）获取的连接首字节，仅需至少 6 字节即可判断：
+/// `seen` 为连接首字节（至少 6 字节）：
 /// - v1：以 ASCII `PROXY ` 开头
 /// - v2：前 6 字节与 v2 签名头一致
+///
 /// 普通 HTTP 请求首行（如 `GET /`、`CONNECT h`）不会匹配，从而被当作直连流量处理。
+///
+/// 该函数当前仅由单元测试直接使用；运行时签名检测在 [`parse_proxy_protocol`] 内部完成。
+#[cfg(test)]
 fn is_proxy_signature(seen: &[u8]) -> bool {
     if seen.len() < 6 {
         return false;
@@ -503,7 +531,7 @@ fn is_proxy_signature(seen: &[u8]) -> bool {
 /// - `Require` 模式：连接数据必须匹配 PROXY Protocol v1/v2 签名，解析失败返回 `Err`。
 ///   成功时返回 `PpDetectResult::Parsed`。
 /// - `Auto` 模式：若数据匹配则解析并返回 `Parsed`；若不匹配 PROXY Protocol 签名，
-///   返回 `NotMatched`，携带已读取的前缀数据供上层通过 `PrefixedTcpStream`
+///   返回 `NotMatched`，携带已读取的前缀数据供上层通过 [`PrefixedStream`]
 ///   回退给应用层（HTTP/TLS）正常处理。
 ///
 /// 整个读取过程在 `PP_HEADER_TIMEOUT_SECS` 内完成，防止慢速攻击。
@@ -602,7 +630,7 @@ async fn parse_proxy_protocol(
                         stream.read_exact(&mut discard).await?;
                         Ok(PpDetectResult::Parsed(
                             None,
-                            PrefixedTcpStream::new(vec![], stream),
+                            PrefixedStream::new(vec![], stream),
                         ))
                     }
                     1 => {
@@ -612,7 +640,7 @@ async fn parse_proxy_protocol(
                         let addr = parse_pp_v2_addr(fam, &addr_data)?;
                         Ok(PpDetectResult::Parsed(
                             addr,
-                            PrefixedTcpStream::new(vec![], stream),
+                            PrefixedStream::new(vec![], stream),
                         ))
                     }
                     _ => Err(std::io::Error::new(
@@ -648,7 +676,7 @@ async fn parse_proxy_protocol(
                 let addr = parse_pp_v1_line(&line)?;
                 Ok(PpDetectResult::Parsed(
                     addr,
-                    PrefixedTcpStream::new(vec![], stream),
+                    PrefixedStream::new(vec![], stream),
                 ))
             }
         },
@@ -784,67 +812,6 @@ fn parse_pp_v2_addr(fam: u8, data: &[u8]) -> std::io::Result<Option<SocketAddr>>
     }
 }
 
-/// 包装 TcpStream，支持前缀缓冲（用于 PROXY Protocol 解析后保留已读数据）。
-///
-/// `prefix` 中的数据会优先于 TcpStream 被读取，之后直接透传 TcpStream。
-struct PrefixedTcpStream {
-    prefix: Vec<u8>,
-    prefix_pos: usize,
-    inner: tokio::net::TcpStream,
-}
-
-impl PrefixedTcpStream {
-    fn new(prefix: Vec<u8>, inner: tokio::net::TcpStream) -> Self {
-        Self { prefix, prefix_pos: 0, inner }
-    }
-}
-
-impl tokio::io::AsyncRead for PrefixedTcpStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-
-        // 先读 prefix 中剩余的数据
-        if this.prefix_pos < this.prefix.len() {
-            let remaining = &this.prefix[this.prefix_pos..];
-            let n = std::cmp::min(remaining.len(), buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            this.prefix_pos += n;
-            return std::task::Poll::Ready(Ok(()));
-        }
-
-        // prefix 耗尽后透传到 inner
-        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for PrefixedTcpStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
 /// accept_connections_dual 中用于区分 HTTP / HTTPS accept 结果的内部枚举
 enum DualAccept {
     Http(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
@@ -869,10 +836,12 @@ async fn accept_connections_dual(
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
     http_proxy_protocol: crate::config::ProxyProtocolMode,
     https_proxy_protocol: crate::config::ProxyProtocolMode,
-    proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
+    proxy_protocol_trusted_ips: Arc<Vec<std::net::IpAddr>>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut join_set = JoinSet::new();
+    // 并发连接信号量：超出上限的连接直接拒绝（关闭），防止 DoS
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     if http_listener.is_none() && https_listener.is_none() {
         error!("No listeners enabled, server cannot accept connections");
@@ -968,6 +937,7 @@ async fn accept_connections_dual(
                 http_proxy_protocol,
                 https_proxy_protocol,
                 &proxy_protocol_trusted_ips,
+                &conn_semaphore,
             );
         }
         // result == None：定时器触发或 task 完成，直接进入下一轮循环
@@ -982,6 +952,26 @@ async fn drain_joinset(join_set: &mut JoinSet<()>) {
     info!("All active connections completed, server stopped");
 }
 
+/// 尝试获取一个并发连接许可。
+///
+/// 超出 [`MAX_CONCURRENT_CONNECTIONS`] 上限时返回 `None` 并关闭该连接（不排队），
+/// 防止恶意批量连接耗尽资源。返回的许可由处理任务持有，任务结束时自动归还。
+fn try_acquire_conn_permit(
+    semaphore: &Arc<Semaphore>,
+    addr: &SocketAddr,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            warn!(
+                "Connection limit reached ({}), rejecting connection from {}",
+                MAX_CONCURRENT_CONNECTIONS, addr
+            );
+            None
+        }
+    }
+}
+
 /// 将 accept 结果分发到连接处理任务
 #[allow(clippy::too_many_arguments)]
 fn dispatch_accept_result(
@@ -992,17 +982,23 @@ fn dispatch_accept_result(
     auth: &Arc<Option<Vec<crate::config::AuthUser>>>,
     http_proxy_protocol: crate::config::ProxyProtocolMode,
     https_proxy_protocol: crate::config::ProxyProtocolMode,
-    proxy_protocol_trusted_ips: &[std::net::IpAddr],
+    proxy_protocol_trusted_ips: &Arc<Vec<std::net::IpAddr>>,
+    conn_semaphore: &Arc<Semaphore>,
 ) {
     use crate::config::ProxyProtocolMode;
-    let trusted_ips = proxy_protocol_trusted_ips.to_vec();
     match result {
         Some(DualAccept::Http(Ok((client, addr)))) => {
+            // 超出并发上限：关闭连接并跳过
+            let Some(permit) = try_acquire_conn_permit(conn_semaphore, &addr) else {
+                return;
+            };
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
-            let t1 = trusted_ips.clone();
+            let t1 = Arc::clone(proxy_protocol_trusted_ips);
             let pp_mode = http_proxy_protocol;
             join_set.spawn(async move {
+                // 许可在任务整个生命周期内持有，结束后自动归还信号量
+                let _permit = permit;
                 match pp_mode {
                     ProxyProtocolMode::Disable => {
                         handle_client(client, timeout, bp, au).await;
@@ -1017,11 +1013,17 @@ fn dispatch_accept_result(
             error!("Failed to accept HTTP connection: {}", e);
         }
         Some(DualAccept::Https(Ok((client, addr)), tls_reloader)) => {
+            // 超出并发上限：关闭连接并跳过
+            let Some(permit) = try_acquire_conn_permit(conn_semaphore, &addr) else {
+                return;
+            };
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
-            let t2 = trusted_ips.clone();
+            let t2 = Arc::clone(proxy_protocol_trusted_ips);
             let pp_mode = https_proxy_protocol;
             join_set.spawn(async move {
+                // 许可在任务整个生命周期内持有，结束后自动归还信号量
+                let _permit = permit;
                 match pp_mode {
                     ProxyProtocolMode::Disable => {
                         process_tls_client(client, addr, tls_reloader, timeout, bp, au).await;
@@ -1057,7 +1059,7 @@ async fn process_http_client_pp(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
-    trusted_ips: Vec<std::net::IpAddr>,
+    trusted_ips: Arc<Vec<std::net::IpAddr>>,
     pp_mode: crate::config::ProxyProtocolMode,
 ) {
     use crate::config::ProxyProtocolMode;
@@ -1079,77 +1081,42 @@ async fn process_http_client_pp(
         ProxyProtocolMode::Require => PpParseMode::Require,
     };
 
-    if internal_mode == PpParseMode::Auto {
-        // Auto 模式：先用 peek（不消费数据）探测 PROXY 签名。
-        // 避免"预读 6 字节 prefix + 回放"导致 HTTP 首包被截断：
-        // handle_client 只用一次 read 读请求，若数据被 PrefixedTcpStream 分成
-        // prefix+剩余 两段，首次 read 只拿到残缺前缀，HTTP 首行解析失败、代理失效。
-        // 改为 peek 后：非 PROXY 流量数据原样保留，直接交回普通 HTTP 处理，一次读全。
-        let mut probe = [0u8; 12];
-        let probe_res = tokio::time::timeout(
-            Duration::from_secs(PP_HEADER_TIMEOUT_SECS),
-            client.peek(&mut probe),
-        )
-        .await;
-        let signature_detected = match &probe_res {
-            Ok(Ok(n)) if *n >= 6 => is_proxy_signature(&probe[..*n]),
-            _ => false,
-        };
-
-        if signature_detected {
-            debug!(
-                "PROXY Protocol(Auto): signature detected from {}, parsing",
-                fallback_addr
-            );
-            // peek 不消费数据，强制解析会重新读取 PROXY 头
-            match parse_proxy_protocol(client, PpParseMode::Require).await {
-                Ok(PpDetectResult::Parsed(real_opt, stream)) => {
-                    let real_addr = real_opt.unwrap_or(fallback_addr);
-                    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(
-                        "PROXY Protocol(Auto) parse failed from {}: {}",
-                        fallback_addr, e
-                    );
-                }
-            }
-        } else {
-            // 非 PROXY 流量：普通 HTTP 直连，数据未被消费，原样交给 HTTP 处理
-            debug!(
-                "PROXY Protocol(Auto): no signature detected from {}, plain HTTP connection",
-                fallback_addr
-            );
-            handle_client_with_addr(client, fallback_addr, timeout, buffer_pool, auth).await;
-        }
-        return;
-    }
-
-    // Require 模式：所有连接必须以 PROXY Protocol 头开头
-    match parse_proxy_protocol(client, PpParseMode::Require).await {
+    let (real_addr, stream) = match parse_proxy_protocol(client, internal_mode).await {
         Ok(PpDetectResult::Parsed(real_opt, stream)) => {
             let real_addr = real_opt.unwrap_or(fallback_addr);
             debug!(
-                "PROXY Protocol(Require): {} -> real client {}",
-                fallback_addr, real_addr
+                "PROXY Protocol({}): {} -> real client {}",
+                pp_mode, fallback_addr, real_addr
             );
-            handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
+            (real_addr, stream)
         }
-        Ok(PpDetectResult::NotMatched(_, _)) => {
-            // Require 模式下 parse 不会返回 NotMatched，此分支仅防御
-            warn!(
-                "PROXY Protocol(Require): unexpected NotMatched from {}",
+        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
+            // Auto 模式：不匹配 → 回退，携带 prefix 供 HTTP 请求头解析使用。
+            // handle_client 的 read_request_head 会多次读取直到找到头结束符，
+            // 因此前缀字节不会丢失。
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain HTTP",
                 fallback_addr
             );
+            (fallback_addr, PrefixedStream::new(prefix, tcp))
         }
         Err(e) => {
-            warn!(
-                "PROXY Protocol(Require) parse failed from {}: {}",
-                fallback_addr, e
-            );
+            if matches!(pp_mode, ProxyProtocolMode::Require) {
+                warn!(
+                    "PROXY Protocol(Require) parse failed from {}: {}",
+                    fallback_addr, e
+                );
+            } else {
+                debug!(
+                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
+                    fallback_addr, e
+                );
+            }
+            return;
         }
-    }
+    };
+
+    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
 }
 
 /// PROXY Protocol 启用时的 HTTPS 连接处理：
@@ -1162,7 +1129,7 @@ async fn process_tls_client_pp(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
-    trusted_ips: Vec<std::net::IpAddr>,
+    trusted_ips: Arc<Vec<std::net::IpAddr>>,
     pp_mode: crate::config::ProxyProtocolMode,
 ) {
     use crate::config::ProxyProtocolMode;
@@ -1199,7 +1166,7 @@ async fn process_tls_client_pp(
                 "PROXY Protocol(Auto): no signature detected from {}, fallback to plain TLS",
                 fallback_addr
             );
-            (fallback_addr, PrefixedTcpStream::new(prefix, tcp))
+            (fallback_addr, PrefixedStream::new(prefix, tcp))
         }
         Err(e) => {
             if matches!(pp_mode, ProxyProtocolMode::Require) {
@@ -1217,7 +1184,7 @@ async fn process_tls_client_pp(
         }
     };
 
-    // TLS 握手（与 process_tls_client 逻辑一致，但流类型为 PrefixedTcpStream）
+    // TLS 握手（与 process_tls_client 逻辑一致，但流类型为 PrefixedStream<TcpStream>）
     let acceptor = tls_reloader.current_acceptor();
     let tls_handshake_timeout = Duration::from_secs(10);
     let tls_stream = match tokio::time::timeout(tls_handshake_timeout, acceptor.accept(stream)).await {
@@ -1488,5 +1455,68 @@ mod tests {
         assert!(!is_proxy_signature(b""));
         assert!(!is_proxy_signature(b"GET"));
         assert!(!is_proxy_signature(b"PROX"));
+    }
+
+    // ─── 锁 poison 容错测试 ───
+
+    #[test]
+    fn test_mutex_guard_survives_poison() {
+        // 故意污染 Mutex：持锁期间 panic
+        let m = Mutex::new(42u32);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = m.lock().unwrap();
+            panic!("intentional panic to poison the mutex");
+        });
+
+        // 锁被污染后 mutex_guard 仍能读取并写入数据
+        assert_eq!(*mutex_guard(&m), 42);
+        *mutex_guard(&m) = 7;
+        assert_eq!(*mutex_guard(&m), 7);
+    }
+
+    #[test]
+    fn test_rwlock_helpers_survive_poison() {
+        // 写锁污染：持锁期间 panic
+        let rw = RwLock::new("value".to_string());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = rw.write().unwrap();
+            panic!("intentional panic to poison the rwlock");
+        });
+
+        // 污染后读/写均应正常
+        assert_eq!(rwlock_read(&rw).as_str(), "value");
+        rwlock_write(&rw).push('!');
+
+        // 读锁污染同理
+        let rw2 = RwLock::new(1u8);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = rw2.read().unwrap();
+            panic!("intentional panic to poison the read lock");
+        });
+        assert_eq!(*rwlock_read(&rw2), 1);
+    }
+
+    // ─── 并发连接信号量测试 ───
+
+    #[test]
+    fn test_conn_permit_exhaustion_rejects_connections() {
+        let sem = Arc::new(Semaphore::new(2));
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // 前 2 个连接可获取许可
+        let p1 = try_acquire_conn_permit(&sem, &addr).expect("first permit");
+        let p2 = try_acquire_conn_permit(&sem, &addr).expect("second permit");
+
+        // 第 3 个连接被拒绝（信号量耗尽）
+        assert!(
+            try_acquire_conn_permit(&sem, &addr).is_none(),
+            "third connection must be rejected when the semaphore is exhausted"
+        );
+
+        // 释放一个许可后新连接可重新进入
+        drop(p1);
+        let p3 = try_acquire_conn_permit(&sem, &addr).expect("permit after release");
+        drop(p2);
+        drop(p3);
     }
 }

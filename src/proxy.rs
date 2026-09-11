@@ -1,7 +1,8 @@
 //! Proxy module containing HTTP proxy request handling logic with zero-copy optimization and DNS caching
 
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
+use crate::io::PrefixedStream;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::net::SocketAddr;
@@ -11,6 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsConnector, native_tls};
 use log::{debug, error, info, warn};
+
+/// 请求头最大字节数：超过则视为畸形/恶意请求（防御超大头攻击）
+const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Combined trait for stream types used by `test_proxy`.
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -69,7 +73,7 @@ pub async fn handle_client_tls<S>(
 
 /// 通用客户端连接处理逻辑（与具体传输层 TCP/TLS 无关）
 ///
-/// 接受任意 AsyncRead + AsyncWrite 流，完成请求解析、认证、分发到 CONNECT 或 HTTP 处理。
+/// 接受任意 AsyncRead + AsyncWrite 流，完成请求头读取、解析、认证、分发到 CONNECT 或 HTTP 处理。
 async fn handle_client_generic<S>(
     mut client: S,
     client_addr: SocketAddr,
@@ -81,43 +85,37 @@ async fn handle_client_generic<S>(
 {
     let timeout_duration = Duration::from_secs(timeout);
 
-    // Get a buffer from the pool (zero-copy, no allocation if available)
-    let mut buf = buffer_pool.get();
-    let buf_slice = buf.as_mut_slice();
-
-    // Read request data directly into the pooled buffer
-    let n = match tokio::time::timeout(timeout_duration, client.read(buf_slice)).await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
+    // 读取完整请求头（含可能的 body 前缀），常见情况零拷贝复用池化缓冲区
+    let storage = match read_request_head(&mut client, &buffer_pool, timeout_duration).await {
+        Ok(s) => s,
+        Err(e) => {
             if is_benign_close_error(&e) {
                 debug!("Read from client {} ended: {}", client_addr, e);
             } else {
-                warn!("Failed to read from client {}: {}", client_addr, e);
+                warn!("Failed to read request from client {}: {}", client_addr, e);
             }
-            return;
-        }
-        Err(_) => {
-            warn!("Read from client {} timed out", client_addr);
             return;
         }
     };
 
-    if n == 0 {
+    let data = storage.as_slice();
+    if data.is_empty() {
         return;
     }
 
-    // Use String::from_utf8_lossy without copying if possible
-    let request_data = String::from_utf8_lossy(&buf_slice[..n]);
-    let mut lines = request_data.lines();
+    // 请求头结束位置（body 起始偏移）；未找到头结束符时视为整个数据都是头
+    let head_end = head_end_offset(data);
+    let head = &data[..head_end];
+    // 请求头为 ASCII，lossy 转换不会损坏后续二进制 body（body 按字节切片处理）
+    let head_str = String::from_utf8_lossy(head);
 
-    let request_line = match lines.next() {
+    let request_line = match head_str.lines().next() {
         Some(line) => line,
         None => return,
     };
 
     info!("{} -> {}", client_addr, request_line);
 
-    // Parse request
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         warn!("Invalid request from {}: {}", client_addr, request_line);
@@ -147,7 +145,7 @@ async fn handle_client_generic<S>(
     // 第二步：认证校验。配置了 [[auth]] 时才校验。
     // 只有确认是代理请求后才会可能返回 407，降低"被扫描识别为代理"的风险。
     if let Some(users) = auth.as_ref() {
-        if !check_proxy_auth(&request_data, users) {
+        if !check_proxy_auth(&head_str, users) {
             send_auth_required(&mut client).await;
             warn!("Proxy authentication failed from {}", client_addr);
             return;
@@ -156,12 +154,103 @@ async fn handle_client_generic<S>(
 
     // Handle CONNECT method (HTTPS tunneling)
     if method == "CONNECT" {
-        handle_connect_generic(client, url, client_addr, timeout_duration).await;
+        // 请求头之后的字节是隧道协议数据（如 TLS ClientHello），必须保留并交给隧道
+        let leftover = &data[head_end..];
+        handle_connect_generic(client, url, client_addr, timeout_duration, leftover).await;
         return;
     }
 
     // Handle HTTP proxy request with buffer pool
-    handle_http_request_generic(client, &request_data, client_addr, timeout_duration, buffer_pool).await;
+    handle_http_request_generic(client, data, head_end, client_addr, timeout_duration, buffer_pool).await;
+}
+
+/// 请求头读取结果的存储方式
+///
+/// 常见情况（请求头在第一次读取内完成）复用池化缓冲区，实现零拷贝；
+/// 大请求头则需要扩展堆缓冲。
+enum RequestStorage {
+    /// 单次读取即包含完整请求头：直接持有池化缓冲区（零拷贝）
+    Pooled(PooledBuffer, usize),
+    /// 需要多次读取的大请求：持有堆缓冲
+    Heap(Vec<u8>),
+}
+
+impl RequestStorage {
+    /// 获取已读数据的字节切片
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            RequestStorage::Pooled(b, n) => &b.as_slice()[..*n],
+            RequestStorage::Heap(v) => v,
+        }
+    }
+}
+
+/// 查找请求头结束位置（第一个 `\r\n\r\n` 之后的偏移），未找到返回 `None`
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// 请求头结束位置（body 起始偏移）；未找到头结束符时返回 `data.len()`
+fn head_end_offset(data: &[u8]) -> usize {
+    find_header_end(data).unwrap_or(data.len())
+}
+
+/// 读取请求头，直到出现 `\r\n\r\n`（或达到 `MAX_HEADER_BYTES` 上限 / 客户端 EOF）。
+///
+/// 整个读取过程受一次 `timeout` 约束，防止慢速攻击（slowloris）逐次续期。
+/// 常见情况（一次读取即含完整头）复用池化缓冲区，零拷贝。
+async fn read_request_head<S>(
+    client: &mut S,
+    buffer_pool: &BufferPool,
+    timeout: Duration,
+) -> std::io::Result<RequestStorage>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::time::timeout(timeout, read_request_head_inner(client, buffer_pool))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out reading request head",
+            )
+        })?
+}
+
+async fn read_request_head_inner<S>(
+    client: &mut S,
+    buffer_pool: &BufferPool,
+) -> std::io::Result<RequestStorage>
+where
+    S: AsyncRead + Unpin,
+{
+    // 第一段读入池化缓冲区（常见路径：零拷贝）
+    let mut buf = buffer_pool.get();
+    let n = client.read(buf.as_mut_slice()).await?;
+    if n == 0 {
+        return Ok(RequestStorage::Pooled(buf, 0));
+    }
+    if find_header_end(&buf.as_slice()[..n]).is_some() {
+        return Ok(RequestStorage::Pooled(buf, n));
+    }
+
+    // 慢路径：多次读取累积到堆缓冲。
+    // 注意：短读（n < BUFFER_SIZE）不代表客户端已发完，TCP 可能分片，
+    // 因此必须继续读取直到出现头结束符、超限或 EOF。
+    let mut data = Vec::with_capacity(2 * BUFFER_SIZE);
+    data.extend_from_slice(&buf.as_slice()[..n]);
+    loop {
+        let m = client.read(buf.as_mut_slice()).await?;
+        if m == 0 {
+            break; // EOF：用已有数据返回
+        }
+        data.extend_from_slice(&buf.as_slice()[..m]);
+        if find_header_end(&data).is_some() || data.len() >= MAX_HEADER_BYTES {
+            break;
+        }
+    }
+    Ok(RequestStorage::Heap(data))
 }
 
 /// 代理请求分类结果
@@ -303,12 +392,54 @@ async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     let _ = client.write_all(response.as_bytes()).await;
 }
 
+/// 异步 DNS 解析并连接目标主机
+///
+/// 与直接 `TcpStream::connect((host, port))` 不同，`lookup_host` 是异步的，
+/// 不会在 Tokio 运行时内执行阻塞的 `getaddrinfo`（同步 DNS 会阻塞工作线程）。
+/// 对解析出的多个地址（多 A/AAAA 记录）依次尝试，直到连接成功。
+async fn connect_host(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let addrs = match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port))).await {
+        Ok(res) => res.map_err(std::io::Error::other)?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("DNS lookup timed out for {}:{}", host, port),
+            ))
+        }
+    };
+
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Connection to {}:{} timed out", host, port),
+                ))
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("No address resolved for {}", host),
+        )
+    }))
+}
+
 /// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）
+///
+/// `leftover` 是请求头之后已经读入的字节（如客户端与 CONNECT 一并发送的 TLS ClientHello），
+/// 会作为隧道前缀保留，避免数据丢失。
 async fn handle_connect_generic<S>(
     client: S,
     host_port: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
+    leftover: &[u8],
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -320,55 +451,51 @@ async fn handle_connect_generic<S>(
         }
     };
 
-    // 直接使用主机名连接，由操作系统负责 DNS 解析和缓存
-    // (&str, u16) 直接实现 ToSocketAddrs，无需额外的 String 分配
-    let target = match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port))).await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            error!("Failed to connect to {}:{} from {}: {}", host, port, client_addr, e);
-            return;
-        }
-        Err(_) => {
-            error!("Connection to {}:{} timed out", host, port);
+    // CONNECT 目标主机字符串，供 DNS/连接使用。若为方括号 IPv6，去掉方括号
+    // （`[a:b::1]` 需转换为 `a:b::1` 才能通过 tokio lookup_host 解析）。
+    let connect_host_str = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let mut target = match connect_host(connect_host_str, port, timeout_duration).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                "Failed to connect to {}:{} from {}: {}",
+                connect_host_str, port, client_addr, e
+            );
             return;
         }
     };
 
-    // 使用 tokio::io::split 将泛型流拆分为读写两半，便于双向 copy
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-    let (mut target_read, mut target_write) = target.into_split();
+    // 将预读字节作为前缀保留，交给隧道双向转发
+    let mut client = PrefixedStream::new(leftover.to_vec(), client);
 
     // Send 200 Connection Established
-    if client_write.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .is_err()
+    {
         return;
     }
 
-    // Tunnel data bidirectionally using tokio::io::copy (zero-copy internally)
-    let client_to_target = tokio::io::copy(&mut client_read, &mut target_write);
-    let target_to_client = tokio::io::copy(&mut target_read, &mut client_write);
-
-    match tokio::time::timeout(timeout_duration * 2, async {
-        let (ct_result, tc_result) = tokio::join!(client_to_target, target_to_client);
-        if let Err(e) = ct_result {
+    // 双向隧道：`copy_bidirectional` 正确处理半关闭（一侧 EOF 时关闭另一侧写端），
+    // 且不对隧道总时长设限——长连接 HTTPS 会话可无限期保持（旧实现的总超时会断开长会话）。
+    // 返回值为 `(client→target 字节数, target→client 字节数)`。
+    match tokio::io::copy_bidirectional(&mut client, &mut target).await {
+        Ok((c2t, t2c)) => info!(
+            "CONNECT tunnel closed: {}:{} ({} bytes client→target, {} bytes target→client)",
+            host, port, c2t, t2c
+        ),
+        Err(e) => {
             if is_benign_close_error(&e) {
-                debug!("Client to target copy ended: {}", e);
+                debug!("CONNECT tunnel closed: {}:{} ({})", host, port, e);
             } else {
-                warn!("Client to target copy error: {}", e);
+                warn!("CONNECT tunnel error: {}:{} ({})", host, port, e);
             }
         }
-        if let Err(e) = tc_result {
-            if is_benign_close_error(&e) {
-                debug!("Target to client copy ended: {}", e);
-            } else {
-                warn!("Target to client copy error: {}", e);
-            }
-        }
-    })
-    .await
-    {
-        Ok(_) => info!("CONNECT tunnel closed: {}:{}", host, port),
-        Err(_) => debug!("CONNECT tunnel timed out: {}:{}", host, port),
     }
 }
 
@@ -390,16 +517,24 @@ fn is_benign_close_error(e: &std::io::Error) -> bool {
 }
 
 /// Handle standard HTTP proxy request with buffer reuse（泛型版本，支持 TCP/TLS 客户端流）
+///
+/// `request_data` 为已读入的全部数据（头 + 可能的 body 前缀），`head_end` 为 body 起始偏移。
+/// 请求行以 origin-form 转发给目标服务器（旧实现遗漏请求行，导致明文 HTTP 代理失效）。
+/// body 按 Content-Length / Transfer-Encoding: chunked 流式转发，支持大请求体。
 async fn handle_http_request_generic<S>(
     mut client: S,
-    request_data: &str,
+    request_data: &[u8],
+    head_end: usize,
     client_addr: SocketAddr,
     timeout_duration: Duration,
     buffer_pool: Arc<BufferPool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut lines = request_data.lines();
+    let head = &request_data[..head_end];
+    let head_str = String::from_utf8_lossy(head);
+    let mut lines = head_str.lines();
+
     let request_line = match lines.next() {
         Some(line) => line,
         None => return,
@@ -434,60 +569,131 @@ async fn handle_http_request_generic<S>(
 
     info!("{} -> {} {}:{} -> {}", client_addr, method, host, port, url);
 
-    // 直接使用主机名连接，由操作系统负责 DNS 解析和缓存
-    let mut target = match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port)))
-        .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
+    let mut target = match connect_host(host, port, timeout_duration).await {
+        Ok(t) => t,
+        Err(e) => {
             error!("Failed to connect to {}:{} from {}: {}", host, port, client_addr, e);
-            return;
-        }
-        Err(_) => {
-            error!("Connection to {}:{} timed out", host, port);
             return;
         }
     };
 
-    // Forward request headers without copying when possible
-    let mut header_buffer = String::new();
+    // 转发请求行：origin-form（path + query），这是直连目标服务器的标准形式
+    let target_path = match parsed_url.query() {
+        Some(q) => format!("{}?{}", parsed_url.path(), q),
+        None => parsed_url.path().to_string(),
+    };
+    let mut header_buffer = String::with_capacity(512);
+    header_buffer.push_str(method);
+    header_buffer.push(' ');
+    header_buffer.push_str(&target_path);
+    header_buffer.push_str(" HTTP/1.1\r\n");
+
+    // 解析头部并过滤逐跳头（proxy-connection、proxy-authorization，避免凭据泄漏）；
+    // 保留 transfer-encoding（body 以原始 chunked 分帧转发）；connection 改写为 close。
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        let line_lower = line.to_ascii_lowercase();
-        // 过滤逐跳头：proxy-connection、transfer-encoding，以及携带凭据的
-        // proxy-authorization（认证完成后不应转发给目标服务器）
-        if !line_lower.contains("proxy-connection")
-            && !line_lower.contains("transfer-encoding")
-            && !line_lower.contains("proxy-authorization")
-        {
-            // Modify connection header
-            let line_to_send = if line_lower.starts_with("connection:") {
-                "Connection: close\r\n"
-            } else {
-                line
-            };
-            header_buffer.push_str(line_to_send);
-            header_buffer.push_str("\r\n");
+        // 精确按头名匹配（旧实现用 contains 匹配子串，会误伤合法头）
+        let (name, value) = match line.split_once(':') {
+            Some(pair) => pair,
+            None => {
+                // 无冒号的行（如续行）原样转发
+                header_buffer.push_str(line);
+                header_buffer.push_str("\r\n");
+                continue;
+            }
+        };
+        let name = name.trim();
+        let value = value.trim();
+
+        if name.eq_ignore_ascii_case("connection") {
+            header_buffer.push_str("Connection: close\r\n");
+            continue;
         }
+        if name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            if value.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+            header_buffer.push_str(line);
+            header_buffer.push_str("\r\n");
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse::<u64>().ok();
+            header_buffer.push_str(line);
+            header_buffer.push_str("\r\n");
+            continue;
+        }
+        header_buffer.push_str(line);
+        header_buffer.push_str("\r\n");
     }
     header_buffer.push_str("\r\n");
 
-    // Send headers in one write operation
     if target.write_all(header_buffer.as_bytes()).await.is_err() {
         return;
     }
 
-    // Forward body if present (for POST, PUT, etc.) - zero-copy
-    if method == "POST" || method == "PUT" || method == "PATCH" {
-        if let Some(body_start) = request_data.find("\r\n\r\n") {
-            let body = &request_data[body_start + 4..];
-            if !body.is_empty() {
-                let _ = target.write_all(body.as_bytes()).await;
+    // 转发 body：先转发已缓冲的剩余字节，再按 Content-Length / chunked 流式转发
+    let buffered_body = &request_data[head_end..];
+    if !buffered_body.is_empty() && target.write_all(buffered_body).await.is_err() {
+        return;
+    }
+
+    if chunked {
+        // 流式转发 chunked 请求体，直到终止块（0\r\n\r\n）
+        let result = forward_chunked_body(&mut client, &mut target, timeout_duration, &buffer_pool).await;
+        if let Err(e) = result {
+            if !is_benign_close_error(&e) {
+                warn!("Failed to forward chunked request body from {}: {}", client_addr, e);
+            }
+            return;
+        }
+    } else if let Some(cl) = content_length {
+        // 按 Content-Length 精确流式转发剩余 body（支持大文件上传）
+        let already_sent = buffered_body.len() as u64;
+        if cl > already_sent {
+            let mut remaining = cl - already_sent;
+            let mut tmp = buffer_pool.get();
+            let tmp_slice = tmp.as_mut_slice();
+            loop {
+                let want = std::cmp::min(remaining as usize, tmp_slice.len());
+                let m = match tokio::time::timeout(timeout_duration, client.read(&mut tmp_slice[..want])).await {
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => {
+                        if !is_benign_close_error(&e) {
+                            warn!("Error reading request body from {}: {}", client_addr, e);
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("Timeout reading request body from {}", client_addr);
+                        return;
+                    }
+                };
+                if m == 0 {
+                    // 客户端提前关闭，body 不完整
+                    warn!("Client {} closed before sending complete request body", client_addr);
+                    break;
+                }
+                if target.write_all(&tmp_slice[..m]).await.is_err() {
+                    return;
+                }
+                remaining -= m as u64;
+                if remaining == 0 {
+                    break;
+                }
             }
         }
     }
+    // 无 Content-Length 且非 chunked：仅转发已缓冲字节（历史行为）
 
     // Read response and forward to client using pooled buffer
     let mut response_buf = buffer_pool.get();
@@ -520,15 +726,219 @@ async fn handle_http_request_generic<S>(
     info!("Request completed: {} {}", method, url);
 }
 
-/// Parse host:port string into host and port
-fn parse_host_port(host_port: &str) -> Result<(&str, u16), String> {
-    let parts: Vec<&str> = host_port.splitn(2, ':').collect();
-    if parts.len() == 2 {
-        let port = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
-        Ok((parts[0], port))
-    } else {
-        Ok((host_port, 443)) // Default HTTPS port
+/// RFC 7230 chunked 请求体分帧状态机
+///
+/// 仅用于识别 body 结束位置（最终块 `0\r\n` 及随后的空行），所有字节原样转发。
+struct ChunkedBodyReader {
+    state: ChunkState,
+    /// chunk-size 行 / trailer 行缓冲
+    line: Vec<u8>,
+    /// 当前 chunk 剩余数据字节
+    chunk_remaining: u64,
+    /// chunk 数据后已消费的 CRLF 字节数（0..=2）
+    crlf_seen: u8,
+    done: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ChunkState {
+    /// 读取 chunk-size 行（可能跨多个输入片段）
+    SizeLine,
+    /// 转发 chunk 数据
+    Data,
+    /// 等待 chunk 数据后的 \r\n
+    DataCrlf,
+    /// 读取 trailer（遇空行结束）
+    Trailers,
+}
+
+impl ChunkedBodyReader {
+    fn new() -> Self {
+        Self {
+            state: ChunkState::SizeLine,
+            line: Vec::with_capacity(16),
+            chunk_remaining: 0,
+            crlf_seen: 0,
+            done: false,
+        }
     }
+
+    #[inline]
+    fn done(&self) -> bool {
+        self.done
+    }
+
+    /// 消费一个输入字节，推进分帧状态
+    fn push_byte(&mut self, b: u8) {
+        if self.done {
+            return;
+        }
+        match self.state {
+            ChunkState::SizeLine => {
+                if self.line.len() >= 64 {
+                    self.done = true; // 防御：chunk-size/trailer 行异常长
+                    return;
+                }
+                self.line.push(b);
+                if self.line.ends_with(b"\r\n") {
+                    match parse_chunk_size(&self.line) {
+                        Some(0) => {
+                            self.line.clear();
+                            self.state = ChunkState::Trailers;
+                        }
+                        Some(n) => {
+                            self.line.clear();
+                            self.chunk_remaining = n;
+                            self.state = ChunkState::Data;
+                        }
+                        None => self.done = true, // 畸形行：停止转发
+                    }
+                }
+            }
+            ChunkState::Data => {
+                if self.chunk_remaining > 0 {
+                    self.chunk_remaining -= 1;
+                    if self.chunk_remaining == 0 {
+                        self.crlf_seen = 0;
+                        self.state = ChunkState::DataCrlf;
+                    }
+                }
+            }
+            ChunkState::DataCrlf => {
+                if self.crlf_seen == 0 && b == b'\r' {
+                    self.crlf_seen = 1;
+                } else if self.crlf_seen == 1 && b == b'\n' {
+                    self.crlf_seen = 2;
+                    self.state = ChunkState::SizeLine;
+                } else {
+                    self.done = true; // 畸形 CRLF：停止转发
+                }
+            }
+            ChunkState::Trailers => {
+                if self.line.len() >= 64 {
+                    self.done = true;
+                    return;
+                }
+                self.line.push(b);
+                if self.line.ends_with(b"\r\n") {
+                    if self.line == b"\r\n" {
+                        self.done = true; // 空行：body 结束
+                    } else {
+                        self.line.clear(); // trailer 行，继续
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 解析 chunk-size 行（可能带 extension：`1a;ext=val`），返回十六进制大小
+fn parse_chunk_size(line: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(line).ok()?;
+    let s = s.strip_suffix("\r\n").unwrap_or(s);
+    let hex = s.split(';').next()?.trim();
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// 流式转发 chunked 编码的请求体。
+///
+/// 已缓冲的 body 前缀由调用方先行转发；本函数从客户端继续读取，按分帧状态机
+/// 解析并原样转发，直到遇到终止块 `0\r\n` 及随后的空行（trailer 结束）。
+/// 输出按 BUFFER_SIZE 批量 flush，避免逐字节写。
+async fn forward_chunked_body<S, T>(
+    client: &mut S,
+    target: &mut T,
+    timeout: Duration,
+    buffer_pool: &BufferPool,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+    T: AsyncWrite + Unpin,
+{
+    let mut reader = ChunkedBodyReader::new();
+    let mut buf = buffer_pool.get();
+    let buf_slice = buf.as_mut_slice();
+    let mut out: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+
+    loop {
+        let n = match tokio::time::timeout(timeout, client.read(buf_slice)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timeout reading chunked body",
+                ))
+            }
+        };
+        if n == 0 {
+            // 客户端在完整分帧前关闭：按已收到内容结束（目标端会因 body 不完整而报错）
+            return Ok(());
+        }
+
+        for &b in &buf_slice[..n] {
+            reader.push_byte(b);
+            out.push(b);
+            if out.len() >= BUFFER_SIZE {
+                target.write_all(&out).await?;
+                out.clear();
+            }
+            if reader.done() {
+                if !out.is_empty() {
+                    target.write_all(&out).await?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Parse host:port, our own最小化实现。
+///
+/// 支持形式：
+/// - `host`（无端口，默认 443）
+/// - `host:port`
+/// - `[ipv6]:port`（带方括号的 IPv6 字面量，符合 URL 规范）
+///
+/// 裸 IPv6（不含方括号，如 `::1`）因含多个冒号无法可靠拆分，会返回 Err 或误判；
+/// 规范要求使用方括号形式。
+fn parse_host_port(host_port: &str) -> Result<(&str, u16), String> {
+    // 带方括号的 IPv6：先在末尾的 "]:" 处拆分，避免被内部冒号干扰
+    if host_port.starts_with('[') {
+        return parse_bracketed_ipv6(host_port);
+    }
+
+    match host_port.split_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse::<u16>().map_err(|e| e.to_string())?;
+            Ok((host, port))
+        }
+        None => Ok((host_port, 443)), // 无端口，默认 HTTPS 端口
+    }
+}
+
+/// 解析 `[ipv6]:port` 形式的带方括号 IPv6 地址
+fn parse_bracketed_ipv6(host_port: &str) -> Result<(&str, u16), String> {
+    // 定位 "]"
+    let close = host_port
+        .find(']')
+        .ok_or_else(|| format!("unclosed '[' in host:port '{}'", host_port))?;
+    let host = &host_port[..=close]; // 含方括号，如 "[::1]"
+
+    let rest = &host_port[close + 1..];
+    if rest.is_empty() {
+        return Ok((host, 443)); // 无端口，默认 443
+    }
+    if !rest.starts_with(':') {
+        return Err(format!(
+            "expected ':port' after ']' in host:port '{}'",
+            host_port
+        ));
+    }
+    let port = rest[1..]
+        .parse::<u16>()
+        .map_err(|e| format!("invalid port in '{}': {}", host_port, e))?;
+    Ok((host, port))
 }
 
 /// Extract `(username, password)` from the userinfo component of a proxy URL.
@@ -1140,5 +1550,121 @@ mod tests {
             classify_proxy_request("GET", "ftp://files.example.com/a"),
             ProxyRequestKind::Invalid
         );
+    }
+
+    // ─── parse_host_port 测试 ───
+
+    #[test]
+    fn test_parse_host_port_with_port() {
+        let (host, port) = parse_host_port("example.com:8080").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_host_port_without_port_defaults_443() {
+        let (host, port) = parse_host_port("example.com").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443, "CONNECT 默认端口应为 443");
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4() {
+        let (host, port) = parse_host_port("1.2.3.4:9999").unwrap();
+        assert_eq!(host, "1.2.3.4");
+        assert_eq!(port, 9999);
+    }
+
+    #[test]
+    fn test_parse_host_port_bracketed_ipv6() {
+        // 带方括号的 IPv6 字面量（URL 标准形式）
+        let (host, port) = parse_host_port("[::1]:8443").unwrap();
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn test_parse_host_port_bare_ipv6() {
+        // 无端口、无方括号的裸 IPv6 —— 会因含多个冒号被误判。
+        // 这是已知限制（与旧实现一致）；文档标注用户应使用方括号形式。
+        let (host, port) = parse_host_port("::1").unwrap_or(("fallback", 443));
+        assert_eq!(host, "fallback");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_host_port_invalid_port_error() {
+        assert!(parse_host_port("example.com:notaport").is_err(), "非数字端口应报错");
+        assert!(parse_host_port("example.com:99999").is_err(), "端口超出 u16 范围应报错");
+    }
+
+    // ─── chunked 分帧状态机测试 ───
+
+    /// 用给定数据驱动 `ChunkedBodyReader`，返回其是否在正确位置判定结束。
+    fn drive_chunked(data: &[u8]) -> bool {
+        let mut r = ChunkedBodyReader::new();
+        for &b in data {
+            r.push_byte(b);
+            if r.done() {
+                return true;
+            }
+        }
+        r.done()
+    }
+
+    #[test]
+    fn test_chunked_termination_single_chunk() {
+        // "4\r\ndata\r\n0\r\n\r\n" —— 单 chunk + 终止块 + 空行
+        let data = b"4\r\ndata\r\n0\r\n\r\n";
+        assert!(drive_chunked(data), "chunked body 应正确处理单块并结束");
+    }
+
+    #[test]
+    fn test_chunked_termination_multiple_chunks() {
+        let data = b"3\r\nfoo\r\n4\r\nbar!\r\n0\r\n\r\n";
+        assert!(drive_chunked(data));
+    }
+
+    #[test]
+    fn test_chunked_large_in_single_pass() {
+        // 单个大数据块（跨内部 crlf 边界仍应识别）
+        let data = b"a\r\n0123456789\r\n0\r\n\r\n";
+        assert!(drive_chunked(data));
+    }
+
+    #[test]
+    fn test_chunked_with_trailer() {
+        // 终止块后带 trailer 行再以空行结束
+        let data = b"1\r\na\r\n0\r\nX-Custom: val\r\n\r\n";
+        assert!(drive_chunked(data), "应支持 trailer 字段后收尾");
+    }
+
+    #[test]
+    fn test_chunked_incomplete_not_done() {
+        // body 未完整发送：不应判定为结束
+        let data = b"4\r\ndata\r\n0\r\n";
+        assert!(!drive_chunked(data), "缺少最终空行时不应视为结束");
+    }
+
+    #[test]
+    fn test_chunked_size_with_extension_parsed() {
+        let line: &[u8] = b"1a;ext=value\r\n";
+        assert_eq!(parse_chunk_size(line), Some(0x1a));
+    }
+
+    #[test]
+    fn test_chunked_invalid_size_line_stops() {
+        // 畸形 chunk-size（非十六进制）→ 状态机应终止转发
+        let data = b"zz\r\ndata\r\n";
+        assert!(drive_chunked(data), "畸形 chunk-size 应触发 done 停止");
+    }
+
+    #[test]
+    fn test_parse_chunk_size_basic() {
+        assert_eq!(parse_chunk_size(b"1a\r\n"), Some(26));
+        assert_eq!(parse_chunk_size(b"0\r\n"), Some(0));
+        assert_eq!(parse_chunk_size(b"A\r\n"), Some(10)); // 大小写不敏感
+        assert_eq!(parse_chunk_size(b"garbage\r\n"), None);
+        assert_eq!(parse_chunk_size(b""), None);
     }
 }

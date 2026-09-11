@@ -349,7 +349,10 @@ mod windows_service {
         })?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        *SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
+        // 锁 poison 容错：服务生命周期的锁，panic 后继续使用内部状态
+        let mut guard = SHUTDOWN_TX.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(shutdown_tx);
+        drop(guard);
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,

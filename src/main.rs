@@ -8,6 +8,7 @@
 
 mod buffer_pool;
 mod config;
+mod io;
 mod logging;
 mod proxy;
 mod server;

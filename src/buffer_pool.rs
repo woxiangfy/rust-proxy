@@ -59,7 +59,8 @@ impl BufferPool {
     /// 优先从池中复用已有缓冲区；若池为空则分配新的。
     /// 当池为空且当前容量未达硬上限时，自动扩容（容量翻倍）。
     pub fn get(&self) -> PooledBuffer {
-        let mut state = self.state.lock().unwrap();
+        // 锁 poison 容错：临界区极短且不跨 await，panic 后状态自洽，继续使用
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(buf) = state.buffers.pop() {
             state.outstanding += 1;
@@ -87,13 +88,13 @@ impl BufferPool {
     /// 返回当前池中的缓冲区数量（仅用于测试和监控）
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.state.lock().unwrap().buffers.len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).buffers.len()
     }
 
     /// 返回当前池容量上限（仅用于测试和监控）
     #[cfg(test)]
     fn max_size(&self) -> usize {
-        self.state.lock().unwrap().max_size
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).max_size
     }
 }
 
@@ -131,24 +132,23 @@ impl Drop for PooledBuffer {
         // 同步归还缓冲区，避免生成 Tokio 任务的开销
         let buf = std::mem::take(&mut self.data);
 
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding = state.outstanding.saturating_sub(1);
-            state.idle_drops += 1;
+        // 锁 poison 容错：即使锁已损坏也归还缓冲区，避免内存泄漏
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.outstanding = state.outstanding.saturating_sub(1);
+        state.idle_drops += 1;
 
-            if state.buffers.len() < state.max_size {
-                state.buffers.push(buf);
-            }
-
-            // 缩容判断：连续归还次数超阈值且容量未到最小值
-            if state.idle_drops > SHRINK_THRESHOLD && state.max_size > MIN_POOL_SIZE {
-                state.max_size /= 2;
-                state.idle_drops = 0;
-                // 丢弃超出新容量的缓冲区
-                let new_max = state.max_size;
-                state.buffers.truncate(new_max);
-            }
+        if state.buffers.len() < state.max_size {
+            state.buffers.push(buf);
         }
-        // 如果获取锁失败（理论上不会发生），缓冲区直接释放
+
+        // 缩容判断：连续归还次数超阈值且容量未到最小值
+        if state.idle_drops > SHRINK_THRESHOLD && state.max_size > MIN_POOL_SIZE {
+            state.max_size /= 2;
+            state.idle_drops = 0;
+            // 丢弃超出新容量的缓冲区
+            let new_max = state.max_size;
+            state.buffers.truncate(new_max);
+        }
     }
 }
 
@@ -234,5 +234,23 @@ mod tests {
         assert_eq!(pool.max_size(), HARD_MAX_POOL_SIZE);
 
         drop(all_bufs);
+    }
+
+    #[test]
+    fn test_pool_survives_poisoned_lock() {
+        let pool = BufferPool::new();
+
+        // 故意污染池的内部锁：持锁期间 panic
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = pool.state.lock().unwrap();
+            panic!("intentional panic to poison the pool lock");
+        });
+
+        // 锁被污染后 get/drop/len/max_size 均应正常工作
+        let buf = pool.get();
+        assert_eq!(buf.as_slice().len(), BUFFER_SIZE);
+        drop(buf);
+        assert_eq!(pool.len(), 1);
+        assert!(pool.max_size() >= MIN_POOL_SIZE);
     }
 }

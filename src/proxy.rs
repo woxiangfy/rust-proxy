@@ -1,4 +1,4 @@
-//! Proxy module containing HTTP proxy request handling logic with zero-copy optimization and DNS caching
+//! Proxy module containing HTTP proxy request handling logic with zero-copy buffer reuse
 
 use crate::buffer_pool::{BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
@@ -1005,12 +1005,8 @@ fn build_proxy_auth_header(
         }
     };
 
-    // Format: Basic <base64(user:pass)>
-    let credentials = if pass.is_empty() {
-        user.to_string()
-    } else {
-        format!("{}:{}", user, pass)
-    };
+    // Format: Basic <base64(user:pass)>。空密码也保留冒号，与服务端 `split_once(':')` 解析保持一致。
+    let credentials = format!("{}:{}", user, pass);
     let encoded = BASE64_STANDARD.encode(credentials.as_bytes());
     Some(format!("Basic {}", encoded))
 }
@@ -1456,7 +1452,7 @@ mod tests {
     fn test_build_proxy_auth_header_partial_cli_no_url() {
         // 仅 --username 无 --password，URL 也无凭证
         let header = build_proxy_auth_header("http://proxy.local:8080", Some("user"), None);
-        assert_eq!(header.as_deref(), Some("Basic dXNlcg=="));
+        assert_eq!(header.as_deref(), Some("Basic dXNlcjo="));
     }
 
     // ─── classify_proxy_request 反扫描测试 ───

@@ -2,7 +2,7 @@
 
 ## 简介
 
-轻量级 HTTP/HTTPS 代理服务器，拿来即用，支持异步高并发处理。AI辅组开发。
+轻量级 HTTP/HTTPS 代理服务器，拿来即用，支持异步高并发处理。AI 辅助开发。
 
 ## 功能特性
 
@@ -31,7 +31,7 @@
 ./rust-proxy start --config /path/to/config.toml
 
 # 测试代理连接
-./rust-proxy test 127.0.0.1:8080
+./rust-proxy test http://127.0.0.1:8080
 ```
 
 ### 启用 HTTPS 代理接入
@@ -90,6 +90,8 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--tls-key`    | TLS 私钥文件路径（PEM 格式，PKCS#8 或 RSA） | 无（缺失时自动生成自签证书）      |
 | `--proxy-protocol` | 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`），用于挂在 nginx/HAProxy 后的场景 | false            |
 | `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔），仅接受来自这些 IP 的 PROXY Protocol 头 | 无（接受所有来源）            |
+| `--proxy-protocol-mode` | PROXY Protocol 全局默认模式：`auto` / `disable` / `require` | auto               |
+| `--multi-thread` | 启用多线程 Tokio 运行时                        | false                |
 
 > **启用规则**：只有显式指定 `--https-port` 才会启用 HTTPS 代理。若同时提供了合法 `--tls-cert` + `--tls-key`，则使用用户证书并支持热重载；若证书缺失或加载失败，则自动生成 10 年有效期自签证书（输出 warn 日志）。证书/私钥支持相对路径（相对于配置文件目录解析）和绝对路径。
 
@@ -158,6 +160,8 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 | `--tls-key`    | TLS 私钥文件路径   | 无（缺失时自动生成自签证书）                    |
 | `--proxy-protocol` | 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`） | false            |
 | `--proxy-protocol-trusted-ips` | PROXY Protocol 可信代理 IP 列表（逗号分隔） | 无（接受所有来源）            |
+
+> 其余参数（`--multi-thread`、`--proxy-protocol-mode`、`--config` 等）与 `start` 命令一致，见下方「配置参数」表。
 
 #### 使用注意事项
 
@@ -370,7 +374,8 @@ stream {
 | ------- | ---------------- |
 | HTTP代理  | `127.0.0.1:8080` |
 | HTTPS代理 | `127.0.0.1:8080` |
-| FTP代理   | `127.0.0.1:8080` |
+
+> 本代理为 HTTP/HTTPS 代理，不支持 FTP 协议（`ftp://` 请求会被视为非代理请求而返回 404）。
 
 ### curl 测试
 
@@ -401,27 +406,28 @@ $env:https_proxy="http://127.0.0.1:8080"
 
 ### 控制台输出
 
-默认情况下，日志直接输出到控制台：
+默认情况下，日志直接输出到控制台（stderr），格式为 `YYYY-MM-DD HH:MM:SS 级别 消息`（本地时间）：
 
 ```
-2026-06-20T10:30:00.123456Z  INFO rust_proxy::server: Proxy server listening on 0.0.0.0:8080
-2026-06-20T10:30:05.234567Z  INFO 127.0.0.1:54321 -> GET http://example.com -> 200 OK
+2026-06-20 10:30:00 INFO Binding HTTP address: 0.0.0.0:8080
+2026-06-20 10:30:00 INFO rust_proxy is running
+2026-06-20 10:30:05 INFO 127.0.0.1:54321 -> GET http://example.com/ HTTP/1.1
 ```
 
 ### 日志文件
 
-指定日志文件后，日志同时写入文件和控制台：
+指定日志文件后，日志仅写入该文件（不再输出到控制台）：
 
 ```bash
-./rust-proxy --log-file proxy.log
+./rust-proxy start --log-file proxy.log
 ```
 
 日志文件格式示例：
 
 ```
-2026-06-20T10:30:00.123456Z  INFO Starting HTTP proxy server on 0.0.0.0:8080
-2026-06-20T10:30:05.234567Z  INFO 127.0.0.1:54321 -> GET http://example.com
-2026-06-20T10:30:05.567890Z  INFO Request completed: GET http://example.com
+2026-06-20 10:30:00 INFO Binding HTTP address: 0.0.0.0:8080
+2026-06-20 10:30:00 INFO rust_proxy is running
+2026-06-20 10:30:05 INFO 127.0.0.1:54321 -> GET http://example.com/ HTTP/1.1
 ```
 
 ## 常见问题
@@ -429,7 +435,7 @@ $env:https_proxy="http://127.0.0.1:8080"
 ### 1. 端口被占用
 
 ```
-Error: Failed to bind to 0.0.0.0:8080
+Error: Failed to bind HTTP to 0.0.0.0:8080
 ```
 
 解决方法：使用其他端口或停止占用端口的进程
@@ -452,10 +458,10 @@ lsof -i :8080
 
 ```bash
 # Linux/Mac
-sudo ./rust-proxy --log-file /var/log/proxy.log
+sudo ./rust-proxy start --log-file /var/log/proxy.log
 
 # 或使用用户有权限的目录
-./rust-proxy --log-file ./proxy.log
+./rust-proxy start --log-file ./proxy.log
 ```
 
 ### 4. HTTPS网站无法访问
@@ -555,4 +561,14 @@ mv key.new.pem key.pem
 - 默认超时时间 30 秒适合大多数场景
 - 高并发场景下，日志级别建议使用 `info` 或更高
 - 日志文件会占用磁盘空间，定期清理或轮转日志
+
+## 变更记录
+
+### 本轮（代码与文档）
+
+- 修复 `test` 子命令在空密码场景下的认证头编码：由 `user` 改为 `user:`，与服务端 `split_once(':')` 解析对齐，使空密码用户也能通过认证。
+- 修正 `proxy.rs` 模块头不实意的 “DNS caching” 描述（实际未实现 DNS 缓存）。
+- 移除 `LogLevel` 的空 `impl` 块（冗余代码）。
+- 文档：修正 `test` 命令示例（代理地址须含 `http://`/`https://` 前缀）、日志格式示例（本地时间、无模块前缀/微秒）、`--log-file` 用法（须用于 `start` 子命令；且写文件后不再输出到控制台）、补全 `start` 命令参数表（`--proxy-protocol-mode`、`--multi-thread`）、移除 FTP 代理误导项。
+- 新增前台 `start` 命令的优雅关停：监听 SIGINT/SIGTERM（Linux/macOS）与 Ctrl+C（Windows），收到信号后停止接受新连接并等待活跃连接处理完成后退出（此前仅系统服务模式具备优雅关停）。
 

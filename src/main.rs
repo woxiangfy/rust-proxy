@@ -16,6 +16,7 @@ mod service;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::sync::oneshot;
 
 use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerRunArgs, ServerSubcommand};
 
@@ -29,6 +30,49 @@ fn create_runtime(multi_thread: bool) -> Result<tokio::runtime::Runtime> {
             .build()
             .context("无法创建单线程 Tokio 运行时")
     }
+}
+
+/// 监听前台运行时的操作系统关停信号，触发优雅关停。
+///
+/// 前台 `start` 命令不依赖服务管理机制（Windows 服务 / systemd），因此需要
+/// 自行监听关停信号并通知 [`server::run_server`] 进入优雅关停流程：
+/// 停止接受新连接，等待所有活跃连接处理完成后退出。
+///
+/// - Unix（Linux/macOS）：监听 SIGINT（Ctrl+C）与 SIGTERM
+/// - Windows：监听 Ctrl+C
+///
+/// 返回一个在信号到达时被唤醒的 [`oneshot::Receiver`]，供 [`server::run_server`] 的
+/// `shutdown_rx` 参数接收。
+fn spawn_shutdown_signal(runtime: &tokio::runtime::Runtime) -> Result<oneshot::Receiver<()>> {
+    let (tx, rx) = oneshot::channel();
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint =
+            signal(SignalKind::interrupt()).context("无法注册 SIGINT 信号处理器")?;
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("无法注册 SIGTERM 信号处理器")?;
+        runtime.spawn(async move {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        runtime.spawn(async move {
+            // 注册失败仅影响优雅关停能力，不影响代理主流程本身，故忽略错误
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = tx.send(());
+            }
+        });
+    }
+
+    Ok(rx)
 }
 
 /// 程序主入口函数
@@ -53,7 +97,8 @@ fn main() -> Result<()> {
             let args = Args::from_run_args(&start_args);
             logging::setup_logging(&args.log_file, &args.log_level)?;
             let runtime = create_runtime(args.multi_thread)?;
-            runtime.block_on(server::run_server(&args, None))?;
+            let shutdown_rx = spawn_shutdown_signal(&runtime)?;
+            runtime.block_on(server::run_server(&args, Some(shutdown_rx)))?;
         }
         Commands::Test { proxy_url, url, username, password } => {
             logging::setup_logging(&None, &LogLevel::Info)?;

@@ -18,8 +18,6 @@ pub enum LogLevel {
     Trace,
 }
 
-impl LogLevel {}
-
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

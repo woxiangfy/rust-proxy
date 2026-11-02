@@ -8,8 +8,10 @@
 
 mod buffer_pool;
 mod config;
+mod http_body;
 mod io;
 mod logging;
+mod net;
 mod path_proxy;
 mod proxy;
 mod server;

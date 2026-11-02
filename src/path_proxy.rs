@@ -25,7 +25,8 @@
 //!    重写为 `/<prefix>/<绝对URL>`，使重定向后的请求继续走本代理。
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool};
-use crate::proxy::{connect_host, forward_chunked_body, is_benign_close_error};
+use crate::http_body::forward_chunked_body;
+use crate::net::{connect_host, is_benign_close_error, AsyncStream};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
@@ -35,10 +36,6 @@ use tokio_native_tls::{native_tls, TlsConnector};
 
 /// 请求/响应头最大字节数：超过则按畸形请求处理（防御超大头攻击）
 const MAX_HEAD_BYTES: usize = 64 * 1024;
-
-/// Combined trait for the two upstream stream flavours (plain TCP / TLS).
-trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 /// 路径前缀直连模式配置
 #[derive(Debug, Clone)]

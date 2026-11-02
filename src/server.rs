@@ -31,7 +31,7 @@ use crate::buffer_pool::BufferPool;
 use crate::config::{Args, TlsConfig};
 use crate::io::PrefixedStream;
 use crate::path_proxy::PathProxyConfig;
-use crate::proxy::{handle_client, handle_client_tls, handle_client_with_addr};
+use crate::proxy::{handle_client, handle_client_with_addr};
 
 /// TLS 证书热重载检查间隔（秒）
 const TLS_RELOAD_CHECK_INTERVAL_SECS: u64 = 3600;
@@ -1247,7 +1247,7 @@ async fn process_tls_client_pp(
             return;
         }
     };
-    handle_client_tls(tls_stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
+    handle_client_with_addr(tls_stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// 执行一次 TLS 证书热重载检查
@@ -1269,7 +1269,7 @@ fn handle_tls_reload(tls_reloader: &TlsReloader) {
     }
 }
 
-/// 对 accept 下来的 HTTPS socket 执行 TLS 握手，成功后交给 handle_client_tls
+/// 对 accept 下来的 HTTPS socket 执行 TLS 握手，成功后交给 handle_client_with_addr
 async fn process_tls_client(
     client: tokio::net::TcpStream,
     addr: SocketAddr,
@@ -1293,7 +1293,7 @@ async fn process_tls_client(
             return;
         }
     };
-    handle_client_tls(tls_stream, addr, timeout, buffer_pool, auth, path_proxy).await;
+    handle_client_with_addr(tls_stream, addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 #[cfg(test)]

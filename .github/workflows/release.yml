@@ -28,10 +28,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: x86_64-pc-windows-msvc
+          key: x86_64-pc-windows-msvc-${{ env.ImageOS }}
 
       - name: Build release
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Prepare artifact directory
         run: mkdir -p release
@@ -43,10 +43,11 @@ jobs:
         run: cd release && tar -czf ../rust-proxy-x86_64-pc-windows-msvc.tar.gz rust-proxy.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-proxy-x86_64-pc-windows-msvc
           path: rust-proxy-x86_64-pc-windows-msvc.tar.gz
+          if-no-files-found: error
 
   build-windows-gnu:
     runs-on: windows-latest
@@ -62,13 +63,13 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: x86_64-pc-windows-gnu
+          key: x86_64-pc-windows-gnu-${{ env.ImageOS }}
 
       - name: Install MinGW
         run: choco install mingw -y
 
       - name: Build release
-        run: cargo build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
 
       - name: Prepare artifact directory
         run: mkdir -p release
@@ -80,20 +81,32 @@ jobs:
         run: cd release && tar -czf ../rust-proxy-x86_64-pc-windows-gnu.tar.gz rust-proxy.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-proxy-x86_64-pc-windows-gnu
           path: rust-proxy-x86_64-pc-windows-gnu.tar.gz
+          if-no-files-found: error
 
   build-linux-gnu:
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
+    # 固定 glibc 2.35 基线（Ubuntu 22.04，支持到 2027）：
+    #   - 隔离 ubuntu-latest 迁到 26.04 带来的 glibc/OpenSSL 变化
+    #   - 20.04 已过标准支持期，apt 源随时可能变动
+    #   - 需要更老的 glibc 兼容性时用 musl 产物（完全静态）
+    container: ubuntu:22.04
     steps:
+      # 必须排在 checkout 之前：
+      #   1. 该基础镜像没有 git，checkout 会静默降级成 REST API 拉 tarball（无 .git）
+      #   2. openssl 是 vendored 从源码编译，需要 perl（Configure 脚本）
+      #   3. actions/cache 需要 zstd，否则退化成 gzip，缓存版本与其它 job 不一致
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git perl build-essential zstd gzip tar
+
       - name: Checkout code
         uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: apt-get update && apt-get install -y curl build-essential
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -103,10 +116,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: x86_64-unknown-linux-gnu
+          key: x86_64-unknown-linux-gnu-${{ env.ImageOS }}
 
       - name: Build release
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
       - name: Prepare artifact directory
         run: mkdir -p release
@@ -118,10 +131,11 @@ jobs:
         run: cd release && tar -czf ../rust-proxy-x86_64-unknown-linux-gnu.tar.gz rust-proxy
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-proxy-x86_64-unknown-linux-gnu
           path: rust-proxy-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
 
   build-linux-musl:
     runs-on: ubuntu-latest
@@ -137,13 +151,13 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: x86_64-unknown-linux-musl
+          key: x86_64-unknown-linux-musl-${{ env.ImageOS }}
 
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build release
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Prepare artifact directory
         run: mkdir -p release
@@ -155,29 +169,43 @@ jobs:
         run: cd release && tar -czf ../rust-proxy-x86_64-unknown-linux-musl.tar.gz rust-proxy
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-proxy-x86_64-unknown-linux-musl
           path: rust-proxy-x86_64-unknown-linux-musl.tar.gz
+          if-no-files-found: error
 
   release:
     needs: [build-windows-msvc, build-windows-gnu, build-linux-gnu, build-linux-musl]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          files: |
-            artifacts/rust-proxy-x86_64-pc-windows-msvc/rust-proxy-x86_64-pc-windows-msvc.tar.gz
-            artifacts/rust-proxy-x86_64-pc-windows-gnu/rust-proxy-x86_64-pc-windows-gnu.tar.gz
-            artifacts/rust-proxy-x86_64-unknown-linux-gnu/rust-proxy-x86_64-unknown-linux-gnu.tar.gz
-            artifacts/rust-proxy-x86_64-unknown-linux-musl/rust-proxy-x86_64-unknown-linux-musl.tar.gz
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # 只上传 tar.gz，避免把目录结构带进 release assets
+          shopt -s nullglob
+          files=(artifacts/*/*.tar.gz)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no tar.gz found under artifacts/, download-artifact step failed?"
+            ls -R artifacts || true
+            exit 1
+          fi
+          printf 'assets:\n'; printf '  %s\n' "${files[@]}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, uploading assets with --clobber"
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" --title "$TAG" \
+              --target "$GITHUB_SHA" --generate-notes
+          fi
+
+          echo "release url: $(gh release view "$TAG" --json url -q .url)"

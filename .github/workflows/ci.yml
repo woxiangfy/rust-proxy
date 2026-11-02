@@ -28,14 +28,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          cache-key: ${{ matrix.target }}
-
-      - name: Install OpenSSL (Linux)
-        if: matrix.target == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+          key: ${{ matrix.target }}-${{ env.ImageOS }}
 
       - name: Cargo check
-        run: cargo check
+        run: cargo check --locked --all-targets
 
       - name: Cargo test
-        run: cargo test --no-fail-fast
+        run: cargo test --locked --no-fail-fast

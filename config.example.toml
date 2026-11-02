@@ -76,3 +76,21 @@ port = 8080
 # http_proxy_protocol = "disable"     # （可选覆盖）HTTP 端口关闭解析
 # https_proxy_protocol = "auto"       # （可选覆盖）HTTPS 端口自动识别
 # proxy_protocol_trusted_ips = ["10.0.0.1"]  # 仅接受来自 nginx IP 的 PROXY Protocol 头
+
+# ── 路径前缀直连模式（可选，类似 gh-proxy.com 的用法）──
+# 启用后，客户端无需配置代理，直接请求下方形式的网址即可由本代理直连上游并回传内容：
+#   http://<代理地址>:<端口>/px/https://www.baidu.com/   → 实际访问 https://www.baidu.com/
+#   http://<代理地址>:<端口>/px/http://example.com/a.txt → 实际访问 http://example.com/a.txt
+# 只有精确命中前缀的请求会被接管，其余路径请求仍返回 404（前缀相当于一个路径口令）。
+# 省略 path_proxy_prefix 即不启用该模式。
+# 注意：启用后本端口相当于一个「URL 网关」，建议同时配置 [[auth]] 防止被当作开放中继滥用。
+#
+# path_proxy_prefix = "px"
+#
+# 跳过上游 TLS 证书校验（默认 false）。仅对 https 上游生效，
+# 用于自签证书 / 证书链不完整的内网站点。
+# path_proxy_insecure_tls = false
+#
+# 是否把 3xx 响应的 Location 重写为 /px/<绝对URL>（默认 true）。
+# 开启后重定向后的请求仍由本代理转发；关闭则原样透传上游 Location（客户端会直连上游）。
+# path_proxy_rewrite_location = true

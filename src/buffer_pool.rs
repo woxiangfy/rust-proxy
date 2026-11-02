@@ -5,9 +5,113 @@
 //! - 连续归还 20 次未触发扩容时，自动减半缩容（最少 4 个），丢弃多余缓冲区
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// 代理操作使用的缓冲区大小
+/// 池化缓冲区大小（请求头读取、短请求转发等短生命周期场景）
+///
+/// 大文件转发的 body 拷贝不再用固定大小，而是走 [`AdaptiveBuffer`]：
+/// 初始 8KB，持续传输后自动翻倍到 256KB，兼顾「小请求省内存」与「大文件少系统调用」。
 pub const BUFFER_SIZE: usize = 8192;
+
+// ── 自适应拷贝缓冲区参数 ──
+
+/// 初始大小：8KB（小响应/小请求几乎不占额外内存）
+pub const ADAPTIVE_INITIAL: usize = 8 * 1024;
+/// 上限：再大收益趋于平坦，而每连接常驻内存 ×2（8KB→256KB 共 5 次翻倍）
+pub const ADAPTIVE_MAX: usize = 256 * 1024;
+/// 持续传输超过该时长后翻倍（慢速链路 / 长时间下载的主要触发条件）
+pub const ADAPTIVE_GROW_INTERVAL: Duration = Duration::from_secs(5);
+/// 或已拷贝超过该字节数后翻倍：纯时间触发对「几秒就下完」的快连接不生效，
+/// 补一条按量的触发条件，让 1Gbps+ 内网/loopback 的大文件也能快速用上大缓冲。
+pub const ADAPTIVE_GROW_AFTER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 自适应拷贝缓冲区
+///
+/// 生命周期跟着一次 body 转发走：开始 8KB，满足触发条件（持续 5s 或累计拷贝 32MB）
+/// 就翻倍，直到 256KB 上限；每次翻倍之间互不叠加，避免瞬间冲顶。
+///
+/// 为什么按「时间 + 字节」双条件：小文件下载（<8KB 级）直接用 8KB 结束，零额外内存；
+/// 大文件下载才会逐步放大，最终把每 MB 的 read/write 系统调用从 256 次降到 4 次。
+#[derive(Debug)]
+pub struct AdaptiveBuffer {
+    buf: Vec<u8>,
+    started: Instant,
+    /// 下一次允许按时间翻倍的时刻（相对 `started`）
+    next_grow_at: Duration,
+    /// 下一次允许按字节翻倍的门槛
+    next_grow_bytes: u64,
+    /// 自上次翻倍以来累计拷贝的字节数
+    copied: u64,
+    interval: Duration,
+    grow_after_bytes: u64,
+    max: usize,
+}
+
+impl AdaptiveBuffer {
+    pub fn new() -> Self {
+        Self::with_limits(
+            ADAPTIVE_INITIAL,
+            ADAPTIVE_GROW_INTERVAL,
+            ADAPTIVE_GROW_AFTER_BYTES,
+            ADAPTIVE_MAX,
+        )
+    }
+
+    fn with_limits(initial: usize, interval: Duration, grow_after_bytes: u64, max: usize) -> Self {
+        let initial = initial.clamp(1, max.max(1));
+        Self {
+            buf: vec![0u8; initial],
+            started: Instant::now(),
+            next_grow_at: interval,
+            next_grow_bytes: grow_after_bytes,
+            copied: 0,
+            interval,
+            grow_after_bytes,
+            max,
+        }
+    }
+
+    /// 每次 read 前调用：到点则翻倍（写入 0 填充的新长度）
+    #[inline]
+    pub fn prepare(&mut self) {
+        if self.buf.len() >= self.max {
+            return;
+        }
+        let due = self.started.elapsed() >= self.next_grow_at
+            || (self.grow_after_bytes > 0 && self.copied >= self.next_grow_bytes);
+        if !due {
+            return;
+        }
+        let new_len = (self.buf.len().saturating_mul(2)).min(self.max);
+        self.buf.resize(new_len, 0);
+        self.copied = 0;
+        self.next_grow_at = self.started.elapsed() + self.interval;
+        self.next_grow_bytes = self.grow_after_bytes;
+        log::debug!("Adaptive copy buffer grew to {} KB", new_len / 1024);
+    }
+
+    /// 记录本次实际拷贝的字节数（用于按量触发翻倍）
+    #[inline]
+    pub fn note_copied(&mut self, n: usize) {
+        self.copied = self.copied.saturating_add(n as u64);
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    #[inline]
+    pub fn current_size(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl Default for AdaptiveBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── 动态扩缩容常量 ──
 
@@ -155,6 +259,77 @@ impl Drop for PooledBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── 自适应拷贝缓冲区 ───
+
+    #[test]
+    fn test_adaptive_starts_at_initial_size() {
+        let buf = AdaptiveBuffer::new();
+        assert_eq!(buf.current_size(), ADAPTIVE_INITIAL);
+        assert_eq!(ADAPTIVE_INITIAL, 8 * 1024);
+    }
+
+    #[test]
+    fn test_adaptive_small_transfer_does_not_grow() {
+        let mut buf = AdaptiveBuffer::new();
+        // 小响应：拷贝 8KB，未达按量阈值（32MB），时间也没到 5s
+        buf.note_copied(8 * 1024);
+        buf.prepare();
+        assert_eq!(buf.current_size(), ADAPTIVE_INITIAL, "小传输不应扩容");
+    }
+
+    #[test]
+    fn test_adaptive_grows_by_bytes() {
+        let mut buf = AdaptiveBuffer::with_limits(8192, Duration::from_secs(3600), 1000, 1 << 20);
+        assert_eq!(buf.current_size(), 8192);
+        buf.note_copied(1000);
+        buf.prepare();
+        assert_eq!(buf.current_size(), 16384, "累计达阈值应翻倍");
+        // 翻倍后计数清零，需再累计一个阈值才继续翻倍
+        buf.note_copied(500);
+        buf.prepare();
+        assert_eq!(buf.current_size(), 16384, "未达新阈值不应翻倍");
+        buf.note_copied(500);
+        buf.prepare();
+        assert_eq!(buf.current_size(), 32768);
+    }
+
+    #[test]
+    fn test_adaptive_grows_by_time_and_caps() {
+        // interval=0：每次 prepare 都到点，验证翻倍序列与上限
+        let mut buf = AdaptiveBuffer::with_limits(8192, Duration::ZERO, 0, 256 * 1024);
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            buf.prepare();
+            sizes.push(buf.current_size());
+        }
+        assert_eq!(
+            sizes,
+            vec![16384, 32768, 65536, 131072, 262144, 262144, 262144, 262144],
+            "应逐次翻倍并在 256KB 封顶"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_default_cap_is_256k() {
+        let mut buf = AdaptiveBuffer::with_limits(ADAPTIVE_INITIAL, Duration::ZERO, 0, ADAPTIVE_MAX);
+        for _ in 0..10 {
+            buf.prepare();
+        }
+        assert_eq!(buf.current_size(), 256 * 1024);
+        // 8KB → 256KB 共 5 次翻倍，每 MB 的系统调用从 256 次降到 8 次
+        assert_eq!(ADAPTIVE_MAX / ADAPTIVE_INITIAL, 32);
+    }
+
+    #[test]
+    fn test_adaptive_buffer_zero_filled_and_writable() {
+        let mut buf = AdaptiveBuffer::new();
+        buf.prepare();
+        let s = buf.as_mut_slice();
+        assert!(s.iter().all(|&b| b == 0), "扩容后新增区域必须是 0");
+        s[0] = 1;
+        s[s.len() - 1] = 2;
+    }
 
     #[test]
     fn test_buffer_pool_reuse() {

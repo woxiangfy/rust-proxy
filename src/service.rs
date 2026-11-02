@@ -108,6 +108,15 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from(ips_str));
     }
 
+    // 路径前缀直连模式
+    if let Some(prefix) = &run_args.path_proxy_prefix {
+        command_args.push(OsString::from("--path-proxy-prefix"));
+        command_args.push(OsString::from(prefix));
+    }
+    if run_args.path_proxy_insecure {
+        command_args.push(OsString::from("--path-proxy-insecure"));
+    }
+
     let description = DEFAULT_SERVICE_DESCRIPTION.to_string();
 
     #[cfg(target_os = "linux")]

@@ -149,6 +149,20 @@ pub struct ServerRunArgs {
     /// 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
     #[arg(long, value_delimiter = ',')]
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
+
+    /// 启用路径前缀直连模式并指定前缀（如 px）
+    ///
+    /// 启用后，请求 `http://代理地址/px/https://example.com/` 会被代理服务器
+    /// 直连到 `https://example.com/`，客户端无需配置代理即可使用（类似 gh-proxy）。
+    /// 前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。
+    #[arg(long, value_name = "PREFIX")]
+    pub path_proxy_prefix: Option<String>,
+
+    /// 路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
+    ///
+    /// 仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。
+    #[arg(long)]
+    pub path_proxy_insecure: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -180,6 +194,11 @@ pub struct ServerArgs {
     pub subcommand: ServerSubcommand,
 }
 
+/// 服务管理子命令
+///
+/// `Install` 携带完整的运行参数（与 `start` 一致），因此该枚举各变体大小差异较大；
+/// 枚举仅在启动时构造一次，装箱带来的间接访问反而无收益。
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum ServerSubcommand {
     Install(ServerRunArgs),
@@ -252,6 +271,15 @@ pub struct Args {
     pub proxy_protocol: ProxyProtocolMode,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
+    /// 路径前缀直连模式的前缀（`None` 表示不启用该模式）
+    ///
+    /// 启用后 `/px/https://example.com/` 这类请求会由代理服务器直连上游并回传内容。
+    /// 前缀合法性在 `server` 层构造 [`crate::path_proxy::PathProxyConfig`] 时校验。
+    pub path_proxy_prefix: Option<String>,
+    /// 路径前缀直连模式是否跳过上游 TLS 证书校验
+    pub path_proxy_insecure_tls: bool,
+    /// 路径前缀直连模式是否重写 3xx 响应的 `Location`（默认 true）
+    pub path_proxy_rewrite_location: bool,
 }
 
 impl Args {
@@ -396,6 +424,20 @@ impl Args {
                         .unwrap_or_default()
                 }
             },
+            // 路径前缀直连模式：前缀 CLI 优先于配置文件；两个开关项取「配置 ∪ CLI」
+            path_proxy_prefix: run_args
+                .path_proxy_prefix
+                .clone()
+                .or_else(|| config.as_ref().and_then(|c| c.path_proxy_prefix.clone())),
+            path_proxy_insecure_tls: run_args.path_proxy_insecure
+                || config
+                    .as_ref()
+                    .map(|c| c.path_proxy_insecure_tls)
+                    .unwrap_or(false),
+            path_proxy_rewrite_location: config
+                .as_ref()
+                .and_then(|c| c.path_proxy_rewrite_location)
+                .unwrap_or(true),
         }
     }
 
@@ -482,6 +524,17 @@ pub struct Config {
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     #[serde(default)]
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
+    /// 路径前缀直连模式前缀（如 "px"）。省略即不启用该模式。
+    ///
+    /// 启用后：`http://代理地址/px/https://example.com/` → 直连 `https://example.com/`。
+    pub path_proxy_prefix: Option<String>,
+    /// 路径前缀直连模式下跳过上游 TLS 证书校验（默认 false）
+    #[serde(default)]
+    pub path_proxy_insecure_tls: bool,
+    /// 是否把 3xx 响应的 `Location` 重写为 `/<prefix>/<绝对URL>`（默认 true）
+    ///
+    /// 开启后重定向仍由本代理转发；关闭则原样透传上游 Location（客户端会直连上游）。
+    pub path_proxy_rewrite_location: Option<bool>,
 }
 
 /// Load configuration from a TOML file
@@ -605,6 +658,8 @@ port = 8080
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -637,6 +692,8 @@ port = 8080
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect(
@@ -664,6 +721,8 @@ port = 8080
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert!(
@@ -700,6 +759,8 @@ tls_key = "key.pem"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -726,6 +787,8 @@ tls_key = "key.pem"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, None, "port must be None when only https_port is specified");
@@ -748,6 +811,8 @@ tls_key = "key.pem"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(Args::DEFAULT_PORT));
@@ -770,6 +835,8 @@ tls_key = "key.pem"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(9090), "explicit port should be preserved");
@@ -800,6 +867,8 @@ port = 7777
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(7777));
@@ -871,6 +940,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1"]
             proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: cli_ips.clone(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol_trusted_ips, cli_ips);
@@ -903,6 +974,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol_trusted_ips.len(), 2);
@@ -926,6 +999,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -947,6 +1022,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -967,6 +1044,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol_mode: Some(ProxyProtocolMode::Auto),
             proxy_protocol: true,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -996,6 +1075,8 @@ proxy_protocol_mode = "auto"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -1028,6 +1109,8 @@ proxy_protocol = true
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -1062,6 +1145,8 @@ https_proxy_protocol = "require"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         // 全局默认仍为 auto
@@ -1089,6 +1174,8 @@ proxy_protocol_mode = "auto"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         });
         assert_eq!(args2.http_proxy_protocol, ProxyProtocolMode::Auto);
         assert_eq!(args2.https_proxy_protocol, ProxyProtocolMode::Auto);
@@ -1120,6 +1207,8 @@ proxy_protocol_mode = "disable"
             proxy_protocol_mode: None,
             proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Disable);
@@ -1174,5 +1263,95 @@ proxy_protocol_mode = "disable"
             let s = mode.to_string();
             assert_eq!(s.parse::<ProxyProtocolMode>().unwrap(), mode);
         }
+    }
+
+    // ─── 路径前缀直连模式配置测试 ───
+
+    #[test]
+    fn test_parse_path_proxy_from_config() {
+        let toml_str = r#"
+port = 8080
+path_proxy_prefix = "px"
+path_proxy_insecure_tls = true
+path_proxy_rewrite_location = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.path_proxy_prefix.as_deref(), Some("px"));
+        assert!(config.path_proxy_insecure_tls);
+        assert_eq!(config.path_proxy_rewrite_location, Some(false));
+    }
+
+    #[test]
+    fn test_path_proxy_defaults_when_absent() {
+        // 未配置时：模式关闭、默认校验证书、默认重写 Location
+        let config: Config = toml::from_str("port = 8080\n").unwrap();
+        assert!(config.path_proxy_prefix.is_none());
+        assert!(!config.path_proxy_insecure_tls);
+        assert_eq!(config.path_proxy_rewrite_location, None);
+    }
+
+    #[test]
+    fn test_from_run_args_path_proxy_cli_overrides_config() {
+        let toml_str = r#"
+port = 8080
+path_proxy_prefix = "from-config"
+path_proxy_rewrite_location = false
+"#;
+        let tmp_dir = std::env::temp_dir().join("test_path_proxy_cli_dir");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_file = tmp_dir.join("config.toml");
+        std::fs::write(&config_file, toml_str).unwrap();
+
+        let run_args = ServerRunArgs {
+            config: Some(config_file.clone()),
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: Some("px".into()),
+            path_proxy_insecure: true,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert_eq!(
+            args.path_proxy_prefix.as_deref(),
+            Some("px"),
+            "CLI 前缀应覆盖配置文件"
+        );
+        assert!(args.path_proxy_insecure_tls);
+        assert!(
+            !args.path_proxy_rewrite_location,
+            "配置文件的关闭开关应生效"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_from_run_args_path_proxy_disabled_by_default() {
+        let run_args = ServerRunArgs {
+            config: None,
+            port: None,
+            log_file: None,
+            timeout: None,
+            log_level: None,
+            multi_thread: false,
+            https_port: None,
+            tls_cert: None,
+            tls_key: None,
+            proxy_protocol_mode: None,
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure: false,
+        };
+        let args = Args::from_run_args(&run_args);
+        assert!(args.path_proxy_prefix.is_none());
+        assert!(args.path_proxy_rewrite_location, "默认应重写 Location");
     }
 }

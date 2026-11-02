@@ -10,6 +10,7 @@ mod buffer_pool;
 mod config;
 mod io;
 mod logging;
+mod path_proxy;
 mod proxy;
 mod server;
 mod service;
@@ -139,6 +140,8 @@ fn parse_service_args() -> ServerRunArgs {
         proxy_protocol_mode: None,
         proxy_protocol: false,
         proxy_protocol_trusted_ips: Vec::new(),
+        path_proxy_prefix: None,
+        path_proxy_insecure: false,
     };
 
     let mut i = 0;
@@ -206,6 +209,16 @@ fn parse_service_args() -> ServerRunArgs {
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
                 i += 2;
+                continue;
+            }
+            "--path-proxy-prefix" if i + 1 < args.len() => {
+                start_args.path_proxy_prefix = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            "--path-proxy-insecure" => {
+                start_args.path_proxy_insecure = true;
+                i += 1;
                 continue;
             }
             _ => {}

@@ -30,6 +30,7 @@ use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
 use crate::buffer_pool::BufferPool;
 use crate::config::{Args, TlsConfig};
 use crate::io::PrefixedStream;
+use crate::path_proxy::PathProxyConfig;
 use crate::proxy::{handle_client, handle_client_tls, handle_client_with_addr};
 
 /// TLS 证书热重载检查间隔（秒）
@@ -65,6 +66,35 @@ fn rwlock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
     let buffer_pool = Arc::new(BufferPool::new());
     let auth = Arc::new(args.auth.clone());
+
+    // ── 路径前缀直连模式（可选）──
+    // 前缀合法性在此校验（配置层无法记录日志）；非法前缀直接启动失败，避免静默降级。
+    let path_proxy = match &args.path_proxy_prefix {
+        Some(prefix) => {
+            let cfg = PathProxyConfig::new(
+                prefix,
+                args.path_proxy_insecure_tls,
+                args.path_proxy_rewrite_location,
+            )?;
+            info!(
+                "Path-prefix direct proxy enabled: /{}/http://host/path and /{}/https://host/path \
+                 (insecure_tls={}, rewrite_location={})",
+                cfg.prefix(),
+                cfg.prefix(),
+                cfg.insecure_tls,
+                cfg.rewrite_location
+            );
+            if args.auth.is_none() {
+                warn!(
+                    "Path-prefix direct proxy is open to anyone reaching this port \
+                     (no [[auth]] configured); consider [[auth]] to avoid being used as an open relay"
+                );
+            }
+            Some(cfg)
+        }
+        None => None,
+    };
+    let path_proxy = Arc::new(path_proxy);
 
     // ── 根据 TLS 配置构建 TlsReloader ──
     // config 层已确保：args.tls 为 Some ⟺ 用户显式指定了 https_port
@@ -213,6 +243,7 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         args.timeout,
         buffer_pool,
         auth,
+        path_proxy,
         args.http_proxy_protocol,
         args.https_proxy_protocol,
         Arc::new(args.proxy_protocol_trusted_ips.clone()),
@@ -834,6 +865,7 @@ async fn accept_connections_dual(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
     http_proxy_protocol: crate::config::ProxyProtocolMode,
     https_proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: Arc<Vec<std::net::IpAddr>>,
@@ -934,6 +966,7 @@ async fn accept_connections_dual(
                 timeout,
                 &buffer_pool,
                 &auth,
+                &path_proxy,
                 http_proxy_protocol,
                 https_proxy_protocol,
                 &proxy_protocol_trusted_ips,
@@ -980,6 +1013,7 @@ fn dispatch_accept_result(
     timeout: u64,
     buffer_pool: &Arc<BufferPool>,
     auth: &Arc<Option<Vec<crate::config::AuthUser>>>,
+    path_proxy: &Arc<Option<PathProxyConfig>>,
     http_proxy_protocol: crate::config::ProxyProtocolMode,
     https_proxy_protocol: crate::config::ProxyProtocolMode,
     proxy_protocol_trusted_ips: &Arc<Vec<std::net::IpAddr>>,
@@ -994,6 +1028,7 @@ fn dispatch_accept_result(
             };
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
+            let pp = Arc::clone(path_proxy);
             let t1 = Arc::clone(proxy_protocol_trusted_ips);
             let pp_mode = http_proxy_protocol;
             join_set.spawn(async move {
@@ -1001,10 +1036,10 @@ fn dispatch_accept_result(
                 let _permit = permit;
                 match pp_mode {
                     ProxyProtocolMode::Disable => {
-                        handle_client(client, timeout, bp, au).await;
+                        handle_client(client, timeout, bp, au, pp).await;
                     }
                     ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
-                        process_http_client_pp(client, addr, timeout, bp, au, t1, pp_mode).await;
+                        process_http_client_pp(client, addr, timeout, bp, au, pp, t1, pp_mode).await;
                     }
                 }
             });
@@ -1019,6 +1054,7 @@ fn dispatch_accept_result(
             };
             let bp = Arc::clone(buffer_pool);
             let au = Arc::clone(auth);
+            let pp = Arc::clone(path_proxy);
             let t2 = Arc::clone(proxy_protocol_trusted_ips);
             let pp_mode = https_proxy_protocol;
             join_set.spawn(async move {
@@ -1026,7 +1062,7 @@ fn dispatch_accept_result(
                 let _permit = permit;
                 match pp_mode {
                     ProxyProtocolMode::Disable => {
-                        process_tls_client(client, addr, tls_reloader, timeout, bp, au).await;
+                        process_tls_client(client, addr, tls_reloader, timeout, bp, au, pp).await;
                     }
                     ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
                         process_tls_client_pp(
@@ -1036,6 +1072,7 @@ fn dispatch_accept_result(
                             timeout,
                             bp,
                             au,
+                            pp,
                             t2,
                             pp_mode,
                         )
@@ -1053,12 +1090,14 @@ fn dispatch_accept_result(
 
 /// PROXY Protocol 启用时的 HTTP 连接处理：
 /// 先检查 peer IP 是否在可信列表中，再按模式解析/自动检测 PROXY Protocol 头
+#[allow(clippy::too_many_arguments)]
 async fn process_http_client_pp(
     client: tokio::net::TcpStream,
     fallback_addr: SocketAddr,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
     trusted_ips: Arc<Vec<std::net::IpAddr>>,
     pp_mode: crate::config::ProxyProtocolMode,
 ) {
@@ -1071,7 +1110,7 @@ async fn process_http_client_pp(
             fallback_addr.ip(),
             trusted_ips
         );
-        handle_client(client, timeout, buffer_pool, auth).await;
+        handle_client(client, timeout, buffer_pool, auth, path_proxy).await;
         return;
     }
 
@@ -1116,7 +1155,7 @@ async fn process_http_client_pp(
         }
     };
 
-    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth).await;
+    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// PROXY Protocol 启用时的 HTTPS 连接处理：
@@ -1129,6 +1168,7 @@ async fn process_tls_client_pp(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
     trusted_ips: Arc<Vec<std::net::IpAddr>>,
     pp_mode: crate::config::ProxyProtocolMode,
 ) {
@@ -1141,7 +1181,16 @@ async fn process_tls_client_pp(
             fallback_addr.ip(),
             trusted_ips
         );
-        process_tls_client(client, fallback_addr, tls_reloader, timeout, buffer_pool, auth).await;
+        process_tls_client(
+            client,
+            fallback_addr,
+            tls_reloader,
+            timeout,
+            buffer_pool,
+            auth,
+            path_proxy,
+        )
+        .await;
         return;
     }
 
@@ -1198,7 +1247,7 @@ async fn process_tls_client_pp(
             return;
         }
     };
-    handle_client_tls(tls_stream, real_addr, timeout, buffer_pool, auth).await;
+    handle_client_tls(tls_stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// 执行一次 TLS 证书热重载检查
@@ -1228,6 +1277,7 @@ async fn process_tls_client(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<crate::config::AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
 ) {
     // 获取当前 acceptor（支持热重载，每次握手获取最新版本）
     let acceptor = tls_reloader.current_acceptor();
@@ -1243,7 +1293,7 @@ async fn process_tls_client(
             return;
         }
     };
-    handle_client_tls(tls_stream, addr, timeout, buffer_pool, auth).await;
+    handle_client_tls(tls_stream, addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 #[cfg(test)]

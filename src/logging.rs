@@ -114,7 +114,7 @@ fn rotate(inner: &mut RollingWriterInner) -> io::Result<()> {
 fn unique_rotated_path(base_path: &Path, file_name: &str, ts: &str) -> PathBuf {
     let dir = base_path
         .parent()
-        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
     let path = Path::new(file_name);
@@ -265,7 +265,7 @@ fn prune_old_files(base_path: &Path, max_files: usize) {
 
     let dir = base_path
         .parent()
-        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
     let mut entries: Vec<_> = match fs::read_dir(dir) {

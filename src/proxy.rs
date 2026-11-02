@@ -1,8 +1,9 @@
 //! Proxy module containing HTTP proxy request handling logic with zero-copy buffer reuse
 
-use crate::buffer_pool::{BufferPool, PooledBuffer, BUFFER_SIZE};
+use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
 use crate::io::PrefixedStream;
+use crate::path_proxy::{handle_path_proxy, PathProxyConfig};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::net::SocketAddr;
@@ -24,11 +25,15 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 ///
 /// `auth` 为 `None` 时不启用认证；为 `Some(用户列表)` 时要求客户端通过 HTTP Basic
 /// 认证（`Proxy-Authorization` 头），否则返回 407 并关闭连接。
+///
+/// `path_proxy` 为 `Some` 时额外启用路径前缀直连模式
+/// （`/px/https://example.com/` → 直连该站点，见 [`crate::path_proxy`]）。
 pub async fn handle_client(
     client: TcpStream,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
 ) {
     let client_addr = match client.peer_addr() {
         Ok(addr) => addr,
@@ -37,7 +42,7 @@ pub async fn handle_client(
             return;
         }
     };
-    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// Handle an HTTP proxy client connection with a pre-resolved address.
@@ -50,10 +55,11 @@ pub async fn handle_client_with_addr<S>(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// Handle an HTTP proxy client connection over a TLS-wrapped stream
@@ -65,21 +71,24 @@ pub async fn handle_client_tls<S>(
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_generic(client, client_addr, timeout, buffer_pool, auth).await;
+    handle_client_generic(client, client_addr, timeout, buffer_pool, auth, path_proxy).await;
 }
 
 /// 通用客户端连接处理逻辑（与具体传输层 TCP/TLS 无关）
 ///
-/// 接受任意 AsyncRead + AsyncWrite 流，完成请求头读取、解析、认证、分发到 CONNECT 或 HTTP 处理。
+/// 接受任意 AsyncRead + AsyncWrite 流，完成请求头读取、解析、认证、分发到
+/// CONNECT / HTTP 代理 / 路径前缀直连三种处理路径。
 async fn handle_client_generic<S>(
     mut client: S,
     client_addr: SocketAddr,
     timeout: u64,
     buffer_pool: Arc<BufferPool>,
     auth: Arc<Option<Vec<AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -124,6 +133,41 @@ async fn handle_client_generic<S>(
 
     let method = parts[0];
     let url = parts[1];
+
+    // 第零步：路径前缀直连模式（如 /px/https://www.baidu.com/）。
+    // 必须在代理请求分类之前判断——该形式是 origin-form 相对路径，会被 classify 判为
+    // Invalid 而直接 404。只有前缀精确命中才接管，其余相对路径仍走 404（保持反扫描）。
+    if let Some(cfg) = path_proxy.as_ref() {
+        if let Some(target) = cfg.match_target(url) {
+            // 复用代理认证：配置了 [[auth]] 时同样要求 Basic 凭据（401 质询）。
+            // 认证成功时记录凭据所在的头，转发上游前必须剔除（否则凭据泄漏给目标站点）。
+            let mut auth_header: Option<&'static str> = None;
+            if let Some(users) = auth.as_ref() {
+                match check_path_auth(&head_str, users) {
+                    Some(source) => auth_header = Some(source.header_name()),
+                    None => {
+                        send_path_auth_required(&mut client).await;
+                        warn!("Path-proxy authentication failed from {}", client_addr);
+                        return;
+                    }
+                }
+            }
+            handle_path_proxy(
+                client,
+                client_addr,
+                method,
+                target,
+                data,
+                head_end,
+                cfg,
+                timeout_duration,
+                &buffer_pool,
+                auth_header,
+            )
+            .await;
+            return;
+        }
+    }
 
     // 第一步：判断是否为"合法代理请求"。
     // 反扫描策略：非代理格式请求直接返回 404，扫描器无法从响应识别这是代理端口。
@@ -324,11 +368,60 @@ async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
 /// `Proxy-Authorization: Basic <base64(user:pass)>`，解码后与 `users` 比对。
 /// 头缺失、方案不符、Base64 解码失败或凭据不匹配均返回 `false`。
 fn check_proxy_auth(request_data: &str, users: &[AuthUser]) -> bool {
-    let credentials = match extract_proxy_authorization(request_data) {
-        Some(c) => c,
-        None => return false,
-    };
+    match extract_basic_credentials(request_data, "proxy-authorization") {
+        Some(creds) => verify_basic_credentials(creds, users),
+        None => false,
+    }
+}
 
+/// 路径前缀直连模式下用于认证的请求头来源。
+///
+/// 认证成功后需要把该头从转发给上游的请求中剔除，否则代理凭据会泄漏给目标站点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathAuthSource {
+    /// `Authorization`：浏览器/普通客户端收到 401 质询后发送
+    Authorization,
+    /// `Proxy-Authorization`：脚本或 curl 以代理方式携带凭据
+    ProxyAuthorization,
+}
+
+impl PathAuthSource {
+    /// 该来源对应的请求头名（小写）
+    pub(crate) fn header_name(self) -> &'static str {
+        match self {
+            PathAuthSource::Authorization => "authorization",
+            PathAuthSource::ProxyAuthorization => "proxy-authorization",
+        }
+    }
+}
+
+/// 校验路径前缀直连模式的认证凭据。
+///
+/// 该模式是「直接访问网址」而非「配置代理」，因此优先读取 `Authorization`
+/// （浏览器/普通 HTTP 客户端在收到 401 质询后发送），同时也接受
+/// `Proxy-Authorization`，便于用脚本或 curl 以代理方式携带凭据。
+///
+/// 返回实际认证成功的头来源（`None` 表示认证失败），调用方据此把该头从
+/// 上游请求中移除——只移除"真正被用来认证"的那一个，另一个可留给目标站点使用。
+pub(crate) fn check_path_auth(
+    request_data: &str,
+    users: &[AuthUser],
+) -> Option<PathAuthSource> {
+    for source in [
+        PathAuthSource::Authorization,
+        PathAuthSource::ProxyAuthorization,
+    ] {
+        if let Some(creds) = extract_basic_credentials(request_data, source.header_name()) {
+            if verify_basic_credentials(creds, users) {
+                return Some(source);
+            }
+        }
+    }
+    None
+}
+
+/// 校验 `Basic` 凭据（base64 的 `user:pass`）是否命中用户列表
+fn verify_basic_credentials(credentials: &str, users: &[AuthUser]) -> bool {
     // Base64 解码凭据
     let decoded = match BASE64_STANDARD.decode(credentials.trim()) {
         Ok(d) => d,
@@ -350,11 +443,11 @@ fn check_proxy_auth(request_data: &str, users: &[AuthUser]) -> bool {
         .any(|u| u.username == username && u.password == password)
 }
 
-/// 从原始请求数据中提取 `Proxy-Authorization: Basic <credentials>` 的凭据部分。
+/// 从原始请求数据中提取 `<header>: Basic <credentials>` 的凭据部分。
 ///
 /// 头名匹配不区分大小写，仅识别 Basic 方案；遇到空行（请求头结束）即停止搜索。
 /// 不含冒号的行（如绝对形式的请求行）会被跳过而非导致整体失败。
-fn extract_proxy_authorization(request_data: &str) -> Option<&str> {
+fn extract_basic_credentials<'a>(request_data: &'a str, header_name: &str) -> Option<&'a str> {
     for line in request_data.lines() {
         if line.is_empty() {
             // 空行标志请求头结束
@@ -364,7 +457,7 @@ fn extract_proxy_authorization(request_data: &str) -> Option<&str> {
             Some(pair) => pair,
             None => continue,
         };
-        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+        if !name.trim().eq_ignore_ascii_case(header_name) {
             continue;
         }
         let value = value.trim();
@@ -392,12 +485,25 @@ async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     let _ = client.write_all(response.as_bytes()).await;
 }
 
+/// 向客户端发送 401 Unauthorized 质询（路径前缀直连模式使用）。
+///
+/// 该模式下客户端并未「配置代理」，407 + `Proxy-Authenticate` 不会被浏览器处理
+/// （只会渲染 407 错误页且不弹登录框）；因此改用 401 + `WWW-Authenticate`，
+/// 浏览器会正常弹出 Basic 登录框。
+async fn send_path_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
+    let response = "HTTP/1.1 401 Unauthorized\r\n\
+        WWW-Authenticate: Basic realm=\"rust-proxy\"\r\n\
+        Content-Length: 0\r\n\
+        Connection: close\r\n\r\n";
+    let _ = client.write_all(response.as_bytes()).await;
+}
+
 /// 异步 DNS 解析并连接目标主机
 ///
 /// 与直接 `TcpStream::connect((host, port))` 不同，`lookup_host` 是异步的，
 /// 不会在 Tokio 运行时内执行阻塞的 `getaddrinfo`（同步 DNS 会阻塞工作线程）。
 /// 对解析出的多个地址（多 A/AAAA 记录）依次尝试，直到连接成功。
-async fn connect_host(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+pub(crate) async fn connect_host(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
     let addrs = match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port))).await {
         Ok(res) => res.map_err(std::io::Error::other)?,
         Err(_) => {
@@ -506,7 +612,7 @@ async fn handle_connect_generic<S>(
 /// - `ConnectionReset`：对端发送 TCP RST（移动网络切换、NAT 超时等）
 /// - `ConnectionAborted`：本地或对端中止连接
 /// - `BrokenPipe`：写入已关闭的管道（对端先关闭，己方仍在写）
-fn is_benign_close_error(e: &std::io::Error) -> bool {
+pub(crate) fn is_benign_close_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::UnexpectedEof
@@ -641,70 +747,93 @@ async fn handle_http_request_generic<S>(
         return;
     }
 
-    // 转发 body：先转发已缓冲的剩余字节，再按 Content-Length / chunked 流式转发
+    // 转发 body：按 chunked / Content-Length 流式转发（已缓冲的字节一并交给下游处理）
     let buffered_body = &request_data[head_end..];
-    if !buffered_body.is_empty() && target.write_all(buffered_body).await.is_err() {
-        return;
-    }
 
     if chunked {
-        // 流式转发 chunked 请求体，直到终止块（0\r\n\r\n）
-        let result = forward_chunked_body(&mut client, &mut target, timeout_duration, &buffer_pool).await;
+        // 流式转发 chunked 请求体，直到终止块（0\r\n\r\n）。
+        // 已缓冲字节必须交给分帧状态机消费——终止块可能就落在缓冲区里，
+        // 若先原样写出再读 socket，状态机会永远等不到结束而挂住。
+        let result = forward_chunked_body(
+            &mut client,
+            &mut target,
+            buffered_body,
+            timeout_duration,
+            &buffer_pool,
+        )
+        .await;
         if let Err(e) = result {
             if !is_benign_close_error(&e) {
                 warn!("Failed to forward chunked request body from {}: {}", client_addr, e);
             }
             return;
         }
-    } else if let Some(cl) = content_length {
-        // 按 Content-Length 精确流式转发剩余 body（支持大文件上传）
-        let already_sent = buffered_body.len() as u64;
-        if cl > already_sent {
-            let mut remaining = cl - already_sent;
-            let mut tmp = buffer_pool.get();
-            let tmp_slice = tmp.as_mut_slice();
-            loop {
-                let want = std::cmp::min(remaining as usize, tmp_slice.len());
-                let m = match tokio::time::timeout(timeout_duration, client.read(&mut tmp_slice[..want])).await {
-                    Ok(Ok(m)) => m,
-                    Ok(Err(e)) => {
-                        if !is_benign_close_error(&e) {
-                            warn!("Error reading request body from {}: {}", client_addr, e);
-                        }
+    } else {
+        // 非 chunked：先转发已缓冲字节，超出 Content-Length 的部分属于管道化下一个请求
+        let mut buffered = buffered_body;
+        if let Some(cl) = content_length {
+            if buffered.len() as u64 > cl {
+                buffered = &buffered[..cl as usize];
+            }
+        }
+        if !buffered.is_empty() && target.write_all(buffered).await.is_err() {
+            return;
+        }
+
+        if let Some(cl) = content_length {
+            // 按 Content-Length 精确流式转发剩余 body（支持大文件上传）
+            let already_sent = buffered.len() as u64;
+            if cl > already_sent {
+                let mut remaining = cl - already_sent;
+                let mut tmp = buffer_pool.get();
+                let tmp_slice = tmp.as_mut_slice();
+                loop {
+                    let want = std::cmp::min(remaining as usize, tmp_slice.len());
+                    let m =
+                        match tokio::time::timeout(timeout_duration, client.read(&mut tmp_slice[..want]))
+                            .await
+                        {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(e)) => {
+                                if !is_benign_close_error(&e) {
+                                    warn!("Error reading request body from {}: {}", client_addr, e);
+                                }
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("Timeout reading request body from {}", client_addr);
+                                return;
+                            }
+                        };
+                    if m == 0 {
+                        // 客户端提前关闭，body 不完整
+                        warn!("Client {} closed before sending complete request body", client_addr);
+                        break;
+                    }
+                    if target.write_all(&tmp_slice[..m]).await.is_err() {
                         return;
                     }
-                    Err(_) => {
-                        warn!("Timeout reading request body from {}", client_addr);
-                        return;
+                    remaining -= m as u64;
+                    if remaining == 0 {
+                        break;
                     }
-                };
-                if m == 0 {
-                    // 客户端提前关闭，body 不完整
-                    warn!("Client {} closed before sending complete request body", client_addr);
-                    break;
-                }
-                if target.write_all(&tmp_slice[..m]).await.is_err() {
-                    return;
-                }
-                remaining -= m as u64;
-                if remaining == 0 {
-                    break;
                 }
             }
         }
     }
     // 无 Content-Length 且非 chunked：仅转发已缓冲字节（历史行为）
 
-    // Read response and forward to client using pooled buffer
-    let mut response_buf = buffer_pool.get();
-    let response_slice = response_buf.as_mut_slice();
+    // 读取响应并转发给客户端：拷贝缓冲自适应（8KB 起步，长传输/大body 翻倍到 256KB）
+    let mut response_buf = AdaptiveBuffer::new();
 
     loop {
-        match tokio::time::timeout(timeout_duration, target.read(response_slice)).await {
+        response_buf.prepare();
+        match tokio::time::timeout(timeout_duration, target.read(response_buf.as_mut_slice())).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
-                // Zero-copy: directly write from buffer to client
-                if client.write_all(&response_slice[..n]).await.is_err() {
+                response_buf.note_copied(n);
+                // 直接从缓冲区写到客户端（一次读 + 一次写，零中间分配）
+                if client.write_all(&response_buf.as_mut_slice()[..n]).await.is_err() {
                     break;
                 }
             }
@@ -722,6 +851,13 @@ async fn handle_http_request_generic<S>(
             }
         }
     }
+
+    debug!(
+        "Response copy buffer for {}:{} ended at {} KB",
+        host,
+        port,
+        response_buf.current_size() / 1024
+    );
 
     info!("Request completed: {} {}", method, url);
 }
@@ -842,12 +978,16 @@ fn parse_chunk_size(line: &[u8]) -> Option<u64> {
 
 /// 流式转发 chunked 编码的请求体。
 ///
-/// 已缓冲的 body 前缀由调用方先行转发；本函数从客户端继续读取，按分帧状态机
-/// 解析并原样转发，直到遇到终止块 `0\r\n` 及随后的空行（trailer 结束）。
+/// `prefix` 是调用方已从 socket 读入的 body 前缀（可能是完整 body，也可能只是开头）。
+/// **这些字节必须由本函数的分帧状态机消费后再转发**：若调用方先原样写出、再从这里读
+/// socket，则终止块落在前缀里时状态机永远等不到结束，连接会一直挂到超时。
+///
+/// 分帧状态机逐字节解析并原样转发，直到遇到终止块 `0\r\n` 及随后的空行（trailer 结束）。
 /// 输出按 BUFFER_SIZE 批量 flush，避免逐字节写。
-async fn forward_chunked_body<S, T>(
+pub(crate) async fn forward_chunked_body<S, T>(
     client: &mut S,
     target: &mut T,
+    prefix: &[u8],
     timeout: Duration,
     buffer_pool: &BufferPool,
 ) -> std::io::Result<()>
@@ -859,6 +999,21 @@ where
     let mut buf = buffer_pool.get();
     let buf_slice = buf.as_mut_slice();
     let mut out: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+
+    // 先处理已缓冲前缀：原样转发，同时驱动状态机
+    if !prefix.is_empty() {
+        for &b in prefix {
+            reader.push_byte(b);
+            out.push(b);
+            if reader.done() {
+                // 整个 body 都在前缀里结束：立即收尾，不再等 socket
+                target.write_all(&out).await?;
+                return Ok(());
+            }
+        }
+        target.write_all(&out).await?;
+        out.clear();
+    }
 
     loop {
         let n = match tokio::time::timeout(timeout, client.read(buf_slice)).await {
@@ -1366,7 +1521,7 @@ mod tests {
             Proxy-Authorization: Basic YWRtaW46c2VjcmV0\r\n\
             Host: example.com:443\r\n\r\n";
         assert_eq!(
-            extract_proxy_authorization(req),
+            extract_basic_credentials(req, "proxy-authorization"),
             Some("YWRtaW46c2VjcmV0")
         );
     }
@@ -1374,7 +1529,70 @@ mod tests {
     #[test]
     fn test_extract_authorization_none_when_absent() {
         let req = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert_eq!(extract_proxy_authorization(req), None);
+        assert_eq!(extract_basic_credentials(req, "proxy-authorization"), None);
+    }
+
+    // ─── 路径前缀直连模式的认证 ───
+
+    #[test]
+    fn test_path_auth_accepts_authorization_header() {
+        // 浏览器/直连客户端走标准 Authorization 头
+        let req = "GET /px/https://example.com/ HTTP/1.1\r\n\
+            Authorization: Basic YWRtaW46c2VjcmV0\r\n\
+            Host: proxy.local\r\n\r\n";
+        // 返回来源头名，供上层转发时剔除（避免凭据泄漏给目标站点）
+        assert_eq!(
+            check_path_auth(req, &make_users()),
+            Some(PathAuthSource::Authorization)
+        );
+    }
+
+    #[test]
+    fn test_path_auth_accepts_proxy_authorization_header() {
+        // 脚本/curl 也可能携带 Proxy-Authorization
+        let req = "GET /px/https://example.com/ HTTP/1.1\r\n\
+            Proxy-Authorization: Basic YWRtaW46c2VjcmV0\r\n\r\n";
+        assert_eq!(
+            check_path_auth(req, &make_users()),
+            Some(PathAuthSource::ProxyAuthorization)
+        );
+    }
+
+    #[test]
+    fn test_path_auth_rejects_missing_or_wrong_credentials() {
+        assert!(check_path_auth(
+            "GET /px/https://example.com/ HTTP/1.1\r\nHost: p\r\n\r\n",
+            &make_users()
+        )
+        .is_none());
+        // "admin:wrong"
+        assert!(check_path_auth(
+            "GET /px/https://example.com/ HTTP/1.1\r\n\
+             Authorization: Basic YWRtaW46d3Jvbmc=\r\n\r\n",
+            &make_users()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_path_auth_prefers_verifiable_header() {
+        // 两个头同时存在：Authorization 错、Proxy-Authorization 对 → 以能通过认证的为准，
+        // 这样目标站点自己的 Authorization 可以保留下来
+        let req = "GET /px/https://example.com/ HTTP/1.1\r\n\
+            Authorization: Basic YWRtaW46d3Jvbmc=\r\n\
+            Proxy-Authorization: Basic YWRtaW46c2VjcmV0\r\n\r\n";
+        assert_eq!(
+            check_path_auth(req, &make_users()),
+            Some(PathAuthSource::ProxyAuthorization)
+        );
+    }
+
+    #[test]
+    fn test_proxy_auth_does_not_accept_plain_authorization_header() {
+        // 经典代理模式只认 Proxy-Authorization，避免把源站凭据当作代理凭据
+        let req = "GET http://example.com/ HTTP/1.1\r\n\
+            Authorization: Basic YWRtaW46c2VjcmV0\r\n\r\n";
+        assert!(!check_proxy_auth(req, &make_users()));
     }
 
     // ─── extract_userinfo 测试 ───
@@ -1662,5 +1880,63 @@ mod tests {
         assert_eq!(parse_chunk_size(b"A\r\n"), Some(10)); // 大小写不敏感
         assert_eq!(parse_chunk_size(b"garbage\r\n"), None);
         assert_eq!(parse_chunk_size(b""), None);
+    }
+
+    // ─── chunked body 转发（含已缓冲前缀）───
+
+    /// 完整 body 已落在缓冲区里时，必须立即收尾而不能继续读 socket（否则挂到超时）。
+    #[tokio::test]
+    async fn test_forward_chunked_body_completes_entirely_from_prefix() {
+        let (_client_w, mut client_r) = tokio::io::duplex(64);
+        let (mut up_w, mut up_r) = tokio::io::duplex(4096);
+        let pool = BufferPool::new();
+
+        // 客户端 socket 已无数据（duplex 写端被丢弃 → read 返回 0），只有前缀里有完整 body
+        drop(_client_w);
+        let prefix = b"5\r\nhello\r\n0\r\n\r\n";
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_chunked_body(&mut client_r, &mut up_w, prefix, Duration::from_secs(2), &pool),
+        )
+        .await
+        .expect("不应等待 socket，前缀里已有完整 body");
+        assert!(res.is_ok());
+        drop(up_w);
+
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut up_r, &mut got).await.unwrap();
+        assert_eq!(got, prefix.to_vec());
+    }
+
+    /// 前缀只是 body 的一部分：剩余部分仍从 socket 读取并接续转发。
+    #[tokio::test]
+    async fn test_forward_chunked_body_continues_from_socket_after_prefix() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_w, mut client_r) = tokio::io::duplex(64);
+        let (mut up_w, mut up_r) = tokio::io::duplex(4096);
+        let pool = BufferPool::new();
+
+        let prefix = b"5\r\nhel".to_vec();
+        let rest = b"lo\r\n0\r\n\r\n".to_vec();
+        let rest_clone = rest.clone();
+        tokio::spawn(async move {
+            client_w.write_all(&rest_clone).await.unwrap();
+            drop(client_w);
+        });
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_chunked_body(&mut client_r, &mut up_w, &prefix, Duration::from_secs(2), &pool),
+        )
+        .await
+        .expect("应在读到终止块后立即返回");
+        assert!(res.is_ok());
+        drop(up_w);
+
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut up_r, &mut got).await.unwrap();
+        let mut want = prefix.clone();
+        want.extend_from_slice(&rest);
+        assert_eq!(got, want);
     }
 }

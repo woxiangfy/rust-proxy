@@ -25,6 +25,7 @@ pub mod app;
 pub mod buffer_pool;
 pub mod config;
 pub mod http_body;
+pub mod http_response;
 pub mod http_util;
 pub mod io;
 pub mod logging;

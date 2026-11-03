@@ -28,14 +28,12 @@ impl<S> PrefixedStream<S> {
     }
 
     /// 取出内部流（丢弃未消费的前缀）
-    #[allow(dead_code)]
     pub fn into_inner(self) -> S {
         self.inner
     }
 
     /// 是否仍存在未消费的前缀字节
     #[inline]
-    #[allow(dead_code)]
     pub fn has_pending_prefix(&self) -> bool {
         self.prefix_pos < self.prefix.len()
     }

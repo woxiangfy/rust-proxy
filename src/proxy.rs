@@ -3,6 +3,7 @@
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
 use crate::http_body::forward_chunked_body;
+use crate::http_response::write_response;
 use crate::http_util::{find_header_end, head_end_offset, MAX_HEAD_BYTES};
 use crate::io::PrefixedStream;
 use crate::net::{connect_host, is_benign_close_error, parse_host_port, AsyncStream};
@@ -328,16 +329,13 @@ fn classify_proxy_request(method: &str, url: &str) -> ProxyRequestKind {
 /// - 简短，最小化攻击面与指纹
 /// - Connection: close，避免占着连接
 async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
-    let body = b"404 Not Found";
-    let response = format!(
-        "HTTP/1.1 404 Not Found\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = client.write_all(response.as_bytes()).await;
-    let _ = client.write_all(body).await;
+    write_response(
+        client,
+        "404 Not Found",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        b"404 Not Found",
+    )
+    .await;
 }
 
 /// 校验请求中的 `Proxy-Authorization` 头是否符合配置的用户列表。
@@ -456,11 +454,13 @@ fn extract_basic_credentials<'a>(request_data: &'a str, header_name: &str) -> Op
 /// 泛型版本兼容 TCP 和 TLS 流。
 async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     // Connection: close 使客户端重连时携带认证头重试
-    let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-        Proxy-Authenticate: Basic realm=\"rust-proxy\"\r\n\
-        Content-Length: 0\r\n\
-        Connection: close\r\n\r\n";
-    let _ = client.write_all(response.as_bytes()).await;
+    write_response(
+        client,
+        "407 Proxy Authentication Required",
+        &[("Proxy-Authenticate", "Basic realm=\"rust-proxy\"")],
+        b"",
+    )
+    .await;
 }
 
 /// 向客户端发送 401 Unauthorized 质询（路径前缀直连模式使用）。
@@ -469,11 +469,13 @@ async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
 /// （只会渲染 407 错误页且不弹登录框）；因此改用 401 + `WWW-Authenticate`，
 /// 浏览器会正常弹出 Basic 登录框。
 async fn send_path_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
-    let response = "HTTP/1.1 401 Unauthorized\r\n\
-        WWW-Authenticate: Basic realm=\"rust-proxy\"\r\n\
-        Content-Length: 0\r\n\
-        Connection: close\r\n\r\n";
-    let _ = client.write_all(response.as_bytes()).await;
+    write_response(
+        client,
+        "401 Unauthorized",
+        &[("WWW-Authenticate", "Basic realm=\"rust-proxy\"")],
+        b"",
+    )
+    .await;
 }
 
 /// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）

@@ -232,7 +232,6 @@ pub struct Args {
     /// HTTPS 端口实际使用的 PROXY Protocol 模式（缺省回退到全局默认）
     pub https_proxy_protocol: ProxyProtocolMode,
     /// PROXY Protocol 全局默认模式（供日志/回退使用；http/https 字段已给出每个端口的最终值）
-    #[allow(dead_code)]
     pub proxy_protocol: ProxyProtocolMode,
     /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
     pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,

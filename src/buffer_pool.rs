@@ -225,7 +225,6 @@ impl PooledBuffer {
 
     /// 获取缓冲区数据的不可变切片引用
     #[inline]
-    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }

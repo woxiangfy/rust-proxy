@@ -5,45 +5,10 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// Log level for logging
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-#[derive(PartialEq)]
-pub enum LogLevel {
-    #[default]
-    Info,
-    Debug,
-    Warn,
-    Error,
-    Trace,
-}
-
-impl std::fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogLevel::Trace => write!(f, "trace"),
-            LogLevel::Debug => write!(f, "debug"),
-            LogLevel::Info => write!(f, "info"),
-            LogLevel::Warn => write!(f, "warn"),
-            LogLevel::Error => write!(f, "error"),
-        }
-    }
-}
-
-impl std::str::FromStr for LogLevel {
-    type Err = String;
-    
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "trace" => Ok(LogLevel::Trace),
-            "debug" => Ok(LogLevel::Debug),
-            "info" => Ok(LogLevel::Info),
-            "warn" => Ok(LogLevel::Warn),
-            "error" => Ok(LogLevel::Error),
-            _ => Err(format!("Invalid log level: {}", s)),
-        }
-    }
-}
+// `LogLevel` 属于日志域，定义在 `logging` 模块（见 B4）。
+// 这里重新导出，既保持 `config::LogLevel` 这个既有路径可用，又让依赖方向变成
+// `config → logging`（单向），避免 `logging` 为了一个枚举反查配置模块。
+pub use crate::logging::LogLevel;
 
 #[derive(Parser, Debug)]
 #[command(name = "rust-proxy")]
@@ -91,7 +56,7 @@ impl std::str::FromStr for ProxyProtocolMode {
     }
 }
 
-#[derive(clap::Parser, Debug, Clone)]
+#[derive(clap::Parser, Debug, Clone, Default)]
 pub struct ServerRunArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,

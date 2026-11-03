@@ -9,8 +9,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use env_logger::Builder;
 use log::LevelFilter;
+use serde::Deserialize;
 
-use crate::config::LogLevel;
+/// 日志级别
+///
+/// 定义在本模块而非 `config`：日志级别是日志域的取值域，放在 `config` 会让
+/// `logging` 反向依赖配置模块（仅为这一个枚举）。`config` 侧以 `pub use`
+/// 重新导出，`config::LogLevel` 路径保持可用。
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    #[default]
+    Info,
+    Debug,
+    Warn,
+    Error,
+    Trace,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Trace => write!(f, "trace"),
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "trace" => Ok(LogLevel::Trace),
+            "debug" => Ok(LogLevel::Debug),
+            "info" => Ok(LogLevel::Info),
+            "warn" => Ok(LogLevel::Warn),
+            "error" => Ok(LogLevel::Error),
+            _ => Err(format!("Invalid log level: {}", s)),
+        }
+    }
+}
 
 /// 日志文件最大大小（10 MB），超过后自动分割
 const MAX_LOG_SIZE_BYTES: u64 = 10 * 1024 * 1024;

@@ -1,14 +1,40 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStatus,
     ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
 
-use crate::config::ServerRunArgs;
+use crate::config::{RunAsServiceArgs, ServerRunArgs};
 
 const SERVICE_LABEL: &str = "rust-proxy";
 const DEFAULT_SERVICE_DESCRIPTION: &str = "Rust HTTP Proxy Server";
+
+/// 解析服务模式下的运行参数
+///
+/// 系统服务启动时（Windows SCM / systemd），命令行由 [`install_service`] 生成，
+/// 形如 `rust-proxy --run-as-service --port 8080 --log-level info`。这条路径不经过
+/// 顶层 `Cli`（`--run-as-service` 不是子命令），因此用 [`RunAsServiceArgs`]
+/// （`--run-as-service` + `#[command(flatten)] ServerRunArgs`）复用同一套 `#[arg]` 定义。
+///
+/// 相比此前手写的逐参数 `match`，新增一个 flag 时只需改 `ServerRunArgs` 一处，
+/// 不会再出现"CLI 支持、服务模式静默丢配置"的漏项。
+///
+/// 解析失败（例如人工追加了未知参数）时告警并回退默认值：服务模式下没有终端可交互，
+/// 直接退出会让系统服务反复重启，回退到"仅用配置文件"更可控。
+fn parse_service_args() -> ServerRunArgs {
+    match RunAsServiceArgs::try_parse_from(std::env::args_os()) {
+        Ok(parsed) => parsed.run_args,
+        Err(e) => {
+            log::warn!(
+                "Failed to parse service-mode arguments ({}); falling back to defaults",
+                e
+            );
+            ServerRunArgs::default()
+        }
+    }
+}
 
 pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -310,6 +336,9 @@ mod windows_service {
     use crate::logging;
     use crate::server;
 
+    /// 复用外层 `service` 模块的解析函数（嵌套模块需要 `super::` 前缀）
+    use super::parse_service_args;
+
     const SERVICE_NAME: &str = "rust-proxy";
 
     static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
@@ -329,7 +358,7 @@ mod windows_service {
     }
 
     fn run_service() -> Result<()> {
-        let start_args = crate::parse_service_args();
+        let start_args = parse_service_args();
         let args = Args::from_run_args(&start_args);
 
         let log_file = args.log_file.clone().unwrap_or_else(|| {
@@ -446,7 +475,7 @@ pub fn run_as_service() -> Result<()> {
     use log::{error, info};
     use tokio::runtime::Runtime;
 
-    let start_args = crate::parse_service_args();
+    let start_args = parse_service_args();
     let args = Args::from_run_args(&start_args);
 
     let effective_log_file = if args.log_file.is_some() {
@@ -485,4 +514,75 @@ pub fn run_as_service() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 服务模式参数必须由 clap 统一解析（B11 / A4 的回归）
+    ///
+    /// 此前是手写 `match` 逐参数解析，新增 flag 时容易漏同步；改为复用
+    /// `RunAsServiceArgs` 后，`ServerRunArgs` 上新增字段自动生效。此测试固定
+    /// "服务模式能识别 install_service 写入的全部参数"这一契约。
+    #[test]
+    fn test_service_args_cover_install_flags() {
+        let parsed = RunAsServiceArgs::try_parse_from([
+            "rust-proxy",
+            "--run-as-service",
+            "--config",
+            "config.toml",
+            "--port",
+            "9090",
+            "--https-port",
+            "9443",
+            "--tls-cert",
+            "cert.pem",
+            "--tls-key",
+            "key.pem",
+            "--timeout",
+            "7",
+            "--log-level",
+            "debug",
+            "--log-file",
+            "proxy.log",
+            "--multi-thread",
+            "--proxy-protocol-mode",
+            "require",
+            "--proxy-protocol-trusted-ips",
+            "10.0.0.1,10.0.0.2",
+            "--path-proxy-prefix",
+            "px",
+            "--path-proxy-insecure",
+        ])
+        .expect("all install_service flags must be recognised");
+
+        let a = parsed.run_args;
+        assert!(parsed.run_as_service);
+        assert_eq!(a.port, Some(9090));
+        assert_eq!(a.https_port, Some(9443));
+        assert_eq!(a.tls_cert.as_deref(), Some(std::path::Path::new("cert.pem")));
+        assert_eq!(a.tls_key.as_deref(), Some(std::path::Path::new("key.pem")));
+        assert_eq!(a.timeout, Some(7));
+        assert_eq!(a.log_level, Some(crate::logging::LogLevel::Debug));
+        assert_eq!(
+            a.log_file.as_deref(),
+            Some(std::path::Path::new("proxy.log"))
+        );
+        assert!(a.multi_thread);
+        assert_eq!(a.proxy_protocol_mode, Some(crate::config::ProxyProtocolMode::Require));
+        assert_eq!(a.proxy_protocol_trusted_ips.len(), 2);
+        assert_eq!(a.path_proxy_prefix.as_deref(), Some("px"));
+        assert!(a.path_proxy_insecure);
+    }
+
+    /// 未传参时回落到全默认值（服务被手动启动时不能 panic）
+    #[test]
+    fn test_service_args_default_is_empty() {
+        let a = ServerRunArgs::default();
+        assert!(a.port.is_none());
+        assert!(a.config.is_none());
+        assert!(a.proxy_protocol_trusted_ips.is_empty());
+        assert!(!a.multi_thread);
+    }
 }

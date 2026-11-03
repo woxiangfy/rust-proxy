@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::oneshot;
 
-use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerRunArgs, ServerSubcommand};
+use config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerSubcommand};
 
 /// 创建 Tokio 运行时，根据参数选择单线程或多线程
 fn create_runtime(multi_thread: bool) -> Result<tokio::runtime::Runtime> {
@@ -118,120 +118,6 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// 服务模式下的命令行参数解析函数
-///
-/// 在系统服务环境中（如 Windows Service 或 Linux systemd），clap 无法正确解析参数，
-/// 因此需要手动解析命令行参数。支持的参数包括：
-///   --config   指定配置文件路径
-///   --port     指定监听端口
-///   --log-file 指定日志文件路径
-///   --timeout  指定连接超时时间（秒）
-///   --log-level 指定日志级别
-///   --multi-thread 启用多线程运行时
-fn parse_service_args() -> ServerRunArgs {
-    let args: Vec<String> = std::env::args().collect();
-    let mut start_args = ServerRunArgs {
-        config: None,
-        port: None,
-        log_file: None,
-        timeout: None,
-        log_level: None,
-        multi_thread: false,
-        https_port: None,
-        tls_cert: None,
-        tls_key: None,
-        proxy_protocol_mode: None,
-        proxy_protocol: false,
-        proxy_protocol_trusted_ips: Vec::new(),
-        path_proxy_prefix: None,
-        path_proxy_insecure: false,
-    };
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" if i + 1 < args.len() => {
-                start_args.port = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-            "--log-file" if i + 1 < args.len() => {
-                start_args.log_file = Some(args[i + 1].clone().into());
-                i += 2;
-                continue;
-            }
-            "--timeout" if i + 1 < args.len() => {
-                start_args.timeout = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-            "--log-level" if i + 1 < args.len() => {
-                start_args.log_level = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-            "--config" if i + 1 < args.len() => {
-                start_args.config = Some(args[i + 1].clone().into());
-                i += 2;
-                continue;
-            }
-            "--run-as-service" => {}
-            "--multi-thread" => {
-                start_args.multi_thread = true;
-                i += 1;
-                continue;
-            }
-            "--https-port" if i + 1 < args.len() => {
-                start_args.https_port = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-            "--tls-cert" if i + 1 < args.len() => {
-                start_args.tls_cert = Some(args[i + 1].clone().into());
-                i += 2;
-                continue;
-            }
-            "--tls-key" if i + 1 < args.len() => {
-                start_args.tls_key = Some(args[i + 1].clone().into());
-                i += 2;
-                continue;
-            }
-            "--proxy-protocol" => {
-                start_args.proxy_protocol = true;
-                i += 1;
-                continue;
-            }
-            "--proxy-protocol-mode" if i + 1 < args.len() => {
-                start_args.proxy_protocol_mode = args[i + 1].parse().ok();
-                i += 2;
-                continue;
-            }
-            "--proxy-protocol-trusted-ips" if i + 1 < args.len() => {
-                start_args.proxy_protocol_trusted_ips = args[i + 1]
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-                i += 2;
-                continue;
-            }
-            "--path-proxy-prefix" if i + 1 < args.len() => {
-                start_args.path_proxy_prefix = Some(args[i + 1].clone());
-                i += 2;
-                continue;
-            }
-            "--path-proxy-insecure" => {
-                start_args.path_proxy_insecure = true;
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    start_args
 }
 
 /// 处理服务管理子命令

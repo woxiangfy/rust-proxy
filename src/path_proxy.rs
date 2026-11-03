@@ -96,26 +96,54 @@ impl PathProxyConfig {
     }
 }
 
-/// 处理一次路径前缀直连请求。
+/// 一次路径前缀直连请求的输入（调用方已从报文中解析出的请求描述）
 ///
-/// `target_url` 是 `match_target` 返回的目标 URL（含 scheme），`request_data`/`head_end`
-/// 为已读入的原始请求（头 + 可能的 body 前缀），保持与普通代理模式一致的零拷贝思路。
-/// `drop_header` 为本次用于认证的请求头名（认证成功后从上游请求中剔除，避免凭据泄漏）。
-#[allow(clippy::too_many_arguments)]
+/// 把这些字段打包，一是为了压住参数个数，二是让"哪些是逐请求的、哪些是进程级的"
+/// 在签名上显式可见（后者见 [`PathProxyRuntime`]）。
+pub(crate) struct PathProxyRequest<'a> {
+    /// 请求方法（GET / POST / ...）
+    pub method: &'a str,
+    /// 目标 URL（含 scheme），由 [`PathProxyConfig::match_target`] 解析得到
+    pub target_url: &'a str,
+    /// 已读入的原始数据（头 + 可能的 body 前缀），保持与普通代理一致的零拷贝思路
+    pub data: &'a [u8],
+    /// body 起始偏移（`data` 中头结束位置）
+    pub head_end: usize,
+    /// 本次用于认证的请求头名；认证成功后转发上游前必须剔除，避免凭据泄漏
+    pub drop_header: Option<&'static str>,
+}
+
+/// 路径前缀直连的运行期参数（与单次请求无关，整个进程共用）
+#[derive(Clone, Copy)]
+pub(crate) struct PathProxyRuntime<'a> {
+    pub cfg: &'a PathProxyConfig,
+    pub timeout: Duration,
+    pub buffer_pool: &'a BufferPool,
+}
+
+/// 处理一次路径前缀直连请求。
 pub(crate) async fn handle_path_proxy<S>(
     mut client: S,
     client_addr: SocketAddr,
-    method: &str,
-    target_url: &str,
-    request_data: &[u8],
-    head_end: usize,
-    cfg: &PathProxyConfig,
-    timeout: Duration,
-    buffer_pool: &BufferPool,
-    drop_header: Option<&'static str>,
+    req: PathProxyRequest<'_>,
+    rt: PathProxyRuntime<'_>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // 解构后沿用原有变量名，函数体无需改动
+    let PathProxyRequest {
+        method,
+        target_url,
+        data: request_data,
+        head_end,
+        drop_header,
+    } = req;
+    let PathProxyRuntime {
+        cfg,
+        timeout,
+        buffer_pool,
+    } = rt;
+
     // ── 1. 解析目标 URL ──
     let parsed = match url::Url::parse(target_url) {
         Ok(u) => u,

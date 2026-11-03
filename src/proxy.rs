@@ -6,7 +6,9 @@ use crate::http_body::forward_chunked_body;
 use crate::http_util::{find_header_end, head_end_offset, MAX_HEAD_BYTES};
 use crate::io::PrefixedStream;
 use crate::net::{connect_host, is_benign_close_error, parse_host_port, AsyncStream};
-use crate::path_proxy::{handle_path_proxy, PathProxyConfig};
+use crate::path_proxy::{
+    handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
+};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::net::SocketAddr;
@@ -137,14 +139,18 @@ async fn handle_client_generic<S>(
             handle_path_proxy(
                 client,
                 client_addr,
-                method,
-                target,
-                data,
-                head_end,
-                cfg,
-                timeout_duration,
-                &buffer_pool,
-                auth_header,
+                PathProxyRequest {
+                    method,
+                    target_url: target,
+                    data,
+                    head_end,
+                    drop_header: auth_header,
+                },
+                PathProxyRuntime {
+                    cfg,
+                    timeout: timeout_duration,
+                    buffer_pool: &buffer_pool,
+                },
             )
             .await;
             return;

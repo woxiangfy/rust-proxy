@@ -40,6 +40,9 @@ use crate::tls::{
 /// 超出上限后新连接直接关闭（不排队），防止恶意批量连接打满文件句柄与内存。
 const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 
+/// TLS 握手超时：防止客户端连上后不完成握手而长期占用连接名额
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 启动代理服务器，根据配置可能同时监听 HTTP 和 HTTPS (TLS) 端口
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
     let buffer_pool = Arc::new(BufferPool::new());
@@ -214,21 +217,136 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
         info!("PROXY Protocol: no trusted IP whitelist (accepting from all sources)");
     }
 
-    accept_connections_dual(
-        http_listener,
-        https_listener,
-        args.timeout,
+    // 连接期不变量一次性收进 ConnContext：后续 accept / dispatch / 各处理函数
+    // 只需传递一个共享引用，避免 8~10 参数的签名在各层反复展开。
+    let ctx = Arc::new(ConnContext {
+        timeout: args.timeout,
         buffer_pool,
         auth,
         path_proxy,
-        args.http_proxy_protocol,
-        args.https_proxy_protocol,
-        Arc::new(args.proxy_protocol_trusted_ips.clone()),
-        shutdown_rx,
-    )
-    .await;
+        pp_policy: PpPolicy {
+            http_mode: args.http_proxy_protocol,
+            https_mode: args.https_proxy_protocol,
+            trusted_ips: Arc::new(args.proxy_protocol_trusted_ips.clone()),
+        },
+    });
+
+    accept_connections_dual(http_listener, https_listener, ctx, shutdown_rx).await;
 
     Ok(())
+}
+
+/// 一次启动内不变的连接处理参数
+///
+/// 这些值与具体连接无关（超时、缓冲池、认证表、路径前缀配置、PROXY 策略），
+/// 却在 accept → dispatch → 处理函数之间逐层传递。收进结构体后：
+/// - 参数列表从 8~10 个降到 1~3 个，`too_many_arguments` 告警消失；
+/// - 新增一个"全局连接参数"时只需改此处，不必追改所有层级的签名。
+struct ConnContext {
+    /// 读超时（秒）
+    timeout: u64,
+    buffer_pool: Arc<BufferPool>,
+    auth: Arc<Option<Vec<AuthUser>>>,
+    path_proxy: Arc<Option<PathProxyConfig>>,
+    pp_policy: PpPolicy,
+}
+
+/// PROXY Protocol 策略：两个 listener 各自有独立模式，共享可信 IP 白名单
+struct PpPolicy {
+    http_mode: ProxyProtocolMode,
+    https_mode: ProxyProtocolMode,
+    /// 空表示不限制来源（信任所有对端）
+    trusted_ips: Arc<Vec<std::net::IpAddr>>,
+}
+
+impl PpPolicy {
+    /// 该对端地址是否可信（配置了白名单时必须命中，否则跳过 PROXY 解析）
+    fn is_trusted(&self, addr: &SocketAddr) -> bool {
+        self.trusted_ips.is_empty() || self.trusted_ips.contains(&addr.ip())
+    }
+}
+
+impl ConnContext {
+    /// 不做 PROXY 解析的直连处理（明文 TCP）
+    async fn handle_plain_tcp(&self, client: tokio::net::TcpStream) {
+        handle_client(
+            client,
+            self.timeout,
+            Arc::clone(&self.buffer_pool),
+            Arc::clone(&self.auth),
+            Arc::clone(&self.path_proxy),
+        )
+        .await;
+    }
+}
+
+/// PROXY Protocol 解析结果
+///
+/// 统一了三种情形，调用方无需再区分"可信性检查 / 已解析 / 未匹配回退"：
+/// - 解析成功：真实客户端地址 + 已回填前缀的流
+/// - 不匹配签名（Auto）：回退地址 + 携带已读前缀的流
+/// - 来源不可信：回退地址 + 空前缀流（等价于原样传递）
+///
+/// 返回 `None` 表示该连接应被丢弃（Require 模式解析失败，或签名命中但报文畸形）。
+async fn resolve_real_addr(
+    client: tokio::net::TcpStream,
+    fallback_addr: SocketAddr,
+    mode: ProxyProtocolMode,
+    policy: &PpPolicy,
+) -> Option<(SocketAddr, PrefixedStream<tokio::net::TcpStream>)> {
+    // IP 白名单检查：源 IP 不可信时跳过解析，把连接当作直连流量
+    if !policy.is_trusted(&fallback_addr) {
+        debug!(
+            "PROXY Protocol: skipping for untrusted source IP {} (trusted: {:?})",
+            fallback_addr.ip(),
+            policy.trusted_ips
+        );
+        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
+    }
+
+    // Disable 在类型层无法表示为解析模式；若真被传入（分派逻辑被改坏），
+    // 保守回退为"不做 PROXY 解析"而不是 panic。
+    let Ok(internal_mode) = PpParseMode::try_from(mode) else {
+        warn!(
+            "PROXY Protocol: unexpected mode {} reached resolver, treating as direct traffic",
+            mode
+        );
+        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
+    };
+
+    match parse_proxy_protocol(client, internal_mode).await {
+        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
+            let real_addr = real_opt.unwrap_or(fallback_addr);
+            debug!(
+                "PROXY Protocol({}): {} -> real client {}",
+                mode, fallback_addr, real_addr
+            );
+            Some((real_addr, stream))
+        }
+        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
+            // Auto 模式：不匹配 → 回退，携带 prefix 供后续读取（HTTP 头 / TLS ClientHello）
+            // 使用。上层读取逻辑本身支持多次读，因此前缀字节不会丢失。
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, fallback to direct traffic",
+                fallback_addr
+            );
+            Some((fallback_addr, PrefixedStream::new(prefix, tcp)))
+        }
+        Err(e) => {
+            if matches!(mode, ProxyProtocolMode::Require) {
+                warn!(
+                    "PROXY Protocol(Require) parse failed from {}: {}",
+                    fallback_addr, e
+                );
+            } else {
+                debug!(
+                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
+                    fallback_addr, e
+                );
+            }
+            None
+        }
+    }
 }
 
 /// accept_connections_dual 中用于区分 HTTP / HTTPS accept 结果的内部枚举
@@ -246,17 +364,10 @@ enum DualAccept {
 ///   - 仅 HTTP（`http_listener=Some, https_listener=None`）
 ///   - 仅 HTTPS（`http_listener=None, https_listener=Some`）
 ///   - HTTP + HTTPS 双通道（两者都 `Some`）
-#[allow(clippy::too_many_arguments)]
 async fn accept_connections_dual(
     http_listener: Option<TcpListener>,
     https_listener: Option<(TcpListener, Arc<TlsReloader>)>,
-    timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
-    path_proxy: Arc<Option<PathProxyConfig>>,
-    http_proxy_protocol: ProxyProtocolMode,
-    https_proxy_protocol: ProxyProtocolMode,
-    proxy_protocol_trusted_ips: Arc<Vec<std::net::IpAddr>>,
+    ctx: Arc<ConnContext>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut join_set = JoinSet::new();
@@ -348,18 +459,7 @@ async fn accept_connections_dual(
         };
 
         if let Some(da) = result {
-            dispatch_accept_result(
-                Some(da),
-                &mut join_set,
-                timeout,
-                &buffer_pool,
-                &auth,
-                &path_proxy,
-                http_proxy_protocol,
-                https_proxy_protocol,
-                &proxy_protocol_trusted_ips,
-                &conn_semaphore,
-            );
+            dispatch_accept_result(Some(da), &mut join_set, &ctx, &conn_semaphore);
         }
         // result == None：定时器触发或 task 完成，直接进入下一轮循环
     }
@@ -394,17 +494,13 @@ fn try_acquire_conn_permit(
 }
 
 /// 将 accept 结果分发到连接处理任务
-#[allow(clippy::too_many_arguments)]
+///
+/// 只负责三件事：拿并发许可、把 `ConnContext` 复制进任务、按 listener 的 PROXY 模式
+/// 选择处理函数。真正的解析/握手在 `process_*` 中完成。
 fn dispatch_accept_result(
     result: Option<DualAccept>,
     join_set: &mut JoinSet<()>,
-    timeout: u64,
-    buffer_pool: &Arc<BufferPool>,
-    auth: &Arc<Option<Vec<AuthUser>>>,
-    path_proxy: &Arc<Option<PathProxyConfig>>,
-    http_proxy_protocol: ProxyProtocolMode,
-    https_proxy_protocol: ProxyProtocolMode,
-    proxy_protocol_trusted_ips: &Arc<Vec<std::net::IpAddr>>,
+    ctx: &Arc<ConnContext>,
     conn_semaphore: &Arc<Semaphore>,
 ) {
     match result {
@@ -413,21 +509,13 @@ fn dispatch_accept_result(
             let Some(permit) = try_acquire_conn_permit(conn_semaphore, &addr) else {
                 return;
             };
-            let bp = Arc::clone(buffer_pool);
-            let au = Arc::clone(auth);
-            let pp = Arc::clone(path_proxy);
-            let t1 = Arc::clone(proxy_protocol_trusted_ips);
-            let pp_mode = http_proxy_protocol;
+            let ctx = Arc::clone(ctx);
             join_set.spawn(async move {
                 // 许可在任务整个生命周期内持有，结束后自动归还信号量
                 let _permit = permit;
-                match pp_mode {
-                    ProxyProtocolMode::Disable => {
-                        handle_client(client, timeout, bp, au, pp).await;
-                    }
-                    ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
-                        process_http_client_pp(client, addr, timeout, bp, au, pp, t1, pp_mode).await;
-                    }
+                match ctx.pp_policy.http_mode {
+                    ProxyProtocolMode::Disable => ctx.handle_plain_tcp(client).await,
+                    _ => process_http_client_pp(client, addr, &ctx).await,
                 }
             });
         }
@@ -439,32 +527,15 @@ fn dispatch_accept_result(
             let Some(permit) = try_acquire_conn_permit(conn_semaphore, &addr) else {
                 return;
             };
-            let bp = Arc::clone(buffer_pool);
-            let au = Arc::clone(auth);
-            let pp = Arc::clone(path_proxy);
-            let t2 = Arc::clone(proxy_protocol_trusted_ips);
-            let pp_mode = https_proxy_protocol;
+            let ctx = Arc::clone(ctx);
             join_set.spawn(async move {
                 // 许可在任务整个生命周期内持有，结束后自动归还信号量
                 let _permit = permit;
-                match pp_mode {
+                match ctx.pp_policy.https_mode {
                     ProxyProtocolMode::Disable => {
-                        process_tls_client(client, addr, tls_reloader, timeout, bp, au, pp).await;
+                        process_tls_client(client, addr, tls_reloader, &ctx).await
                     }
-                    ProxyProtocolMode::Auto | ProxyProtocolMode::Require => {
-                        process_tls_client_pp(
-                            client,
-                            addr,
-                            tls_reloader,
-                            timeout,
-                            bp,
-                            au,
-                            pp,
-                            t2,
-                            pp_mode,
-                        )
-                        .await;
-                    }
+                    _ => process_tls_client_pp(client, addr, tls_reloader, &ctx).await,
                 }
             });
         }
@@ -475,180 +546,77 @@ fn dispatch_accept_result(
     }
 }
 
-/// PROXY Protocol 启用时的 HTTP 连接处理：
-/// 先检查 peer IP 是否在可信列表中，再按模式解析/自动检测 PROXY Protocol 头
-#[allow(clippy::too_many_arguments)]
+/// PROXY Protocol 启用时的 HTTP 连接处理：解析真实地址后交给通用 HTTP 处理
 async fn process_http_client_pp(
     client: tokio::net::TcpStream,
     fallback_addr: SocketAddr,
-    timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
-    path_proxy: Arc<Option<PathProxyConfig>>,
-    trusted_ips: Arc<Vec<std::net::IpAddr>>,
-    pp_mode: ProxyProtocolMode,
+    ctx: &ConnContext,
 ) {
-    // IP 白名单检查：若配置了可信列表且源 IP 不在列表中，跳过 PROXY Protocol 解析
-    if !trusted_ips.is_empty() && !trusted_ips.contains(&fallback_addr.ip()) {
-        debug!(
-            "PROXY Protocol: skipping for untrusted source IP {} (trusted: {:?})",
-            fallback_addr.ip(),
-            trusted_ips
-        );
-        handle_client(client, timeout, buffer_pool, auth, path_proxy).await;
-        return;
-    }
-
-    // Disable 在类型层无法表示为解析模式；若真被传入（分派逻辑被改坏），
-    // 保守回退为"当作直连 HTTP 处理"而不是 panic。
-    let Ok(internal_mode) = PpParseMode::try_from(pp_mode) else {
-        warn!(
-            "PROXY Protocol: unexpected mode {} for HTTP listener, treating as plain HTTP",
-            pp_mode
-        );
-        handle_client(client, timeout, buffer_pool, auth, path_proxy).await;
-        return;
+    let Some((real_addr, stream)) = resolve_real_addr(
+        client,
+        fallback_addr,
+        ctx.pp_policy.http_mode,
+        &ctx.pp_policy,
+    )
+    .await
+    else {
+        return; // 报文畸形，已记录日志
     };
 
-    let (real_addr, stream) = match parse_proxy_protocol(client, internal_mode).await {
-        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
-            let real_addr = real_opt.unwrap_or(fallback_addr);
-            debug!(
-                "PROXY Protocol({}): {} -> real client {}",
-                pp_mode, fallback_addr, real_addr
-            );
-            (real_addr, stream)
-        }
-        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
-            // Auto 模式：不匹配 → 回退，携带 prefix 供 HTTP 请求头解析使用。
-            // handle_client 的 read_request_head 会多次读取直到找到头结束符，
-            // 因此前缀字节不会丢失。
-            debug!(
-                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain HTTP",
-                fallback_addr
-            );
-            (fallback_addr, PrefixedStream::new(prefix, tcp))
-        }
-        Err(e) => {
-            if matches!(pp_mode, ProxyProtocolMode::Require) {
-                warn!(
-                    "PROXY Protocol(Require) parse failed from {}: {}",
-                    fallback_addr, e
-                );
-            } else {
-                debug!(
-                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
-                    fallback_addr, e
-                );
-            }
-            return;
-        }
-    };
-
-    handle_client_with_addr(stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
+    handle_client_with_addr(
+        stream,
+        real_addr,
+        ctx.timeout,
+        Arc::clone(&ctx.buffer_pool),
+        Arc::clone(&ctx.auth),
+        Arc::clone(&ctx.path_proxy),
+    )
+    .await;
 }
 
-/// PROXY Protocol 启用时的 HTTPS 连接处理：
-/// 先检查 peer IP 是否在可信列表中，再按模式解析/自动检测 PROXY Protocol 头
-#[allow(clippy::too_many_arguments)]
+/// PROXY Protocol 启用时的 HTTPS 连接处理：解析真实地址 → TLS 握手 → 通用 HTTP 处理
 async fn process_tls_client_pp(
     client: tokio::net::TcpStream,
     fallback_addr: SocketAddr,
     tls_reloader: Arc<TlsReloader>,
-    timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
-    path_proxy: Arc<Option<PathProxyConfig>>,
-    trusted_ips: Arc<Vec<std::net::IpAddr>>,
-    pp_mode: ProxyProtocolMode,
+    ctx: &ConnContext,
 ) {
-    // IP 白名单检查：若配置了可信列表且源 IP 不在列表中，跳过 PROXY Protocol 解析
-    if !trusted_ips.is_empty() && !trusted_ips.contains(&fallback_addr.ip()) {
-        debug!(
-            "PROXY Protocol: skipping for untrusted source IP {} (trusted: {:?})",
-            fallback_addr.ip(),
-            trusted_ips
-        );
-        process_tls_client(
-            client,
-            fallback_addr,
-            tls_reloader,
-            timeout,
-            buffer_pool,
-            auth,
-            path_proxy,
-        )
-        .await;
-        return;
-    }
-
-    // 同 process_http_client_pp：Disable 不应到此，保守回退为"不做 PROXY 解析直接握手"
-    let Ok(internal_mode) = PpParseMode::try_from(pp_mode) else {
-        warn!(
-            "PROXY Protocol: unexpected mode {} for HTTPS listener, treating as plain TLS",
-            pp_mode
-        );
-        process_tls_client(
-            client,
-            fallback_addr,
-            tls_reloader,
-            timeout,
-            buffer_pool,
-            auth,
-            path_proxy,
-        )
-        .await;
-        return;
+    let Some((real_addr, stream)) = resolve_real_addr(
+        client,
+        fallback_addr,
+        ctx.pp_policy.https_mode,
+        &ctx.pp_policy,
+    )
+    .await
+    else {
+        return; // 报文畸形，已记录日志
     };
 
-    let (real_addr, stream) = match parse_proxy_protocol(client, internal_mode).await {
-        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
-            let real_addr = real_opt.unwrap_or(fallback_addr);
-            debug!(
-                "PROXY Protocol({}): {} -> real client {}",
-                pp_mode, fallback_addr, real_addr
-            );
-            (real_addr, stream)
-        }
-        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
-            // Auto 模式：不匹配 → 回退，携带 prefix 供 TLS ClientHello 使用
-            debug!(
-                "PROXY Protocol(Auto): no signature detected from {}, fallback to plain TLS",
-                fallback_addr
-            );
-            (fallback_addr, PrefixedStream::new(prefix, tcp))
-        }
-        Err(e) => {
-            if matches!(pp_mode, ProxyProtocolMode::Require) {
-                warn!(
-                    "PROXY Protocol(Require) parse failed from {}: {}",
-                    fallback_addr, e
-                );
-            } else {
-                debug!(
-                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
-                    fallback_addr, e
-                );
-            }
-            return;
-        }
-    };
-
-    // TLS 握手（与 process_tls_client 逻辑一致，但流类型为 PrefixedStream<TcpStream>）
+    // 流类型为 PrefixedStream<TcpStream>，与 process_tls_client 的 TcpStream 不同，
+    // 因此握手代码无法直接复用（泛型化会让调用方也多一层类型参数）。
     let acceptor = tls_reloader.current_acceptor();
-    let tls_handshake_timeout = Duration::from_secs(10);
-    let tls_stream = match tokio::time::timeout(tls_handshake_timeout, acceptor.accept(stream)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!("TLS handshake failed for {}: {}", real_addr, e);
-            return;
-        }
-        Err(_) => {
-            warn!("TLS handshake timed out for {}", real_addr);
-            return;
-        }
-    };
-    handle_client_with_addr(tls_stream, real_addr, timeout, buffer_pool, auth, path_proxy).await;
+    let tls_stream =
+        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!("TLS handshake failed for {}: {}", real_addr, e);
+                return;
+            }
+            Err(_) => {
+                warn!("TLS handshake timed out for {}", real_addr);
+                return;
+            }
+        };
+
+    handle_client_with_addr(
+        tls_stream,
+        real_addr,
+        ctx.timeout,
+        Arc::clone(&ctx.buffer_pool),
+        Arc::clone(&ctx.auth),
+        Arc::clone(&ctx.path_proxy),
+    )
+    .await;
 }
 
 /// 对 accept 下来的 HTTPS socket 执行 TLS 握手，成功后交给 handle_client_with_addr
@@ -656,15 +624,12 @@ async fn process_tls_client(
     client: tokio::net::TcpStream,
     addr: SocketAddr,
     tls_reloader: Arc<TlsReloader>,
-    timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
-    path_proxy: Arc<Option<PathProxyConfig>>,
+    ctx: &ConnContext,
 ) {
     // 获取当前 acceptor（支持热重载，每次握手获取最新版本）
     let acceptor = tls_reloader.current_acceptor();
-    let tls_handshake_timeout = Duration::from_secs(10);
-    let tls_stream = match tokio::time::timeout(tls_handshake_timeout, acceptor.accept(client)).await {
+    let tls_stream = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client)).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             warn!("TLS handshake failed for {}: {}", addr, e);
@@ -675,7 +640,16 @@ async fn process_tls_client(
             return;
         }
     };
-    handle_client_with_addr(tls_stream, addr, timeout, buffer_pool, auth, path_proxy).await;
+
+    handle_client_with_addr(
+        tls_stream,
+        addr,
+        ctx.timeout,
+        Arc::clone(&ctx.buffer_pool),
+        Arc::clone(&ctx.auth),
+        Arc::clone(&ctx.path_proxy),
+    )
+    .await;
 }
 
 #[cfg(test)]

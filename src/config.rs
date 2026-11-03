@@ -188,6 +188,7 @@ pub struct RunAsServiceArgs {
 /// 通过配置文件的 `[[auth]]` 段定义。配置后，客户端必须通过 HTTP Basic 认证
 /// （携带 `Proxy-Authorization` 头）才能使用代理。
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthUser {
     /// 用户名
     pub username: String,
@@ -274,7 +275,22 @@ impl Args {
 
     pub fn from_run_args(run_args: &ServerRunArgs) -> Self {
         let config_path = run_args.config.clone().or_else(Self::find_default_config);
-        let config = config_path.as_ref().and_then(|path| load_config(path).ok());
+        // 配置加载失败不能静默：用户显式给了 --config 却写错路径/语法时，
+        // 静默忽略等于用默认值（无认证）继续跑，是安全上的静默降级。
+        let config = match config_path.as_ref() {
+            Some(path) => match load_config(path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::error!(
+                        "Failed to load config {}: {} — continuing with command-line options only",
+                        path.display(),
+                        e
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let mut log_file = run_args.log_file.clone();
         if log_file.is_none() {
@@ -451,7 +467,12 @@ impl Args {
 }
 
 /// Configuration loaded from TOML file
+///
+/// `deny_unknown_fields`：拼错键名（如把 `proxy_protocol_mode` 写成
+/// `proxy_protocal_mode`）必须报错而不是被静默忽略——配置里既有代理认证也有
+/// 来源校验，静默丢一个键等于静默降低安全性。
 #[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Port to bind
     pub port: Option<u16>,
@@ -820,7 +841,6 @@ proxy_protocol_trusted_ips = ["10.0.0.1"]
         // CLI 未指定时应使用配置文件中的可信 IP
         let toml_str = r#"
 port = 8080
-proxy_protocol = true
 proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
 "#;
         let tmp_dir = std::env::temp_dir().join("test_pp_trusted_ips_dir2");
@@ -892,9 +912,10 @@ proxy_protocol_mode = "auto"
     }
 
     #[test]
-    fn test_pp_mode_config_bool_true_is_ignored_defaults_to_auto() {
-        // 配置里的布尔 `proxy_protocol = true` 字段已移除，不再映射为 Require，
-        // 未知字段被 TOML 忽略，最终回退到全局默认 Auto（全自动识别）
+    fn test_pp_mode_unknown_legacy_key_falls_back_to_auto() {
+        // 旧的布尔 `proxy_protocol = true` 已从 Config 移除；现在它属于未知键，
+        // 会让整个配置文件解析失败（deny_unknown_fields）并打出 error 日志，
+        // 进程随后按默认值启动——默认即 Auto（全自动识别），不中断服务。
         let toml_str = r#"
 port = 8080
 proxy_protocol = true
@@ -1134,5 +1155,39 @@ path_proxy_rewrite_location = false
         let resolved = Args::resolve_log_file_path(&rel, None);
         assert!(resolved.is_absolute(), "应返回绝对路径：{resolved:?}");
         assert!(resolved.ends_with("fallback.log"));
+    }
+
+    // ─── 严格解析：拼错/放错键必须报错（而非静默忽略） ───
+
+    #[test]
+    fn test_config_rejects_unknown_key() {
+        let dir = std::env::temp_dir().join("rust_proxy_cfg_unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        // 典型拼写错误：proxy_protocal_mode（少一个 o）
+        std::fs::write(&f, "proxy_protocal_mode = \"auto\"\n").unwrap();
+        let err = load_config(&f).expect_err("拼错的键必须报错");
+        assert!(
+            format!("{err:#}").contains("Failed to parse config"),
+            "错误信息应指出解析失败：{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_rejects_top_level_key_placed_after_auth_table() {
+        // TOML 语义：开过 [[auth]] 之后写的键都属于该数组元素。
+        // 把顶层键写在其后会被当成 AuthUser 的字段，必须报错，
+        // 否则用户会以为"路径前缀已启用"而实际没有。
+        let dir = std::env::temp_dir().join("rust_proxy_cfg_misplaced");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        std::fs::write(
+            &f,
+            "[[auth]]\nusername = \"a\"\npassword = \"b\"\npath_proxy_prefix = \"px\"\n",
+        )
+        .unwrap();
+        assert!(load_config(&f).is_err(), "错位的键必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

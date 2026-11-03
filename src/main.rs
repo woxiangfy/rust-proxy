@@ -15,8 +15,10 @@ mod logging;
 mod net;
 mod path_proxy;
 mod proxy;
+mod proxy_protocol;
 mod server;
 mod service;
+mod tls;
 
 use anyhow::{Context, Result};
 use clap::Parser;

@@ -30,8 +30,8 @@ use log::{debug, error, info, warn};
 pub async fn handle_client(
     client: TcpStream,
     timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
+    buffer_pool: BufferPool,
+    auth: Option<Arc<[AuthUser]>>,
     path_proxy: Arc<Option<PathProxyConfig>>,
 ) {
     let client_addr = match client.peer_addr() {
@@ -54,8 +54,8 @@ pub async fn handle_client_with_addr<S>(
     client: S,
     client_addr: SocketAddr,
     timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
+    buffer_pool: BufferPool,
+    auth: Option<Arc<[AuthUser]>>,
     path_proxy: Arc<Option<PathProxyConfig>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -71,8 +71,8 @@ async fn handle_client_generic<S>(
     mut client: S,
     client_addr: SocketAddr,
     timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
+    buffer_pool: BufferPool,
+    auth: Option<Arc<[AuthUser]>>,
     path_proxy: Arc<Option<PathProxyConfig>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -127,7 +127,7 @@ async fn handle_client_generic<S>(
             // 复用代理认证：配置了 [[auth]] 时同样要求 Basic 凭据（401 质询）。
             // 认证成功时记录凭据所在的头，转发上游前必须剔除（否则凭据泄漏给目标站点）。
             let mut auth_header: Option<&'static str> = None;
-            if let Some(users) = auth.as_ref() {
+            if let Some(users) = auth.as_deref() {
                 match check_path_auth(&head_str, users) {
                     Some(source) => auth_header = Some(source.header_name()),
                     None => {
@@ -177,7 +177,7 @@ async fn handle_client_generic<S>(
 
     // 第二步：认证校验。配置了 [[auth]] 时才校验。
     // 只有确认是代理请求后才会可能返回 407，降低"被扫描识别为代理"的风险。
-    if let Some(users) = auth.as_ref() {
+    if let Some(users) = auth.as_deref() {
         if !check_proxy_auth(&head_str, users) {
             send_auth_required(&mut client).await;
             warn!("Proxy authentication failed from {}", client_addr);
@@ -853,7 +853,7 @@ async fn handle_http_request_generic<S>(
     head_end: usize,
     client_addr: SocketAddr,
     timeout_duration: Duration,
-    buffer_pool: Arc<BufferPool>,
+    buffer_pool: BufferPool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {

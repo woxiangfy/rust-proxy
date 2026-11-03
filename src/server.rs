@@ -221,8 +221,8 @@ pub async fn run_server_with_listener(
 struct ConnContext {
     /// 读超时（秒）
     timeout: u64,
-    buffer_pool: Arc<BufferPool>,
-    auth: Arc<Option<Vec<AuthUser>>>,
+    buffer_pool: BufferPool,
+    auth: Option<Arc<[AuthUser]>>,
     path_proxy: Arc<Option<PathProxyConfig>>,
     pp_policy: PpPolicy,
 }
@@ -276,8 +276,8 @@ impl ConnContext {
 
         Ok(Self {
             timeout: args.timeout,
-            buffer_pool: Arc::new(BufferPool::new()),
-            auth: Arc::new(args.auth.clone()),
+            buffer_pool: BufferPool::new(),
+            auth: args.auth.clone().map(Arc::from),
             path_proxy: Arc::new(path_proxy),
             pp_policy: PpPolicy {
                 http_mode: args.http_proxy_protocol,
@@ -292,8 +292,8 @@ impl ConnContext {
         handle_client(
             client,
             self.timeout,
-            Arc::clone(&self.buffer_pool),
-            Arc::clone(&self.auth),
+            self.buffer_pool.clone(),
+            self.auth.clone(),
             Arc::clone(&self.path_proxy),
         )
         .await;
@@ -587,8 +587,8 @@ async fn process_http_client_pp(
         stream,
         real_addr,
         ctx.timeout,
-        Arc::clone(&ctx.buffer_pool),
-        Arc::clone(&ctx.auth),
+        ctx.buffer_pool.clone(),
+        ctx.auth.clone(),
         Arc::clone(&ctx.path_proxy),
     )
     .await;
@@ -632,8 +632,8 @@ async fn process_tls_client_pp(
         tls_stream,
         real_addr,
         ctx.timeout,
-        Arc::clone(&ctx.buffer_pool),
-        Arc::clone(&ctx.auth),
+        ctx.buffer_pool.clone(),
+        ctx.auth.clone(),
         Arc::clone(&ctx.path_proxy),
     )
     .await;
@@ -665,8 +665,8 @@ async fn process_tls_client(
         tls_stream,
         addr,
         ctx.timeout,
-        Arc::clone(&ctx.buffer_pool),
-        Arc::clone(&ctx.auth),
+        ctx.buffer_pool.clone(),
+        ctx.auth.clone(),
         Arc::clone(&ctx.path_proxy),
     )
     .await;

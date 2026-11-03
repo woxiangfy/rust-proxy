@@ -424,19 +424,20 @@ impl Args {
         path.clone()
     }
 
+    /// 日志文件路径解析：相对配置目录，其次相对可执行文件目录
+    ///
+    /// 与 [`Self::resolve_path_relative_to_config`] 的差别只在最后一级回退：日志文件
+    /// 在"没有配置文件"时仍需要一个稳定落点。服务模式下工作目录不可靠
+    /// （Windows SCM 默认 `System32`、systemd 默认 `/`），因此回退到可执行文件同目录，
+    /// 而不是 `cwd`。
     fn resolve_log_file_path(log_file: &PathBuf, config_path: Option<&PathBuf>) -> PathBuf {
         if log_file.is_absolute() {
             return log_file.clone();
         }
 
-        if let Some(config_path) = config_path {
-            if let Some(config_dir) = config_path.parent() {
-                let resolved = config_dir.join(log_file);
-                if let Ok(canonical) = resolved.canonicalize() {
-                    return canonical;
-                }
-                return resolved;
-            }
+        // 有配置文件时与证书/密钥走同一套解析规则（内含 canonicalize 尝试）
+        if config_path.and_then(|c| c.parent()).is_some() {
+            return Self::resolve_path_relative_to_config(log_file, config_path);
         }
 
         if let Ok(exe_path) = std::env::current_exe() {
@@ -1317,5 +1318,48 @@ path_proxy_rewrite_location = false
         let args = Args::from_run_args(&run_args);
         assert!(args.path_proxy_prefix.is_none());
         assert!(args.path_proxy_rewrite_location, "默认应重写 Location");
+    }
+
+    // ─── 路径解析（C2 合并后的一致性） ───
+
+    #[test]
+    fn test_resolve_keeps_absolute_paths() {
+        let abs = std::env::temp_dir().join("abs.log");
+        let cfg = std::env::temp_dir().join("config.toml");
+        assert_eq!(Args::resolve_log_file_path(&abs, Some(&cfg)), abs);
+        assert_eq!(
+            Args::resolve_path_relative_to_config(&abs, Some(&cfg)),
+            abs,
+            "绝对路径不应被改写"
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_to_config_dir() {
+        let dir = std::env::temp_dir().join("rust_proxy_cfg_resolve");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let rel = std::path::PathBuf::from("proxy.log");
+
+        // 日志与证书走同一套规则：相对配置文件所在目录
+        assert_eq!(
+            Args::resolve_log_file_path(&rel, Some(&cfg)),
+            dir.join("proxy.log")
+        );
+        assert_eq!(
+            Args::resolve_path_relative_to_config(&rel, Some(&cfg)),
+            dir.join("proxy.log")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_log_file_falls_back_to_exe_dir() {
+        // 无配置文件时日志落到可执行文件同目录（服务模式下 cwd 不可靠）
+        let rel = std::path::PathBuf::from("fallback.log");
+        let resolved = Args::resolve_log_file_path(&rel, None);
+        assert!(resolved.is_absolute(), "应返回绝对路径：{resolved:?}");
+        assert!(resolved.ends_with("fallback.log"));
     }
 }

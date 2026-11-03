@@ -9,6 +9,8 @@ use std::ffi::OsString;
 use crate::config::{RunAsServiceArgs, ServerRunArgs};
 
 const SERVICE_LABEL: &str = "rust-proxy";
+/// 服务描述（仅 Windows 使用：`sc description` 需要，Linux 的 systemd unit 描述另配）
+#[cfg(windows)]
 const DEFAULT_SERVICE_DESCRIPTION: &str = "Rust HTTP Proxy Server";
 
 /// 解析服务模式下的运行参数
@@ -33,6 +35,26 @@ fn parse_service_args() -> ServerRunArgs {
             );
             ServerRunArgs::default()
         }
+    }
+}
+
+/// 通过 `sc description` 补充服务描述
+///
+/// `service-manager` 的 `ServiceInstallCtx` 未暴露描述字段，而 Windows SCM 原生支持，
+/// 因此装完之后再补一条 `sc` 命令。失败只告警不中断：描述属于展示信息，
+/// 服务本身已经装好了，不该因为这一步失败而报错。
+#[cfg(windows)]
+fn set_service_description(description: &str) {
+    match std::process::Command::new("sc")
+        .args(["description", SERVICE_LABEL, description])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => println!(
+            "Warning: Failed to set service description: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => println!("Warning: Failed to run sc: {}", e),
     }
 }
 
@@ -143,80 +165,46 @@ pub fn install_service(run_args: &ServerRunArgs) -> Result<()> {
         command_args.push(OsString::from("--path-proxy-insecure"));
     }
 
-    let description = DEFAULT_SERVICE_DESCRIPTION.to_string();
+    // 三个平台的差异只在"用哪个 manager"和"装完是否补描述"：
+    //   Linux  → systemd 专用 manager
+    //   Windows → 平台原生 manager + sc description 补中文描述（service-manager 不支持）
+    //   其他   → 平台原生 manager
+    // 因此安装参数只构造一次，避免三份字面量各自漂移。
+    let install_ctx = ServiceInstallCtx {
+        label: label.clone(),
+        program: exe_path,
+        args: command_args,
+        contents: None,
+        username: None,
+        autostart: true,
+        environment: None,
+        restart_policy: RestartPolicy::default(),
+        working_directory: Some(exe_dir),
+    };
 
     #[cfg(target_os = "linux")]
     {
         use service_manager::SystemdServiceManager;
 
         let mut manager = SystemdServiceManager::system();
-        // manager.config.unit.description = Some(description.clone());
+        // manager.config.unit.description = Some(DEFAULT_SERVICE_DESCRIPTION.to_string());
 
         manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: exe_path,
-                args: command_args,
-                contents: None,
-                username: None,
-                autostart: true,
-                environment: None,
-                restart_policy: RestartPolicy::default(),
-                working_directory: Some(exe_dir),
-            })
+            .install(install_ctx)
             .context("Failed to install service")?;
     }
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     {
         let manager = <dyn ServiceManager>::native()
             .context("Failed to detect service management platform")?;
 
         manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: exe_path,
-                args: command_args,
-                contents: None,
-                username: None,
-                autostart: true,
-                environment: None,
-                restart_policy: RestartPolicy::default(),
-                working_directory: Some(exe_dir),
-            })
+            .install(install_ctx)
             .context("Failed to install service")?;
 
-        let output = std::process::Command::new("sc")
-            .args(["description", SERVICE_LABEL, &description])
-            .output()
-            .context("Failed to set service description")?;
-
-        if !output.status.success() {
-            println!(
-                "Warning: Failed to set service description: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let manager = <dyn ServiceManager>::native()
-            .context("Failed to detect service management platform")?;
-
-        manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: exe_path,
-                args: command_args,
-                contents: None,
-                username: None,
-                autostart: true,
-                environment: None,
-                restart_policy: RestartPolicy::default(),
-                working_directory: Some(exe_dir),
-            })
-            .context("Failed to install service")?;
+        #[cfg(windows)]
+        set_service_description(DEFAULT_SERVICE_DESCRIPTION);
     }
 
     println!("Service installed successfully: {}", label);

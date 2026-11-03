@@ -4,12 +4,17 @@
 //! （[`rust_proxy::server::run_server_with_listener`]，绑定 `127.0.0.1:0` 取临时端口），
 //! 然后用手写 HTTP 报文驱动，断言字节级响应。
 //!
-//! 覆盖 5 条主链路（对应评审报告 A1）：
+//! 覆盖的主链路（对应评审报告 A1）：
 //! 1. 反扫描：非代理格式请求 → 最小化 404，且不带 `Server` 头
 //! 2. 认证：无凭据 / 错凭据 → 407；正确凭据 → 转发，且凭据不出现在上游请求里
 //! 3. CONNECT 隧道：200 Connection Established 后双向透传
 //! 4. 路径前缀直连：`/px/http://host/path` → 上游收到重写后的 origin-form 请求
 //! 5. PROXY Protocol：Auto 模式兼容带/不带 v1 头；Require 模式拒绝无头连接
+//! 6. `Expect: 100-continue`：代理自己回 100，不等上游
+//! 7. TLS 监听：自签证书握手成功，转发与反扫描在 TLS 下同样成立
+//! 8. chunked 请求体：分帧字节原样转发，不补 `Content-Length`
+//! 9. 上游不可达：HTTP 与 CONNECT 均回 502（不得静默关闭）
+//! 10. 超长请求头：超过 64KB 回 431，且不把截断的头转发给上游
 //!
 //! 全部走 loopback，不依赖外网，可在 CI 稳定运行。
 
@@ -20,6 +25,7 @@ use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio_native_tls::{native_tls, TlsConnector};
 
 use rust_proxy::config::{Args, AuthUser, LogLevel, ProxyProtocolMode};
 use rust_proxy::server;
@@ -79,6 +85,42 @@ async fn spawn_proxy(args: Args) -> Proxy {
         addr,
         shutdown: Some(tx),
     }
+}
+
+/// 在临时端口上启动**自签 TLS** 代理
+///
+/// 证书由服务端在进程内生成，测试侧不需要也不应该读磁盘上的证书文件：
+/// 乱序执行的工作目录里可能有个 `config.toml`，任何外部文件依赖都会让用例变得不可靠。
+async fn spawn_tls_proxy(args: Args) -> Proxy {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tls proxy");
+    let addr = listener.local_addr().expect("tls proxy local_addr");
+    let (tx, rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        server::run_server_with_self_signed_tls(listener, &args, Some(rx))
+            .await
+            .expect("tls proxy exited with error");
+    });
+
+    Proxy {
+        addr,
+        shutdown: Some(tx),
+    }
+}
+
+/// 与代理建立 TLS 连接（自签证书，跳过验证）
+async fn connect_tls(addr: SocketAddr) -> tokio_native_tls::TlsStream<TcpStream> {
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    let connector = TlsConnector::from(builder.build().expect("build tls connector"));
+    let tcp = TcpStream::connect(addr).await.expect("connect tls proxy");
+
+    tokio::time::timeout(IO_TIMEOUT, connector.connect("localhost", tcp))
+        .await
+        .expect("tls handshake timed out")
+        .expect("tls handshake failed")
 }
 
 /// 假上游：读完整请求头后，把请求头原文回显进响应体，便于断言 Host / 路径 / 头部过滤
@@ -163,6 +205,61 @@ async fn spawn_body_origin() -> SocketAddr {
     addr
 }
 
+/// chunked 假上游：读完头与 chunked 分帧体（直到终止块），把**原始字节**回显
+///
+/// 回显而不是解码，是为了让测试直接断言"代理有没有动过分帧"——
+/// 一旦代理偷偷把 chunked 解成 `Content-Length`，回显里就再也找不到 `0\r\n\r\n`。
+async fn spawn_chunked_origin() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind chunked origin");
+    let addr = listener.local_addr().expect("chunked origin local_addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut sock).await else {
+                    return;
+                };
+                let head_len = head
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(head.len());
+                let mut raw = head.clone();
+
+                // 用例只发单块 body，终止序列为 `0\r\n\r\n`（块数据后跟空块）
+                let mut chunk = [0u8; 512];
+                while !contains(&raw[head_len..], b"0\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                    }
+                }
+
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    raw.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(&raw);
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// 子串查找（`[u8]::windows` 的薄封装，只在本文件用）
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// 回声上游：用于 CONNECT 隧道，收到什么原样吐回
 async fn spawn_echo_origin() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -241,6 +338,19 @@ fn body_of(resp: &[u8]) -> String {
 
 fn basic(user: &str, pass: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+}
+
+/// 取一个"确定没人监听"的地址：绑定后立即释放端口
+///
+/// 不能写死 `127.0.0.1:1` 之类的端口——那可能被系统服务占用而表现成"能连上"。
+/// loopback 上刚释放的临时端口在用例生命周期内被抢占的概率可忽略。
+async fn dead_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let addr = listener.local_addr().expect("ephemeral local_addr");
+    drop(listener);
+    addr
 }
 
 // ─────────────────────────── 用例 ───────────────────────────
@@ -502,5 +612,180 @@ async fn expect_100_continue_answered_by_proxy_not_upstream() {
         !body_of(&rest).to_ascii_lowercase().contains("expect:"),
         "Expect 不得转发给上游：{}",
         body_of(&rest)
+    );
+}
+
+/// 链路 8：TLS 监听
+///
+/// 明文 listener 的用例无法证明 TLS 分支（握手 → `handle_client_with_addr`）可用：
+/// 该分支的流类型是 `TlsStream`，与明文 `TcpStream` 走的是不同的调用点。
+/// 这里用自签证书握手后跑一次完整转发，再验证反扫描特性在 TLS 下同样成立。
+#[tokio::test]
+async fn tls_listener_proxies_and_keeps_anti_scan() {
+    let origin = spawn_origin().await;
+    let proxy = spawn_tls_proxy(base_args()).await;
+
+    // (a) 真实 TLS 握手 + 绝对 URL 转发
+    let mut sock = connect_tls(proxy.addr).await;
+    let req = format!(
+        "GET http://{origin}/secure HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(req.as_bytes())
+        .await
+        .expect("write over tls");
+    let mut resp = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp))
+        .await
+        .expect("tls response timed out")
+        .expect("read tls response");
+
+    assert_eq!(status_code(&resp), 200, "TLS 下应正常转发");
+    assert!(
+        body_of(&resp).contains("GET /secure HTTP/1.1"),
+        "上游应收到 origin-form 请求行，实际：{}",
+        body_of(&resp)
+    );
+
+    // (b) TLS 下反扫描同样成立：扫描器在 TLS 端口上也只看得到普通 404
+    let mut sock = connect_tls(proxy.addr).await;
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: whatever\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write scan over tls");
+    let mut resp = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp))
+        .await
+        .expect("scan response timed out")
+        .expect("read scan response");
+
+    assert_eq!(status_code(&resp), 404);
+    let lower = String::from_utf8_lossy(&resp).to_lowercase();
+    assert!(!lower.contains("\r\nserver:"), "TLS 404 同样不得暴露 Server 头");
+}
+
+/// 链路 9：chunked 请求体
+///
+/// 两个容易出错的点：
+/// 1. 分帧必须**原样**转发（含终止块），代理不能自行解码后改发 `Content-Length`；
+/// 2. 不得同时出现 `Content-Length`，否则上游按两种长度解析，构成请求走私面。
+#[tokio::test]
+async fn chunked_request_body_forwarded_with_framing_intact() {
+    let origin = spawn_chunked_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let req = format!(
+        "POST http://{origin}/chunk HTTP/1.1\r\n\
+         Host: {origin}\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Connection: close\r\n\
+         \r\n\
+         5\r\nhello\r\n0\r\n\r\n"
+    );
+    let resp = request_raw(proxy.addr, req.as_bytes()).await;
+
+    assert_eq!(status_code(&resp), 200, "上游应完成分帧读取");
+    let echoed = body_of(&resp);
+    let lower = echoed.to_lowercase();
+
+    assert!(
+        lower.contains("transfer-encoding: chunked"),
+        "上游必须收到 chunked 分帧头：{lower}"
+    );
+    assert!(
+        !lower.contains("content-length:"),
+        "chunked 请求不得被补上 Content-Length（请求走私面）：{lower}"
+    );
+    assert!(
+        echoed.ends_with("5\r\nhello\r\n0\r\n\r\n"),
+        "分帧字节必须原样转发，实际：{echoed:?}"
+    );
+}
+
+/// 链路 10：上游不可达
+///
+/// 历史实现对两种形态都要么静默 `return`（客户端只看得到 EOF），要么文档承诺
+/// 502 而实现没做。这里把"明确回 502"钉死：客户端必须能区分"代理到目标不通"
+/// 与"目标自己拒绝"，否则无从重试与排障。
+#[tokio::test]
+async fn unreachable_upstream_returns_502() {
+    let proxy = spawn_proxy(base_args()).await;
+    let dead = dead_addr().await;
+
+    // (a) 明文 HTTP 代理：连接上游失败 → 502
+    let resp = request_raw(
+        proxy.addr,
+        format!("GET http://{dead}/gone HTTP/1.1\r\nHost: {dead}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status_code(&resp),
+        502,
+        "上游不可达必须回 502 而不是空 EOF，body: {:?}",
+        body_of(&resp)
+    );
+    assert!(
+        String::from_utf8_lossy(&resp)
+            .to_lowercase()
+            .contains("connection: close"),
+        "502 必须带 Connection: close，否则客户端会等后续字节"
+    );
+
+    // (b) CONNECT：隧道建不起来时同样回 502（客户端不会把 EOF 当成隧道异常）
+    let resp = request_raw(
+        proxy.addr,
+        format!("CONNECT {dead} HTTP/1.1\r\nHost: {dead}\r\n\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status_code(&resp),
+        502,
+        "CONNECT 到不可达目标应回 502，body: {:?}",
+        body_of(&resp)
+    );
+}
+
+/// 链路 11：超长请求头
+///
+/// 超过 `MAX_HEAD_BYTES`（64KB）时必须**拒绝而不是截断**：截断的头没有 `\r\n\r\n`，
+/// 上游会一直等剩余头部，代理却已开始发 body，两边各自卡到超时；若截断点正好落在
+/// 合法请求行之后，畸形流量还会被当成正常代理请求放行。
+///
+/// 报文构造有两点讲究：
+/// 1. **顶满上限且不含头结束符**——这正是超限的真实形态（超大 Cookie / 慢速续期）。
+///    若报文恰好 64KB 且带 `\r\n\r\n`，会先命中"头已完整"分支而正常转发；
+/// 2. 长度精确对齐到 8 × 8KB 读缓冲，服务端读满后接收缓冲已空，关闭时不会因
+///    残留未读字节触发 RST（Windows 上 RST 会把尚未取走的响应冲掉，
+///    客户端只看到空响应，与待验证行为无关）。
+#[tokio::test]
+async fn oversized_request_head_rejected_before_forwarding() {
+    let proxy = spawn_proxy(base_args()).await;
+
+    const LIMIT: usize = 64 * 1024;
+    let prefix = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Pad: ";
+    let oversized = format!("{prefix}{}", "a".repeat(LIMIT - prefix.len()));
+    assert_eq!(oversized.len(), LIMIT, "报文必须正好顶到上限");
+    assert!(
+        !oversized.ends_with("\r\n\r\n"),
+        "本用例要复现的是「读满上限仍无结束符」"
+    );
+
+    let sock = TcpStream::connect(proxy.addr).await.expect("connect proxy");
+    let (mut rd, mut wr) = sock.into_split();
+    let writer = tokio::spawn(async move { wr.write_all(oversized.as_bytes()).await });
+
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(IO_TIMEOUT, rd.read_to_end(&mut resp)).await;
+    // 写入在服务端提前关闭后可能报错，属预期，不影响断言
+    let _ = writer.await;
+
+    assert_eq!(
+        status_code(&resp),
+        431,
+        "超长请求头必须回 431 而不是截断转发，实际响应：{:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        !String::from_utf8_lossy(&resp).contains("Example Domain"),
+        "超长请求绝不能被转发到上游"
     );
 }

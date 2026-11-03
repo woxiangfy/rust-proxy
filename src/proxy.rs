@@ -79,7 +79,9 @@ async fn handle_client_generic<S>(
     let timeout_duration = Duration::from_secs(timeout);
 
     // 读取完整请求头（含可能的 body 前缀），常见情况零拷贝复用池化缓冲区
-    let storage = match read_request_head(&mut client, &buffer_pool, timeout_duration).await {
+    let (storage, head_overflow) = match read_request_head(&mut client, &buffer_pool, timeout_duration)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             if is_benign_close_error(&e) {
@@ -90,6 +92,20 @@ async fn handle_client_generic<S>(
             return;
         }
     };
+
+    // 头部超过 MAX_HEAD_BYTES：畸形或恶意，必须在分派前拒绝。
+    // 历史实现把已读字节当作完整头继续处理：`head_end_offset` 找不到 `\r\n\r\n` 时
+    // 退化为 `data.len()`，于是截断的头被转发给上游——上游等不到剩余头部，代理却
+    // 已在发 body，两侧一直卡到各自超时；若截断点恰好落在合法请求行之后，还会把
+    // 畸形流量当成正常代理请求放行。
+    if head_overflow {
+        warn!(
+            "Request head from {} exceeds {} bytes, rejecting",
+            client_addr, MAX_HEAD_BYTES
+        );
+        send_head_too_large(&mut client).await;
+        return;
+    }
 
     let data = storage.as_slice();
     if data.is_empty() {
@@ -222,11 +238,14 @@ impl RequestStorage {
 ///
 /// 整个读取过程受一次 `timeout` 约束，防止慢速攻击（slowloris）逐次续期。
 /// 常见情况（一次读取即含完整头）复用池化缓冲区，零拷贝。
+///
+/// 第二个返回值表示"是否因超过 [`MAX_HEAD_BYTES`] 而停止读取"。调用方必须区别对待：
+/// 超限的头部是**不完整**的，既不能当完整头解析，也不能转发（见调用点注释）。
 async fn read_request_head<S>(
     client: &mut S,
     buffer_pool: &BufferPool,
     timeout: Duration,
-) -> std::io::Result<RequestStorage>
+) -> std::io::Result<(RequestStorage, bool)>
 where
     S: AsyncRead + Unpin,
 {
@@ -243,7 +262,7 @@ where
 async fn read_request_head_inner<S>(
     client: &mut S,
     buffer_pool: &BufferPool,
-) -> std::io::Result<RequestStorage>
+) -> std::io::Result<(RequestStorage, bool)>
 where
     S: AsyncRead + Unpin,
 {
@@ -251,10 +270,10 @@ where
     let mut buf = buffer_pool.get();
     let n = client.read(buf.as_mut_slice()).await?;
     if n == 0 {
-        return Ok(RequestStorage::Pooled(buf, 0));
+        return Ok((RequestStorage::Pooled(buf, 0), false));
     }
     if find_header_end(&buf.as_slice()[..n]).is_some() {
-        return Ok(RequestStorage::Pooled(buf, n));
+        return Ok((RequestStorage::Pooled(buf, n), false));
     }
 
     // 慢路径：多次读取累积到堆缓冲。
@@ -268,11 +287,15 @@ where
             break; // EOF：用已有数据返回
         }
         data.extend_from_slice(&buf.as_slice()[..m]);
-        if find_header_end(&data).is_some() || data.len() >= MAX_HEAD_BYTES {
+        if find_header_end(&data).is_some() {
             break;
         }
+        if data.len() >= MAX_HEAD_BYTES {
+            // 读够了上限仍未见到头结束符：标记超限，不再继续读（防慢速续期）
+            return Ok((RequestStorage::Heap(data), true));
+        }
     }
-    Ok(RequestStorage::Heap(data))
+    Ok((RequestStorage::Heap(data), false))
 }
 
 /// 代理请求分类结果
@@ -337,12 +360,44 @@ async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
     .await;
 }
 
+/// 请求头超过上限时的 431 响应
+///
+/// 用 431 而不是 400：语义精确（RFC 6585 §5 专为"头部过大"定义），且只会在客户端
+/// 已经发出超长头时出现——扫描器通常只发一行 `GET /`，因此不构成代理特征泄漏。
+async fn send_head_too_large<W: AsyncWrite + Unpin>(client: &mut W) {
+    write_response(
+        client,
+        "431 Request Header Fields Too Large",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        b"431 Request Header Fields Too Large",
+    )
+    .await;
+}
+
+/// 上游不可达时的最小化 502 响应
+///
+/// 历史实现在这里直接 `return`，客户端只看到 EOF（curl 报
+/// `Empty reply from server`），既无法区分"代理到目标的路由断了"还是"目标自己拒绝"，
+/// 也无从判断是否值得重试。同端口的路径前缀直连模式早已回 502，两条链路对同一种
+/// 失败给出完全不同的反馈属于实现漂移，这里统一。
+///
+/// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
+async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
+    write_response(
+        client,
+        "502 Bad Gateway",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        b"502 Bad Gateway",
+    )
+    .await;
+}
+
 /// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）
 ///
 /// `leftover` 是请求头之后已经读入的字节（如客户端与 CONNECT 一并发送的 TLS ClientHello），
 /// 会作为隧道前缀保留，避免数据丢失。
 async fn handle_connect_generic<S>(
-    client: S,
+    mut client: S,
     host_port: &str,
     client_addr: SocketAddr,
     timeout_duration: Duration,
@@ -372,6 +427,8 @@ async fn handle_connect_generic<S>(
                 "Failed to connect to {}:{} from {}: {}",
                 connect_host_str, port, client_addr, e
             );
+            // 隧道未建立：必须在断开前明确告知 502，否则客户端把 EOF 当作隧道异常
+            send_bad_gateway(&mut client).await;
             return;
         }
     };
@@ -727,6 +784,7 @@ async fn handle_http_request_generic<S>(
                 "Failed to connect to {}:{} from {}: {}",
                 target.host, target.port, client_addr, e
             );
+            send_bad_gateway(&mut client).await;
             return;
         }
     };
@@ -998,5 +1056,28 @@ Host: example.com
             assert!(!lower.contains(hop), "逐跳头 {hop} 不应转发: {}", up.bytes);
         }
         assert!(up.bytes.contains("Accept: */*\r\n"), "端到端头必须保留");
+    }
+
+    #[tokio::test]
+    async fn test_read_request_head_flags_overflow_only_when_incomplete() {
+        let pool = BufferPool::new();
+
+        // 完整头（含结束符）：不标记超限
+        let mut complete = &b"GET http://a.com/ HTTP/1.1\r\nHost: a.com\r\n\r\n"[..];
+        let (storage, overflow) = read_request_head(&mut complete, &pool, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!overflow, "完整头不得判为超限");
+        assert!(storage.as_slice().ends_with(b"\r\n\r\n"));
+
+        // 顶满上限仍无结束符：必须标记超限——否则调用方会把截断的头当成完整头转发
+        let mut big = Vec::new();
+        big.extend_from_slice(b"GET http://a.com/ HTTP/1.1\r\nX-Pad: ");
+        big.resize(MAX_HEAD_BYTES, b'a');
+        let mut incomplete = &big[..];
+        let (_, overflow) = read_request_head(&mut incomplete, &pool, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(overflow, "读满 {MAX_HEAD_BYTES} 字节仍无结束符必须标记超限");
     }
 }

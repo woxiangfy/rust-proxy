@@ -225,6 +225,8 @@ stream {
 | 日志无权限 | `sudo` 运行，或改用用户可写目录 `./proxy.log` |
 | HTTPS 代理接入失败 | 确认显式指定了 `--https-port`；检查证书路径、PEM 格式、证书私钥是否匹配、证书链是否完整、`--port` 与 `--https-port` 是否冲突 |
 | TLS 握手超时 | 客户端 TLS 版本不支持（rustls 支持 1.2/1.3）、未信任自签证书（需 `--proxy-insecure` 或导入 CA）、中间设备拦截 |
+| 客户端收到 `502 Bad Gateway` | 代理连不上目标：目标宕机、端口不通、DNS 解析失败或超过读超时。代理不会静默断开，`502` 即"到目标这一段不通" |
+| 客户端收到 `431 Request Header Fields Too Large` | 请求头超过 64KB（常见于超大 Cookie 或畸形客户端）。代理直接拒绝而不转发，避免把截断的头送给上游 |
 
 ```bash
 openssl x509 -in cert.pem -text -noout    # 验证证书
@@ -252,7 +254,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
 | `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
 | `http_body.rs` | chunked 分帧状态机与流式转发 |
-| `http_response.rs` | 错误响应构造（404 / 407 / 401 共用骨架） |
+| `http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 共用骨架） |
 | `io.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
 | `buffer_pool.rs` | 自适应缓冲区池 |
 | `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |

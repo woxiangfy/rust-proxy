@@ -211,6 +211,29 @@ pub async fn run_server_with_listener(
     Ok(())
 }
 
+/// 在**已绑定**的监听器上运行 HTTPS 代理，服务端证书为进程内生成的自签证书
+///
+/// 与 [`run_server_with_listener`] 对称，区别只在传输层走 TLS。存在的理由：
+/// - 集成测试需要覆盖"真实 TLS 握手 + 转发"这条链路，又不该依赖外部证书文件
+///   或工作目录里的 `config.toml`；
+/// - 嵌入式预览场景只关心"有一条 TLS 通道"，证书内容无意义。
+///
+/// 证书有效期与 [`run_server`] 的自签回退一致（10 年），且**不参与热重载**——
+/// 没有外部源文件可监听。需要用户证书与热重载时走 [`run_server`]，它会按
+/// `args.tls` 装配 `TlsReloader`。
+///
+/// `args.tls` 在本入口被忽略：HTTPS 是否启用由"调用方是否调用了本函数"决定。
+pub async fn run_server_with_self_signed_tls(
+    listener: TcpListener,
+    args: &Args,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
+    let reloader = Arc::new(generate_self_signed_reloader()?);
+    let ctx = Arc::new(ConnContext::from_args(args)?);
+    accept_connections_dual(None, Some((listener, reloader)), ctx, shutdown_rx).await;
+    Ok(())
+}
+
 /// 一次启动内不变的连接处理参数
 ///
 /// 这些值与具体连接无关（超时、缓冲池、认证表、路径前缀配置、PROXY 策略），

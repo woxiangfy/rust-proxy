@@ -9,6 +9,7 @@
 mod buffer_pool;
 mod config;
 mod http_body;
+mod http_util;
 mod io;
 mod logging;
 mod net;

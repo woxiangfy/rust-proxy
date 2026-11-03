@@ -3,6 +3,7 @@
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
 use crate::http_body::forward_chunked_body;
+use crate::http_util::{find_header_end, head_end_offset, MAX_HEAD_BYTES};
 use crate::io::PrefixedStream;
 use crate::net::{connect_host, is_benign_close_error, parse_host_port, AsyncStream};
 use crate::path_proxy::{handle_path_proxy, PathProxyConfig};
@@ -15,9 +16,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsConnector, native_tls};
 use log::{debug, error, info, warn};
-
-/// 请求头最大字节数：超过则视为畸形/恶意请求（防御超大头攻击）
-const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Handle an HTTP proxy client connection with buffer reuse (plain TCP entrypoint)
 ///
@@ -214,17 +212,7 @@ impl RequestStorage {
     }
 }
 
-/// 查找请求头结束位置（第一个 `\r\n\r\n` 之后的偏移），未找到返回 `None`
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
-/// 请求头结束位置（body 起始偏移）；未找到头结束符时返回 `data.len()`
-fn head_end_offset(data: &[u8]) -> usize {
-    find_header_end(data).unwrap_or(data.len())
-}
-
-/// 读取请求头，直到出现 `\r\n\r\n`（或达到 `MAX_HEADER_BYTES` 上限 / 客户端 EOF）。
+/// 读取请求头，直到出现 `\r\n\r\n`（或达到 `MAX_HEAD_BYTES` 上限 / 客户端 EOF）。
 ///
 /// 整个读取过程受一次 `timeout` 约束，防止慢速攻击（slowloris）逐次续期。
 /// 常见情况（一次读取即含完整头）复用池化缓冲区，零拷贝。
@@ -274,7 +262,7 @@ where
             break; // EOF：用已有数据返回
         }
         data.extend_from_slice(&buf.as_slice()[..m]);
-        if find_header_end(&data).is_some() || data.len() >= MAX_HEADER_BYTES {
+        if find_header_end(&data).is_some() || data.len() >= MAX_HEAD_BYTES {
             break;
         }
     }

@@ -26,6 +26,7 @@
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::http_body::forward_chunked_body;
+use crate::http_util::{authority_of, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES};
 use crate::net::{connect_host, is_benign_close_error, AsyncStream};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
@@ -33,9 +34,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_native_tls::{native_tls, TlsConnector};
-
-/// 请求/响应头最大字节数：超过则按畸形请求处理（防御超大头攻击）
-const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 /// 路径前缀直连模式配置
 #[derive(Debug, Clone)]
@@ -378,38 +376,6 @@ fn build_upstream_request(
     }
 }
 
-/// 逐跳头（RFC 7230 §6.1）与仅对代理有意义的头：不得转发给上游。
-///
-/// `transfer-encoding` 不在此列——它由调用方单独处理（body 按原始分帧转发）。
-fn is_hop_by_hop(name: &str) -> bool {
-    const NAMES: [&str; 8] = [
-        "keep-alive",
-        "proxy-connection",
-        "proxy-authorization",
-        "proxy-authenticate",
-        "te",
-        "trailer",
-        "upgrade",
-        "expect",
-    ];
-    NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
-}
-
-/// 上游 authority（Host 头值）：域名/裸 IP 直接拼端口，IPv6 需补方括号。
-fn authority_of(u: &url::Url) -> String {
-    let host = u.host_str().unwrap_or_default();
-    // `url` 对 IPv6 字面量已返回带方括号的形式（`[::1]`），避免重复包裹
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{}]", host)
-    } else {
-        host.to_string()
-    };
-    match u.port() {
-        Some(p) => format!("{}:{}", host, p),
-        None => host,
-    }
-}
-
 /// 转发请求体：先发已缓冲字节，再按 Content-Length / chunked 流式转发。
 async fn forward_request_body<S, T>(
     client: &mut S,
@@ -574,11 +540,6 @@ where
             return Ok(()); // 客户端已断开，正常结束
         }
     }
-}
-
-/// 查找响应头结束位置（首个 `\r\n\r\n` 之后的偏移）
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 /// 从状态行解析状态码（`HTTP/1.1 200 OK` → `Some(200)`）
@@ -840,16 +801,6 @@ mod tests {
         assert!(!req.chunked);
         assert!(!req.head.contains("Transfer-Encoding"));
         assert_eq!(req.content_length, None);
-    }
-
-    #[test]
-    fn test_authority_of_adds_port_and_brackets_ipv6() {
-        let a = url::Url::parse("http://example.com/").unwrap();
-        assert_eq!(authority_of(&a), "example.com");
-        let b = url::Url::parse("http://example.com:8080/").unwrap();
-        assert_eq!(authority_of(&b), "example.com:8080");
-        let c = url::Url::parse("http://[::1]:8080/").unwrap();
-        assert_eq!(authority_of(&c), "[::1]:8080");
     }
 
     // ─── 响应头重写 ───

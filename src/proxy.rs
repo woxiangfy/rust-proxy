@@ -414,9 +414,31 @@ fn verify_basic_credentials(credentials: &str, users: &[AuthUser]) -> bool {
         None => return false,
     };
 
-    users
-        .iter()
-        .any(|u| u.username == username && u.password == password)
+    // 用非短路的 `&` 逐个候选比对：`&&` 会在用户名不匹配时跳过密码比较，
+    // 攻击者可借响应时间推断"用户名是否存在"。两个字段都用等时比较。
+    users.iter().any(|u| {
+        constant_time_eq(u.username.as_bytes(), username.as_bytes())
+            & constant_time_eq(u.password.as_bytes(), password.as_bytes())
+    })
+}
+
+/// 凭据的等时比较
+///
+/// 直接 `==` 会在第一个不同字节处提前返回，逐字节耗时差可被用于推测密码前缀。
+/// 这里固定遍历全部字节再判零；长度差异无法隐藏（直接判否），但"长度一致时逐位比较"
+/// 已能消除前缀推断这条路。
+///
+/// `black_box` 用于阻止编译器把循环重新优化成 `memcmp` 之类的提前退出实现。
+fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
+    if expected.len() != provided.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(provided.iter()) {
+        diff |= a ^ b;
+        std::hint::black_box(diff);
+    }
+    diff == 0
 }
 
 /// 从原始请求数据中提取 `<header>: Basic <credentials>` 的凭据部分。
@@ -1547,6 +1569,41 @@ mod tests {
 
     // ─── host:port 解析 / chunked 分帧 ───
     // 这两组原语的实现与测试已迁至 `crate::net` 与 `crate::http_body`（消除模块循环依赖）。
+
+    // ─── 凭据等时比较 ───
+
+    #[test]
+    fn test_constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        // 长度不同直接判否（长度本身不可避免会泄漏）
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_auth_requires_both_username_and_password() {
+        let users = vec![AuthUser {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        }];
+        // 用户名对、密码错 → 拒绝
+        assert!(!verify_basic_credentials(
+            &BASE64_STANDARD.encode("alice:wrong"),
+            &users
+        ));
+        // 密码对、用户名错 → 拒绝
+        assert!(!verify_basic_credentials(
+            &BASE64_STANDARD.encode("bob:s3cret"),
+            &users
+        ));
+        // 两者都对 → 通过
+        assert!(verify_basic_credentials(
+            &BASE64_STANDARD.encode("alice:s3cret"),
+            &users
+        ));
+    }
 
     // ─── 转发目标解析（B3 拆分后的纯函数） ───
 

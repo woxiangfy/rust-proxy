@@ -191,7 +191,7 @@ export http_proxy=http://127.0.0.1:8080; export https_proxy=http://127.0.0.1:808
 $env:http_proxy="http://127.0.0.1:8080"; $env:https_proxy="http://127.0.0.1:8080"   # PowerShell
 ```
 
-不支持 FTP 协议。日志默认输出到 stderr，格式 `YYYY-MM-DD HH:MM:SS 级别 消息`（本地时间）；指定 `--log-file` 后仅写文件、按天滚动。
+不支持 FTP 协议。日志默认输出到 stderr，格式 `YYYY-MM-DD HH:MM:SS 级别 消息`（本地时间）；指定 `--log-file` 后仅写文件，单文件超过 10MB 自动滚动为 `proxy.YYYYMMDD_HHMMSS.log`，最多保留 10 个。
 
 ## 挂在 nginx/HAProxy 后
 
@@ -233,16 +233,25 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 
 ## 架构
 
-`proxy.rs` 通过 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关（HTTP 明文 / TLS）的请求处理，`server.rs` 负责监听、TLS 握手与热重载。
+代码已整理为库（`src/lib.rs`）+ 薄壳二进制（`src/main.rs`，11 行），因此集成测试可以起真实代理做端到端验证。`proxy.rs` 通过 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关（HTTP 明文 / TLS）的请求处理。
 
 | 模块 | 职责 |
 | --- | --- |
+| `lib.rs` / `main.rs` | 库入口（模块导出与分层）/ 薄壳二进制 |
+| `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
 | `proxy.rs` | 请求解析、认证校验、CONNECT 隧道、HTTP 转发 |
 | `path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
-| `server.rs` | 监听管理、TLS acceptor、证书热重载、连接分发、优雅关闭 |
+| `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭 |
+| `tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
+| `proxy_protocol.rs` | PROXY Protocol v1/v2 解析与模式映射 |
 | `config.rs` | 配置解析与合并（命令行 + TOML） |
+| `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
+| `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
+| `http_body.rs` | chunked 分帧状态机与流式转发 |
+| `http_response.rs` | 错误响应构造（404 / 407 / 401 共用骨架） |
+| `io.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
 | `buffer_pool.rs` | 自适应缓冲区池 |
-| `logging.rs` | 按天滚动日志 |
+| `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |
 | `service.rs` | 系统服务安装与管理 |
 
 前台 `start` 也支持优雅关停：SIGINT/SIGTERM（Linux/macOS）与 Ctrl+C（Windows）后停止接受新连接、等待活跃连接处理完再退出。

@@ -27,7 +27,10 @@
 //! HTTP/TLS 处理——这是"同一端口既接受代理协议又接受直连流量"的关键。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+
+use log::{debug, warn};
 
 use crate::config::ProxyProtocolMode;
 use crate::io::PrefixedStream;
@@ -86,6 +89,90 @@ impl TryFrom<ProxyProtocolMode> for PpParseMode {
 /// 普通 HTTP 请求首行（如 `GET /`、`CONNECT h`）不会匹配，从而被当作直连流量处理。
 ///
 /// 该函数当前仅由单元测试直接使用；运行时签名检测在 [`parse_proxy_protocol`] 内部完成。
+/// PROXY Protocol 策略：两个 listener 各自有独立模式，共享可信 IP 白名单
+pub(crate) struct PpPolicy {
+    pub(crate) http_mode: ProxyProtocolMode,
+    pub(crate) https_mode: ProxyProtocolMode,
+    /// 空表示不限制来源（信任所有对端）
+    pub(crate) trusted_ips: Arc<Vec<std::net::IpAddr>>,
+}
+
+impl PpPolicy {
+    /// 该对端地址是否可信（配置了白名单时必须命中，否则跳过 PROXY 解析）
+    pub(crate) fn is_trusted(&self, addr: &SocketAddr) -> bool {
+        self.trusted_ips.is_empty() || self.trusted_ips.contains(&addr.ip())
+    }
+}
+
+/// PROXY Protocol 解析结果
+///
+/// 统一了三种情形，调用方无需再区分"可信性检查 / 已解析 / 未匹配回退"：
+/// - 解析成功：真实客户端地址 + 已回填前缀的流
+/// - 不匹配签名（Auto）：回退地址 + 携带已读前缀的流
+/// - 来源不可信：回退地址 + 空前缀流（等价于原样传递）
+///
+/// 返回 `None` 表示该连接应被丢弃（Require 模式解析失败，或签名命中但报文畸形）。
+pub(crate) async fn resolve_real_addr(
+    client: tokio::net::TcpStream,
+    fallback_addr: SocketAddr,
+    mode: ProxyProtocolMode,
+    policy: &PpPolicy,
+) -> Option<(SocketAddr, PrefixedStream<tokio::net::TcpStream>)> {
+    // IP 白名单检查：源 IP 不可信时跳过解析，把连接当作直连流量
+    if !policy.is_trusted(&fallback_addr) {
+        debug!(
+            "PROXY Protocol: skipping for untrusted source IP {} (trusted: {:?})",
+            fallback_addr.ip(),
+            policy.trusted_ips
+        );
+        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
+    }
+
+    // Disable 在类型层无法表示为解析模式；若真被传入（分派逻辑被改坏），
+    // 保守回退为"不做 PROXY 解析"而不是 panic。
+    let Ok(internal_mode) = PpParseMode::try_from(mode) else {
+        warn!(
+            "PROXY Protocol: unexpected mode {} reached resolver, treating as direct traffic",
+            mode
+        );
+        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
+    };
+
+    match parse_proxy_protocol(client, internal_mode).await {
+        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
+            let real_addr = real_opt.unwrap_or(fallback_addr);
+            debug!(
+                "PROXY Protocol({}): {} -> real client {}",
+                mode, fallback_addr, real_addr
+            );
+            Some((real_addr, stream))
+        }
+        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
+            // Auto 模式：不匹配 → 回退，携带 prefix 供后续读取（HTTP 头 / TLS ClientHello）
+            // 使用。上层读取逻辑本身支持多次读，因此前缀字节不会丢失。
+            debug!(
+                "PROXY Protocol(Auto): no signature detected from {}, fallback to direct traffic",
+                fallback_addr
+            );
+            Some((fallback_addr, PrefixedStream::new(prefix, tcp)))
+        }
+        Err(e) => {
+            if matches!(mode, ProxyProtocolMode::Require) {
+                warn!(
+                    "PROXY Protocol(Require) parse failed from {}: {}",
+                    fallback_addr, e
+                );
+            } else {
+                debug!(
+                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
+                    fallback_addr, e
+                );
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 fn is_proxy_signature(seen: &[u8]) -> bool {
     if seen.len() < 6 {

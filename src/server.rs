@@ -16,7 +16,7 @@
 //! 2. 未指定 `https_port` → **不启用 HTTPS**（即使配置了 cert+key 也忽略）
 
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,10 +26,9 @@ use tokio::task::JoinSet;
 
 use crate::buffer_pool::BufferPool;
 use crate::config::{Args, AuthUser, ProxyProtocolMode};
-use crate::io::PrefixedStream;
 use crate::path_proxy::PathProxyConfig;
 use crate::proxy::{handle_client, handle_client_with_addr};
-use crate::proxy_protocol::{parse_proxy_protocol, PpDetectResult, PpParseMode};
+use crate::proxy_protocol::{resolve_real_addr, PpPolicy};
 use crate::tls::{
     build_tls_reloader, generate_self_signed_reloader, handle_tls_reload, TlsReloader, TlsSource,
     SELF_SIGNED_VALIDITY_YEARS, TLS_RELOAD_CHECK_INTERVAL_SECS,
@@ -227,21 +226,6 @@ struct ConnContext {
     pp_policy: PpPolicy,
 }
 
-/// PROXY Protocol 策略：两个 listener 各自有独立模式，共享可信 IP 白名单
-struct PpPolicy {
-    http_mode: ProxyProtocolMode,
-    https_mode: ProxyProtocolMode,
-    /// 空表示不限制来源（信任所有对端）
-    trusted_ips: Arc<Vec<std::net::IpAddr>>,
-}
-
-impl PpPolicy {
-    /// 该对端地址是否可信（配置了白名单时必须命中，否则跳过 PROXY 解析）
-    fn is_trusted(&self, addr: &SocketAddr) -> bool {
-        self.trusted_ips.is_empty() || self.trusted_ips.contains(&addr.ip())
-    }
-}
-
 impl ConnContext {
     /// 由合并后的配置构造连接期上下文
     ///
@@ -297,75 +281,6 @@ impl ConnContext {
             Arc::clone(&self.path_proxy),
         )
         .await;
-    }
-}
-
-/// PROXY Protocol 解析结果
-///
-/// 统一了三种情形，调用方无需再区分"可信性检查 / 已解析 / 未匹配回退"：
-/// - 解析成功：真实客户端地址 + 已回填前缀的流
-/// - 不匹配签名（Auto）：回退地址 + 携带已读前缀的流
-/// - 来源不可信：回退地址 + 空前缀流（等价于原样传递）
-///
-/// 返回 `None` 表示该连接应被丢弃（Require 模式解析失败，或签名命中但报文畸形）。
-async fn resolve_real_addr(
-    client: tokio::net::TcpStream,
-    fallback_addr: SocketAddr,
-    mode: ProxyProtocolMode,
-    policy: &PpPolicy,
-) -> Option<(SocketAddr, PrefixedStream<tokio::net::TcpStream>)> {
-    // IP 白名单检查：源 IP 不可信时跳过解析，把连接当作直连流量
-    if !policy.is_trusted(&fallback_addr) {
-        debug!(
-            "PROXY Protocol: skipping for untrusted source IP {} (trusted: {:?})",
-            fallback_addr.ip(),
-            policy.trusted_ips
-        );
-        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
-    }
-
-    // Disable 在类型层无法表示为解析模式；若真被传入（分派逻辑被改坏），
-    // 保守回退为"不做 PROXY 解析"而不是 panic。
-    let Ok(internal_mode) = PpParseMode::try_from(mode) else {
-        warn!(
-            "PROXY Protocol: unexpected mode {} reached resolver, treating as direct traffic",
-            mode
-        );
-        return Some((fallback_addr, PrefixedStream::new(Vec::new(), client)));
-    };
-
-    match parse_proxy_protocol(client, internal_mode).await {
-        Ok(PpDetectResult::Parsed(real_opt, stream)) => {
-            let real_addr = real_opt.unwrap_or(fallback_addr);
-            debug!(
-                "PROXY Protocol({}): {} -> real client {}",
-                mode, fallback_addr, real_addr
-            );
-            Some((real_addr, stream))
-        }
-        Ok(PpDetectResult::NotMatched(prefix, tcp)) => {
-            // Auto 模式：不匹配 → 回退，携带 prefix 供后续读取（HTTP 头 / TLS ClientHello）
-            // 使用。上层读取逻辑本身支持多次读，因此前缀字节不会丢失。
-            debug!(
-                "PROXY Protocol(Auto): no signature detected from {}, fallback to direct traffic",
-                fallback_addr
-            );
-            Some((fallback_addr, PrefixedStream::new(prefix, tcp)))
-        }
-        Err(e) => {
-            if matches!(mode, ProxyProtocolMode::Require) {
-                warn!(
-                    "PROXY Protocol(Require) parse failed from {}: {}",
-                    fallback_addr, e
-                );
-            } else {
-                debug!(
-                    "PROXY Protocol(Auto) parse failed from {}: {} (signature matched but malformed, dropping)",
-                    fallback_addr, e
-                );
-            }
-            None
-        }
     }
 }
 

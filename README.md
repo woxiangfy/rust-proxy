@@ -241,11 +241,13 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | --- | --- |
 | `lib.rs` / `main.rs` | 库入口（模块导出与分层）/ 薄壳二进制 |
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
-| `proxy.rs` | 请求解析、认证校验、CONNECT 隧道、HTTP 转发 |
+| `proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发 |
+| `auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
+| `client.rs` | `test-proxy` 自检客户端（CONNECT + TLS） |
 | `path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭 |
 | `tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
-| `proxy_protocol.rs` | PROXY Protocol v1/v2 解析与模式映射 |
+| `proxy_protocol.rs` | PROXY Protocol v1/v2 解析、模式映射、真实地址解析（`PpPolicy`） |
 | `config.rs` | 配置解析与合并（命令行 + TOML） |
 | `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
 | `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |

@@ -611,20 +611,11 @@ port = 8080
     fn test_from_run_args_tls_enabled_when_both_cert_and_key_provided() {
         // 同时提供证书和私钥 + 显式 https_port → Args.tls 应为 Some
         let run_args = ServerRunArgs {
-            config: None,
             port: Some(8080),
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -645,20 +636,10 @@ port = 8080
         // 仅提供 cert 而无 key（cert/key 不完整）→ Args.tls 仍为 Some，
         // cert_path=Some(key 文件缺失), key_path=None，由 server 层回退到自签证书
         let run_args = ServerRunArgs {
-            config: None,
             port: Some(8080),
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
             https_port: Some(9443),
             tls_cert: Some("/tmp/cert.pem".into()),
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect(
@@ -674,20 +655,10 @@ port = 8080
         // 新语义（严格）：未指定 https_port → 不启用 HTTPS，
         // 即使同时提供了 cert + key 也必须忽略
         let run_args = ServerRunArgs {
-            config: None,
             port: Some(8080),
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
             tls_cert: Some("/tmp/cert.pem".into()),
             tls_key: Some("/tmp/key.pem".into()),
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert!(
@@ -713,19 +684,8 @@ tls_key = "key.pem"
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
             https_port: Some(9999), // 命令行覆盖
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         let tls = args.tls.expect("TLS should be enabled");
@@ -740,20 +700,8 @@ tls_key = "key.pem"
     fn test_port_none_when_only_https_port_specified() {
         // 新语义：指定 https_port 但未指定 port → args.port == None（仅 HTTPS 模式）
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
             https_port: Some(8443),
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, None, "port must be None when only https_port is specified");
@@ -764,20 +712,7 @@ tls_key = "key.pem"
     fn test_port_uses_default_when_neither_specified() {
         // 都未指定 → args.port == Some(DEFAULT_PORT)（默认仅 HTTP 模式）
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(Args::DEFAULT_PORT));
@@ -788,20 +723,9 @@ tls_key = "key.pem"
     fn test_port_explicit_overrides_default() {
         // 显式指定 port → 使用指定值（即使 https_port 也指定）
         let run_args = ServerRunArgs {
-            config: None,
             port: Some(9090),
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
             https_port: Some(8443),
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(9090), "explicit port should be preserved");
@@ -821,19 +745,7 @@ port = 7777
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.port, Some(7777));
@@ -894,19 +806,9 @@ proxy_protocol_trusted_ips = ["10.0.0.1"]
         ];
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
             proxy_protocol: true,
             proxy_protocol_trusted_ips: cli_ips.clone(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol_trusted_ips, cli_ips);
@@ -928,19 +830,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
             proxy_protocol: true,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol_trusted_ips.len(), 2);
@@ -952,20 +843,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
     #[test]
     fn test_pp_mode_default_is_auto() {
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -975,20 +853,8 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
     fn test_pp_mode_cli_flag_true_is_auto() {
         // 旧 `--proxy-protocol` 布尔参数现在映射为 Auto（全自动识别），不再强制 Require
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
             proxy_protocol: true,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -997,20 +863,9 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
     #[test]
     fn test_pp_mode_cli_mode_overrides_flag() {
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
             proxy_protocol_mode: Some(ProxyProtocolMode::Auto),
             proxy_protocol: true,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -1029,19 +884,7 @@ proxy_protocol_mode = "auto"
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -1063,19 +906,7 @@ proxy_protocol = true
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
@@ -1099,19 +930,7 @@ https_proxy_protocol = "require"
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         // 全局默认仍为 auto
@@ -1128,19 +947,7 @@ proxy_protocol_mode = "auto"
         std::fs::write(&config_file, toml_str2).unwrap();
         let args2 = Args::from_run_args(&ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         });
         assert_eq!(args2.http_proxy_protocol, ProxyProtocolMode::Auto);
         assert_eq!(args2.https_proxy_protocol, ProxyProtocolMode::Auto);
@@ -1161,19 +968,7 @@ proxy_protocol_mode = "disable"
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Disable);
@@ -1269,19 +1064,10 @@ path_proxy_rewrite_location = false
 
         let run_args = ServerRunArgs {
             config: Some(config_file.clone()),
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
             proxy_protocol_trusted_ips: Vec::new(),
             path_proxy_prefix: Some("px".into()),
             path_proxy_insecure: true,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert_eq!(
@@ -1300,20 +1086,7 @@ path_proxy_rewrite_location = false
     #[test]
     fn test_from_run_args_path_proxy_disabled_by_default() {
         let run_args = ServerRunArgs {
-            config: None,
-            port: None,
-            log_file: None,
-            timeout: None,
-            log_level: None,
-            multi_thread: false,
-            https_port: None,
-            tls_cert: None,
-            tls_key: None,
-            proxy_protocol_mode: None,
-            proxy_protocol: false,
-            proxy_protocol_trusted_ips: Vec::new(),
-            path_proxy_prefix: None,
-            path_proxy_insecure: false,
+            ..Default::default()
         };
         let args = Args::from_run_args(&run_args);
         assert!(args.path_proxy_prefix.is_none());

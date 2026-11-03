@@ -25,7 +25,7 @@
 //!    重写为 `/<prefix>/<绝对URL>`，使重定向后的请求继续走本代理。
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool};
-use crate::http_body::forward_chunked_body;
+use crate::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::http_util::{authority_of, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES};
 use crate::net::{connect_host, is_benign_close_error, AsyncStream};
 use anyhow::{Context, Result};
@@ -229,14 +229,27 @@ pub(crate) async fn handle_path_proxy<S>(
         buffer_pool,
     )
     .await;
-    if let Err(e) = body_result {
-        if !is_benign_close_error(&e) {
-            warn!(
-                "Path-proxy: failed to forward request body from {}: {}",
-                client_addr, e
-            );
+    match body_result {
+        Ok(sent) => {
+            // 与经典代理保持一致：客户端提前关闭时不再往下走，但把差异记下来
+            if upstream_req.content_length.is_some_and(|cl| sent < cl) {
+                warn!(
+                    "Path-proxy: client {} closed before sending complete request body ({} of {} bytes)",
+                    client_addr,
+                    sent,
+                    upstream_req.content_length.unwrap_or(0)
+                );
+            }
         }
-        return;
+        Err(e) => {
+            if !is_benign_close_error(&e) {
+                warn!(
+                    "Path-proxy: failed to forward request body from {}: {}",
+                    client_addr, e
+                );
+            }
+            return;
+        }
     }
 
     // ── 5. 回传响应（必要时重写 Location）──
@@ -405,6 +418,9 @@ fn build_upstream_request(
 }
 
 /// 转发请求体：先发已缓冲字节，再按 Content-Length / chunked 流式转发。
+///
+/// 返回已向上游写出的 body 字节数（`Content-Length` 路径下可用于判断客户端是否
+/// 提前关闭；chunked 路径恒返回 0，分帧本身已能自证结束位置）。
 async fn forward_request_body<S, T>(
     client: &mut S,
     upstream: &mut T,
@@ -413,60 +429,29 @@ async fn forward_request_body<S, T>(
     chunked: bool,
     timeout: Duration,
     buffer_pool: &BufferPool,
-) -> std::io::Result<()>
+) -> std::io::Result<u64>
 where
     S: AsyncRead + Unpin,
     T: AsyncWrite + Unpin,
 {
     // chunked：已缓冲字节属于分帧的一部分，必须交给状态机消费（否则会挂住等结束块）
     if chunked {
-        return forward_chunked_body(client, upstream, buffered, timeout, buffer_pool).await;
+        forward_chunked_body(client, upstream, buffered, timeout, buffer_pool).await?;
+        return Ok(0);
     }
 
-    // 已缓冲部分可能属于管道化请求的下一个请求（客户端连续发了两个请求）：
-    // 超出 Content-Length 的字节不能当作本次 body 发给上游，否则污染请求体。
-    let mut buffered = buffered;
-    if let Some(cl) = content_length {
-        if buffered.len() as u64 > cl {
-            buffered = &buffered[..cl as usize];
+    match content_length {
+        Some(cl) => {
+            forward_content_length_body(client, upstream, buffered, cl, timeout, buffer_pool).await
         }
-    }
-    if !buffered.is_empty() {
-        upstream.write_all(buffered).await?;
-    }
-
-    if let Some(cl) = content_length {
-        let already_sent = buffered.len() as u64;
-        if cl <= already_sent {
-            return Ok(());
-        }
-        let mut remaining = cl - already_sent;
-        let mut tmp = buffer_pool.get();
-        let tmp_slice = tmp.as_mut_slice();
-        while remaining > 0 {
-            let want = std::cmp::min(remaining as usize, tmp_slice.len());
-            let n = match tokio::time::timeout(timeout, client.read(&mut tmp_slice[..want])).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "timeout reading request body",
-                    ))
-                }
-            };
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "client closed before sending complete request body",
-                ));
+        None => {
+            // 既无 Content-Length 也非 chunked：只能转发已缓冲字节
+            if !buffered.is_empty() {
+                upstream.write_all(buffered).await?;
             }
-            upstream.write_all(&tmp_slice[..n]).await?;
-            remaining -= n as u64;
+            Ok(buffered.len() as u64)
         }
     }
-
-    Ok(())
 }
 
 /// 读取上游响应头（可能连带读到 body 前缀），可选重写 Location，随后流式转发 body。

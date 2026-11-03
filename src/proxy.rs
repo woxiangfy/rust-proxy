@@ -2,9 +2,9 @@
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::config::AuthUser;
-use crate::http_body::forward_chunked_body;
+use crate::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::http_response::write_response;
-use crate::http_util::{find_header_end, head_end_offset, MAX_HEAD_BYTES};
+use crate::http_util::{find_header_end, head_end_offset, is_hop_by_hop, MAX_HEAD_BYTES};
 use crate::io::PrefixedStream;
 use crate::net::{connect_host, is_benign_close_error, parse_host_port, AsyncStream};
 use crate::path_proxy::{
@@ -631,6 +631,8 @@ struct UpstreamHead {
     content_length: Option<u64>,
     /// 请求体是否为 chunked 分帧
     chunked: bool,
+    /// 客户端是否声明了 `Expect: 100-continue`（该头不转发上游，由代理直接应答）
+    expect_continue: bool,
 }
 
 impl UpstreamHead {
@@ -638,7 +640,10 @@ impl UpstreamHead {
     ///
     /// 过滤规则：
     /// - `Connection` → 改写为 `close`（本代理每个请求独占一条上游连接）
-    /// - `Proxy-Connection` / `Proxy-Authorization` → 丢弃（前者代理专用，后者含凭据）
+    /// - `Proxy-Connection` / `Proxy-Authorization` / `Keep-Alive` / `TE` / `Trailer` /
+    ///   `Upgrade` 等逐跳头 → 丢弃（[`is_hop_by_hop`]，RFC 7230 §6.1）
+    /// - `Expect: 100-continue` → 丢弃并置位，由代理直接回 `100 Continue`
+    ///   （转发该头会让客户端等上游的临时响应，而代理此刻正在收 body，白等一个 RTT）
     /// - `Transfer-Encoding` → 保留（body 按原始 chunked 分帧转发，需与状态机一致）
     /// - `Content-Length` → 保留并记录，供 body 精确转发
     ///
@@ -653,6 +658,7 @@ impl UpstreamHead {
 
         let mut content_length: Option<u64> = None;
         let mut chunked = false;
+        let mut expect_continue = false;
 
         for line in head_str.lines().skip(1) {
             if line.is_empty() {
@@ -673,11 +679,7 @@ impl UpstreamHead {
                 bytes.push_str("Connection: close\r\n");
                 continue;
             }
-            if name.eq_ignore_ascii_case("proxy-connection")
-                || name.eq_ignore_ascii_case("proxy-authorization")
-            {
-                continue;
-            }
+            // 分帧相关头先处理：它们需要"改写 / 记录"而不是"丢弃"
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 if value.to_ascii_lowercase().contains("chunked") {
                     chunked = true;
@@ -688,6 +690,17 @@ impl UpstreamHead {
             }
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.parse::<u64>().ok();
+                bytes.push_str(line);
+                bytes.push_str("\r\n");
+                continue;
+            }
+            // `100-continue` 由代理直接应答；其余 `Expect` 值同样丢弃（无从满足）
+            if name.eq_ignore_ascii_case("expect") {
+                expect_continue = value.eq_ignore_ascii_case("100-continue");
+                continue;
+            }
+            if is_hop_by_hop(name) {
+                continue;
             }
             bytes.push_str(line);
             bytes.push_str("\r\n");
@@ -698,6 +711,7 @@ impl UpstreamHead {
             bytes,
             content_length,
             chunked,
+            expect_continue,
         }
     }
 }
@@ -756,54 +770,34 @@ impl RelayCtx<'_> {
             return Ok(());
         };
 
-        // 超出 Content-Length 的已缓冲字节属于管道化下一个请求，不能一起发出去
-        let buffered = if buffered.len() as u64 > cl {
-            &buffered[..cl as usize]
-        } else {
-            buffered
-        };
-        if !buffered.is_empty() && upstream.write_all(buffered).await.is_err() {
-            return Err(anyhow::anyhow!("failed to write buffered body upstream"));
-        }
-
-        let mut remaining = cl - buffered.len() as u64;
-        if remaining == 0 {
-            return Ok(());
-        }
-
-        let mut tmp = self.buffer_pool.get();
-        let tmp_slice = tmp.as_mut_slice();
-        while remaining > 0 {
-            let want = std::cmp::min(remaining as usize, tmp_slice.len());
-            let n =
-                match tokio::time::timeout(self.timeout, client.read(&mut tmp_slice[..want])).await {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        if !is_benign_close_error(&e) {
-                            warn!("Error reading request body from {}: {}", self.client_addr, e);
-                        }
-                        return Err(e.into());
-                    }
-                    Err(_) => {
-                        warn!("Timeout reading request body from {}", self.client_addr);
-                        return Err(anyhow::anyhow!("timeout reading request body"));
-                    }
-                };
-            if n == 0 {
+        match forward_content_length_body(
+            client,
+            upstream,
+            buffered,
+            cl,
+            self.timeout,
+            self.buffer_pool,
+        )
+        .await
+        {
+            Ok(sent) if sent < cl => {
                 // 客户端提前关闭：body 不完整，但请求头已送达，仍可尝试读响应
                 warn!(
-                    "Client {} closed before sending complete request body",
-                    self.client_addr
+                    "Client {} closed before sending complete request body ({} / {} bytes)",
+                    self.client_addr, sent, cl
                 );
-                return Ok(());
+                Ok(())
             }
-            if upstream.write_all(&tmp_slice[..n]).await.is_err() {
-                return Err(anyhow::anyhow!("failed to write request body upstream"));
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if is_benign_close_error(&e) {
+                    debug!("Request body from {} ended: {}", self.client_addr, e);
+                } else {
+                    warn!("Error forwarding request body from {}: {}", self.client_addr, e);
+                }
+                Err(e.into())
             }
-            remaining -= n as u64;
         }
-
-        Ok(())
     }
 
     /// 读上游响应并原样转发给客户端
@@ -902,6 +896,17 @@ async fn handle_http_request_generic<S>(
 
     let head = UpstreamHead::build(&target, &head_str);
     if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
+        return;
+    }
+
+    // `Expect: 100-continue` 已从上游请求里剔除，临时响应必须由代理自己给：
+    // 否则客户端会等一个永远不会来的 100，直到自己的等待超时才补发 body。
+    if head.expect_continue
+        && client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .is_err()
+    {
         return;
     }
 
@@ -1692,5 +1697,51 @@ Host: example.com
         let up = UpstreamHead::build(&target, head);
         assert!(up.bytes.contains("X-Connection-Info: keep\r\n"));
         assert!(!up.bytes.contains("Connection: close"), "不含 Connection 头时不应凭空追加");
+    }
+
+    #[test]
+    fn test_upstream_head_drops_expect_and_flags_100_continue() {
+        // `Expect: 100-continue` 不能转发给上游：上游会先回 100，而代理此刻正在收
+        // body，客户端收不到临时响应就会白等一个 RTT（curl 默认等 1s）。
+        let head = "POST http://h/p HTTP/1.1\r\n\
+                    Content-Length: 4\r\n\
+                    Expect: 100-continue\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        assert!(up.expect_continue, "必须置位，供调用方回 100 Continue");
+        assert!(
+            !up.bytes.to_ascii_lowercase().contains("expect:"),
+            "Expect 头不得出现在上游请求中"
+        );
+        assert_eq!(up.content_length, Some(4));
+    }
+
+    #[test]
+    fn test_upstream_head_does_not_flag_expect_without_continue() {
+        // 其它 Expect 值无从满足，同样丢弃，但不应误触发 100 Continue
+        let head = "POST http://h/p HTTP/1.1\r\nExpect: 42-continue\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        assert!(!up.expect_continue);
+        assert!(!up.bytes.to_ascii_lowercase().contains("expect:"));
+    }
+
+    #[test]
+    fn test_upstream_head_drops_all_hop_by_hop_headers() {
+        // RFC 7230 §6.1 的逐跳头一律不得转发；普通头必须保留
+        let head = "GET http://h/p HTTP/1.1\r\n\
+                    Keep-Alive: timeout=5\r\n\
+                    TE: trailers\r\n\
+                    Trailer: X-Sum\r\n\
+                    Upgrade: websocket\r\n\
+                    Proxy-Authenticate: Basic\r\n\
+                    Accept: */*\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        let lower = up.bytes.to_ascii_lowercase();
+        for hop in ["keep-alive:", "te:", "trailer:", "upgrade:", "proxy-authenticate:"] {
+            assert!(!lower.contains(hop), "逐跳头 {hop} 不应转发: {}", up.bytes);
+        }
+        assert!(up.bytes.contains("Accept: */*\r\n"), "端到端头必须保留");
     }
 }

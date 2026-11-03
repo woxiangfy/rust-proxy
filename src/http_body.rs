@@ -196,6 +196,65 @@ where
     }
 }
 
+/// 按 `Content-Length` 转发请求体：先发已缓冲字节，再流式读转剩余部分。
+///
+/// 返回已向上游写出的字节数。`Ok(n)` 且 `n < content_length` 表示客户端在 body 发完前
+/// 就关闭了连接——此时上游已收到部分 body，怎么处理由调用方决定（经典代理选择继续
+/// 读响应，与 [`forward_chunked_body`] 把提前关闭当正常结束的语义保持一致）。
+///
+/// 已缓冲字节按 `content_length` 截断：超出的部分属于管道化的下一个请求，
+/// 一起发出去会污染本次请求体。
+pub(crate) async fn forward_content_length_body<S, T>(
+    client: &mut S,
+    target: &mut T,
+    buffered: &[u8],
+    content_length: u64,
+    timeout: Duration,
+    buffer_pool: &BufferPool,
+) -> std::io::Result<u64>
+where
+    S: AsyncRead + Unpin,
+    T: AsyncWrite + Unpin,
+{
+    let buffered = if buffered.len() as u64 > content_length {
+        &buffered[..content_length as usize]
+    } else {
+        buffered
+    };
+
+    if !buffered.is_empty() {
+        target.write_all(buffered).await?;
+    }
+    let mut sent = buffered.len() as u64;
+    if sent >= content_length {
+        return Ok(sent);
+    }
+
+    let mut tmp = buffer_pool.get();
+    let tmp_slice = tmp.as_mut_slice();
+    while sent < content_length {
+        let want = std::cmp::min((content_length - sent) as usize, tmp_slice.len());
+        let n = match tokio::time::timeout(timeout, client.read(&mut tmp_slice[..want])).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timeout reading request body",
+                ))
+            }
+        };
+        if n == 0 {
+            // 客户端提前关闭：body 不完整，交由调用方决定后续动作
+            break;
+        }
+        target.write_all(&tmp_slice[..n]).await?;
+        sent += n as u64;
+    }
+
+    Ok(sent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +382,53 @@ mod tests {
         let mut want = prefix.clone();
         want.extend_from_slice(&rest);
         assert_eq!(got, want);
+    }
+
+    // ─── Content-Length 精确转发 ───
+
+    #[tokio::test]
+    async fn test_forward_cl_truncates_buffered_to_content_length() {
+        // 已缓冲字节超出 CL 的部分属于管道化的下一个请求，不能一起发出去
+        let (mut client, _peer) = tokio::io::duplex(64);
+        let mut upstream: Vec<u8> = Vec::new();
+        let pool = BufferPool::new();
+        let sent = forward_content_length_body(
+            &mut client,
+            &mut upstream,
+            b"abcdefgh",
+            4,
+            Duration::from_millis(500),
+            &pool,
+        )
+        .await
+        .expect("write must succeed");
+        assert_eq!(sent, 4);
+        assert_eq!(upstream, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn test_forward_cl_reads_remaining_stream_and_reports_short_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut peer) = tokio::io::duplex(64);
+        let mut upstream: Vec<u8> = Vec::new();
+        let pool = BufferPool::new();
+
+        // 客户端只发 2 字节就关闭：应返回已发送字节数而不是挂到超时
+        peer.write_all(b"cd").await.unwrap();
+        drop(peer);
+
+        let sent = forward_content_length_body(
+            &mut client,
+            &mut upstream,
+            b"ab",
+            6,
+            Duration::from_millis(500),
+            &pool,
+        )
+        .await
+        .expect("short body is not an io error, caller decides");
+        assert_eq!(sent, 4, "已缓冲 2 字节 + 流式 2 字节");
+        assert_eq!(upstream, b"abcd");
     }
 }

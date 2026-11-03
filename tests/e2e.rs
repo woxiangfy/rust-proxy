@@ -111,6 +111,58 @@ async fn spawn_origin() -> SocketAddr {
     addr
 }
 
+/// 需要完整 body 的假上游：读完头 + `Content-Length` 字节的 body 后才响应，
+/// 响应体回显请求头（不包含 body），用于验证 `Expect: 100-continue` 这类契约。
+async fn spawn_body_origin() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind body origin");
+    let addr = listener.local_addr().expect("body origin local_addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut sock).await else {
+                    return;
+                };
+                // 头里已含 body 前缀时先扣掉，剩余部分按 Content-Length 补齐
+                let head_len = head
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(head.len());
+                let text = String::from_utf8_lossy(&head[..head_len]).to_ascii_lowercase();
+                let cl: usize = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut got = head.len() - head_len;
+                let mut chunk = [0u8; 512];
+                while got < cl {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+
+                let body = &head[..head_len];
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body);
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// 回声上游：用于 CONNECT 隧道，收到什么原样吐回
 async fn spawn_echo_origin() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -409,4 +461,46 @@ async fn proxy_protocol_require_rejects_plain_request() {
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         Ok(Err(e)) => panic!("unexpected io error while reading: {e}"),
     }
+}
+
+/// 链路 7：`Expect: 100-continue`
+///
+/// 代理必须**自己**回 `100 Continue`：客户端声明该头后不会立刻发 body，
+/// 而是在等临时响应；若代理把 `Expect` 转发给上游、自己却先阻塞在读 body 上，
+/// 客户端就会白等到自己的超时（curl 默认 1s）才补发。
+///
+/// 用例只发请求头，随后在 1s 内必须收到 100；再发 body 才能拿到 200。
+#[tokio::test]
+async fn expect_100_continue_answered_by_proxy_not_upstream() {
+    let origin = spawn_body_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let mut sock = TcpStream::connect(proxy.addr).await.expect("connect proxy");
+    let head = format!(
+        "POST http://{origin}/upload HTTP/1.1\r\nHost: {origin}\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+    );
+    sock.write_all(head.as_bytes()).await.expect("write head");
+
+    // 只发头、不发 body：临时响应必须在一个很短的等待内到达
+    let mut interim = [0u8; 25];
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut interim))
+        .await
+        .expect("proxy must answer 100-continue immediately")
+        .expect("read interim response");
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
+    sock.write_all(b"hello").await.expect("write body");
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut rest))
+        .await
+        .expect("final response timed out")
+        .expect("read final response");
+
+    assert_eq!(status_code(&rest), 200, "body: {:?}", body_of(&rest));
+    assert!(
+        !body_of(&rest).to_ascii_lowercase().contains("expect:"),
+        "Expect 不得转发给上游：{}",
+        body_of(&rest)
+    );
 }

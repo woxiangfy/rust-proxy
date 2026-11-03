@@ -14,7 +14,7 @@ use clap::Parser;
 use tokio::sync::oneshot;
 
 use crate::config::{Args, Cli, Commands, LogLevel, ServerArgs, ServerSubcommand};
-use crate::{logging, proxy, server, service};
+use crate::{client, logging, server, service};
 
 /// 创建 Tokio 运行时，根据参数选择单线程或多线程
 fn create_runtime(multi_thread: bool) -> Result<tokio::runtime::Runtime> {
@@ -107,7 +107,7 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
         } => {
             logging::setup_logging(&None, &LogLevel::Info)?;
             let runtime = create_runtime(false)?;
-            runtime.block_on(proxy::test_proxy(
+            runtime.block_on(client::test_proxy(
                 &proxy_url,
                 &url,
                 username.as_deref(),

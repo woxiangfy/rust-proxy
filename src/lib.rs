@@ -10,19 +10,30 @@
 //! 模块分层（自底向上，箭头方向即依赖方向，无反向引用）：
 //!
 //! ```text
-//! buffer_pool  io  net  http_util  http_body  logging
-//!        \       |    |      |          |        /
-//!         tls  proxy_protocol  config  service
-//!                    \          |        /
-//!                     proxy  path_proxy
-//!                          \    /
-//!                          server
-//!                            |
-//!                           app
+//! 叶子层（无内部依赖）：
+//!   buffer_pool  io  net  http_util  http_body  http_response  logging
+//!
+//! 中层：
+//!   config   → logging
+//!   auth     → config, http_response
+//!   tls      → buffer_pool
+//!   client   → net                    （`test-proxy` 自检客户端）
+//!
+//! 处理层：
+//!   proxy        → auth, path_proxy, http_body, http_util, http_response, net, io, buffer_pool
+//!   path_proxy   → net, http_body, http_util, http_response, buffer_pool
+//!   proxy_protocol → io
+//!
+//! 装配层：
+//!   server → tls, proxy_protocol, proxy, path_proxy, config, buffer_pool, io
+//!   service → config, logging, server
+//!   app    → 以上全部 + clap 分派
 //! ```
 
 pub mod app;
+pub mod auth;
 pub mod buffer_pool;
+pub mod client;
 pub mod config;
 pub mod http_body;
 pub mod http_response;

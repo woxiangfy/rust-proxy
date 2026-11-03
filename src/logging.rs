@@ -4,7 +4,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use env_logger::Builder;
@@ -60,32 +59,54 @@ const MAX_LOG_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// 最多保留的日志文件数量（含当前活动文件）
 const MAX_LOG_FILES: usize = 10;
 
-/// 惰性缓存本地时区偏移（秒），避免每次写日志都调用系统调用。
+/// 惰性缓存本地时区偏移（秒），避免每次写日志都做一次时区查询。
 ///
-/// 时区极少在进程运行期间变化；每次日志写入都调用 `GetTimeZoneInformation`
-/// 或 `localtime_r` 会成为高并发写日志时的热路径开销。这里用 `OnceLock`
-/// 缓存首次计算结果。
-static TZ_OFFSET_CACHE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+/// 时区极少在进程运行期间变化；每次写日志都查一次会成为高并发写日志时的热路径开销，
+/// 因此用 `OnceLock` 缓存首次结果。
+///
+/// 代价是：进程跨夏令时切换长期运行时缓存值不跟着变（时间戳会偏 1 小时，重启即恢复）。
+/// 这是刻意取舍——日志时间的用途是"排序 + 大致定位"，而每次写日志都调系统时区接口更贵。
+static TZ_OFFSET_SECONDS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
-/// 获取本地时区偏移量（秒），带进程级缓存。
-fn get_local_offset_seconds() -> i64 {
-    *TZ_OFFSET_CACHE.get_or_init(compute_local_offset_seconds)
+/// 本地时区偏移（秒）
+///
+/// 由 `time` crate 提供跨平台实现（Windows 走 `GetTimeZoneInformation`、
+/// Unix 走 `localtime_r`），项目自己不再维护 FFI 与 `unsafe`（B5）。
+fn local_offset_seconds() -> i32 {
+    *TZ_OFFSET_SECONDS.get_or_init(|| {
+        time::UtcOffset::current_local_offset()
+            .map(|off| off.whole_seconds())
+            // 拿不到本地时区（如容器缺 tzdata）时按 UTC 记录：时间仍正确可排序，
+            // 只是不带本地偏移。
+            .unwrap_or(0)
+    })
+}
+
+/// 带缓存的本地时区偏移对象
+fn local_offset() -> time::UtcOffset {
+    time::UtcOffset::from_whole_seconds(local_offset_seconds()).unwrap_or(time::UtcOffset::UTC)
+}
+
+/// 当前本地时间
+///
+/// 必须用 [`time::OffsetDateTime::to_offset`]（只切换表述时区，**不改变时间点**），
+/// 不能用 `now_utc() + Duration`——后者会把时刻本身平移一个时区偏移，
+/// 导致 `unix_timestamp()` 与系统时钟差出整整 8 小时（已有测试固定该语义）。
+fn now_local() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc().to_offset(local_offset())
 }
 
 /// 获取当前本地时间的 (年, 月, 日, 时, 分, 秒) 元组
-fn get_local_datetime() -> (u64, u64, u64, u64, u64, u64) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let tz_offset = get_local_offset_seconds();
-    let secs = now.as_secs() as i64 + tz_offset;
-    let date = ((secs / 86400) as u64) + 2440588;
-    let (year, month, day) = julian_to_ymd(date);
-    let seconds_in_day = (secs.rem_euclid(86400)) as u64;
-    let hours = seconds_in_day / 3600;
-    let minutes = (seconds_in_day % 3600) / 60;
-    let seconds = seconds_in_day % 60;
-    (year, month, day, hours, minutes, seconds)
+fn get_local_datetime() -> (i32, u8, u8, u8, u8, u8) {
+    let t = now_local();
+    (
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+    )
 }
 
 /// 生成用于存档文件名的时间戳后缀，格式 YYYYMMDD_HHMMSS（如 20260814_153045）
@@ -378,111 +399,41 @@ pub fn setup_logging(log_file: &Option<PathBuf>, log_level: &LogLevel) -> Result
     Ok(())
 }
 
-/// 将儒略日转换为 (年, 月, 日) 三元组
-fn julian_to_ymd(julian: u64) -> (u64, u64, u64) {
-    let a = julian as i64 + 32044;
-    let b = (4 * a + 3) / 146097;
-    let c = a - (146097 * b) / 4;
-    let d = (4 * c + 3) / 1461;
-    let e = c - (1461 * d) / 4;
-    let m = (5 * e + 2) / 153;
-    let year = 100 * b as u64 + d as u64 - 4800 + (m / 10) as u64;
-    let month = (m + 3 - 12 * (m / 10)) as u64;
-    let day = (e - (153 * m + 2) / 5 + 1) as u64;
-    (year, month, day)
-}
-
-/// 直接调用平台 API 计算时区偏移（不缓存）
-#[cfg(windows)]
-fn compute_local_offset_seconds() -> i64 {
-    use std::mem::MaybeUninit;
-
-    #[repr(C)]
-    struct SystemTimeRaw {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-
-    #[repr(C)]
-    struct TimeZoneInformation {
-        bias: i32,
-        standard_name: [u16; 32],
-        standard_date: SystemTimeRaw,
-        standard_bias: i32,
-        daylight_name: [u16; 32],
-        daylight_date: SystemTimeRaw,
-        daylight_bias: i32,
-    }
-
-    extern "system" {
-        fn GetTimeZoneInformation(
-            lptimezoneinformation: *mut TimeZoneInformation,
-        ) -> u32;
-    }
-
-    unsafe {
-        let mut tz_info: MaybeUninit<TimeZoneInformation> = MaybeUninit::uninit();
-        let result = GetTimeZoneInformation(tz_info.as_mut_ptr());
-        let tz_info = tz_info.assume_init();
-
-        // bias 是 UTC 偏移量（分钟），值为正表示 UTC 之前（如 UTC+8 的 bias = -480）
-        let bias = tz_info.bias;
-        // 根据当前是否处于夏令时，附加额外偏移
-        let additional_bias = if result == 2 {
-            // TIME_ZONE_ID_DAYLIGHT
-            tz_info.daylight_bias
-        } else {
-            // TIME_ZONE_ID_STANDARD 或 TIME_ZONE_ID_UNKNOWN
-            tz_info.standard_bias
-        };
-
-        let total_bias = bias + additional_bias;
-        -(total_bias as i64) * 60
-    }
-}
-
-/// 直接调用平台 API 计算时区偏移（不缓存）
-#[cfg(not(windows))]
-fn compute_local_offset_seconds() -> i64 {
-    #[repr(C)]
-    struct Tm {
-        tm_sec: i32,
-        tm_min: i32,
-        tm_hour: i32,
-        tm_mday: i32,
-        tm_mon: i32,
-        tm_year: i32,
-        tm_wday: i32,
-        tm_yday: i32,
-        tm_isdst: i32,
-        tm_gmtoff: i64,
-        tm_zone: *const i8,
-    }
-
-    extern "C" {
-        fn time(t: *mut i64) -> i64;
-        fn localtime_r(t: *const i64, result: *mut Tm) -> *mut Tm;
-    }
-
-    unsafe {
-        let mut t: i64 = 0;
-        time(&mut t);
-        let mut tm: Tm = std::mem::zeroed();
-        localtime_r(&t, &mut tm);
-        tm.tm_gmtoff
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 本地时间换算不得让时钟走偏
+    ///
+    /// 这条测试固定 B5 重构的关键不变量：换成 `time` crate 之后，时区偏移只能
+    /// "平移显示用的墙上时间"，不能改变时间点本身。若偏移被重复施加（或符号搞反），
+    /// 会立刻偏离数小时。
+    #[test]
+    fn test_local_time_tracks_system_clock() {
+        let sys = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs() as i64;
+        let local = now_local().unix_timestamp();
+        assert!(
+            (sys - local).abs() <= 5,
+            "本地时间与系统时钟偏差过大：system={sys} local={local}"
+        );
+    }
+
+    /// 存档文件名后缀必须是 `YYYYMMDD_HHMMSS`（日志滚动的文件名契约）
+    #[test]
+    fn test_timestamp_suffix_shape() {
+        let ts = get_timestamp_suffix();
+        assert_eq!(ts.len(), 15, "后缀长度应为 15，实际 {ts:?}");
+        assert_eq!(ts.as_bytes()[8], b'_', "第 9 个字符应为下划线，实际 {ts:?}");
+        assert_eq!(
+            ts.chars().filter(|c| c.is_ascii_digit()).count(),
+            14,
+            "应含 14 位数字，实际 {ts:?}"
+        );
+    }
 
     #[test]
     fn test_size_rotation_triggers() {
@@ -601,32 +552,5 @@ mod tests {
         assert!(log_path.exists(), "current log file should still exist");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    // ─── julian_to_ymd 测试 ───
-
-    #[test]
-    fn test_julian_to_ymd_known_dates() {
-        // 儒略日 2440588 = 1970-01-01
-        assert_eq!(julian_to_ymd(2440588), (1970, 1, 1));
-        // 2000-01-01 = 儒略日 2451545
-        assert_eq!(julian_to_ymd(2451545), (2000, 1, 1));
-        // 2026-08-14 = 2026-01-01(2461042) + 225 天
-        assert_eq!(julian_to_ymd(2461267), (2026, 8, 14));
-    }
-
-    #[test]
-    fn test_julian_to_ymd_leap_year() {
-        // 2024 是闰年：2024-02-29 有效
-        assert_eq!(julian_to_ymd(2460370), (2024, 2, 29));
-        // 2024-03-01
-        assert_eq!(julian_to_ymd(2460371), (2024, 3, 1));
-    }
-
-    #[test]
-    fn test_julian_to_ymd_year_boundary() {
-        // 跨年边界：2025-12-31 -> 2026-01-01
-        assert_eq!(julian_to_ymd(2461041), (2025, 12, 31));
-        assert_eq!(julian_to_ymd(2461042), (2026, 1, 1));
     }
 }

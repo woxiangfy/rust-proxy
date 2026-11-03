@@ -258,6 +258,6 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `io.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
 | `buffer_pool.rs` | 自适应缓冲区池 |
 | `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |
-| `service.rs` | 系统服务安装与管理 |
+| `service/`（`mod` + `windows` + `unix`） | 系统服务安装与管理：命令行拼装、状态查询跨平台共用；SCM 与 systemd 的差异各自成文件 |
 
 前台 `start` 也支持优雅关停：SIGINT/SIGTERM（Linux/macOS）与 Ctrl+C（Windows）后停止接受新连接、等待活跃连接处理完再退出。

@@ -550,6 +550,301 @@ async fn handle_connect_generic<S>(
 /// `request_data` 为已读入的全部数据（头 + 可能的 body 前缀），`head_end` 为 body 起始偏移。
 /// 请求行以 origin-form 转发给目标服务器（旧实现遗漏请求行，导致明文 HTTP 代理失效）。
 /// body 按 Content-Length / Transfer-Encoding: chunked 流式转发，支持大请求体。
+/// 一次转发的目标信息（由请求行 + 绝对 URL 解析得出）
+struct ForwardTarget<'a> {
+    method: &'a str,
+    url: &'a str,
+    host: String,
+    port: u16,
+    /// origin-form 请求目标：path + query，直连上游的标准形式
+    origin_form: String,
+}
+
+impl<'a> ForwardTarget<'a> {
+    /// 从请求头解析转发目标；格式非法时返回 `None`（调用方保持"静默丢弃"语义）
+    fn parse(head_str: &'a str, client_addr: SocketAddr) -> Option<Self> {
+        let request_line = head_str.lines().next()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?;
+        let url = parts.next()?;
+
+        let parsed = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Failed to parse URL '{}' from {}: {}", url, client_addr, e);
+                return None;
+            }
+        };
+
+        let host = match parsed.host_str() {
+            Some(h) => h.to_string(),
+            None => {
+                error!("No host in URL '{}' from {}", url, client_addr);
+                return None;
+            }
+        };
+
+        let origin_form = match parsed.query() {
+            Some(q) => format!("{}?{}", parsed.path(), q),
+            None => parsed.path().to_string(),
+        };
+
+        Some(Self {
+            method,
+            url,
+            host,
+            port: parsed.port().unwrap_or(80),
+            origin_form,
+        })
+    }
+}
+
+/// 发往上游的请求头（已过滤逐跳头、改写 `Connection`）及请求体分帧信息
+struct UpstreamHead {
+    /// 请求行 + 过滤后的头部 + 结尾空行，可直接 `write_all`
+    bytes: String,
+    /// 请求体长度（`None` 表示没有 `Content-Length`）
+    content_length: Option<u64>,
+    /// 请求体是否为 chunked 分帧
+    chunked: bool,
+}
+
+impl UpstreamHead {
+    /// 按 `head_str` 构造上游请求头
+    ///
+    /// 过滤规则：
+    /// - `Connection` → 改写为 `close`（本代理每个请求独占一条上游连接）
+    /// - `Proxy-Connection` / `Proxy-Authorization` → 丢弃（前者代理专用，后者含凭据）
+    /// - `Transfer-Encoding` → 保留（body 按原始 chunked 分帧转发，需与状态机一致）
+    /// - `Content-Length` → 保留并记录，供 body 精确转发
+    ///
+    /// 头名按冒号精确切分匹配（用 `contains` 匹配子串会误伤 `X-Forwarded-For`
+    /// 这类合法头）；无冒号的行（含续行）原样转发，避免破坏上游解析。
+    fn build(target: &ForwardTarget<'_>, head_str: &str) -> Self {
+        let mut bytes = String::with_capacity(512);
+        bytes.push_str(target.method);
+        bytes.push(' ');
+        bytes.push_str(&target.origin_form);
+        bytes.push_str(" HTTP/1.1\r\n");
+
+        let mut content_length: Option<u64> = None;
+        let mut chunked = false;
+
+        for line in head_str.lines().skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            let (name, value) = match line.split_once(':') {
+                Some(pair) => pair,
+                None => {
+                    bytes.push_str(line);
+                    bytes.push_str("\r\n");
+                    continue;
+                }
+            };
+            let name = name.trim();
+            let value = value.trim();
+
+            if name.eq_ignore_ascii_case("connection") {
+                bytes.push_str("Connection: close\r\n");
+                continue;
+            }
+            if name.eq_ignore_ascii_case("proxy-connection")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+            {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                if value.to_ascii_lowercase().contains("chunked") {
+                    chunked = true;
+                }
+                bytes.push_str(line);
+                bytes.push_str("\r\n");
+                continue;
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse::<u64>().ok();
+            }
+            bytes.push_str(line);
+            bytes.push_str("\r\n");
+        }
+        bytes.push_str("\r\n");
+
+        Self {
+            bytes,
+            content_length,
+            chunked,
+        }
+    }
+}
+
+/// 一次转发中各阶段共用的进程级参数
+struct RelayCtx<'a> {
+    client_addr: SocketAddr,
+    timeout: Duration,
+    buffer_pool: &'a BufferPool,
+}
+
+impl RelayCtx<'_> {
+    /// 转发请求体：已缓冲字节 + 尚未读取的部分
+    ///
+    /// 分帧决策以 [`UpstreamHead`] 为准：
+    /// - chunked：交给分帧状态机（已缓冲字节必须先过状态机，终止块可能就在缓冲区里）
+    /// - Content-Length：先发已缓冲部分（截断到 CL，超出的属于管道化的下一个请求），
+    ///   再按剩余长度流式读转
+    /// - 两者皆无：只转发已缓冲字节（历史行为）
+    async fn forward_request_body<S>(
+        &self,
+        client: &mut S,
+        upstream: &mut TcpStream,
+        buffered: &[u8],
+        head: &UpstreamHead,
+    ) -> Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        if head.chunked {
+            let result = forward_chunked_body(
+                client,
+                upstream,
+                buffered,
+                self.timeout,
+                self.buffer_pool,
+            )
+            .await;
+            if let Err(e) = result {
+                if !is_benign_close_error(&e) {
+                    warn!(
+                        "Failed to forward chunked request body from {}: {}",
+                        self.client_addr, e
+                    );
+                }
+                return Err(e.into());
+            }
+            return Ok(());
+        }
+
+        let Some(cl) = head.content_length else {
+            // 无 Content-Length 且非 chunked：仅转发已缓冲字节
+            if !buffered.is_empty() && upstream.write_all(buffered).await.is_err() {
+                return Err(anyhow::anyhow!("failed to write buffered body upstream"));
+            }
+            return Ok(());
+        };
+
+        // 超出 Content-Length 的已缓冲字节属于管道化下一个请求，不能一起发出去
+        let buffered = if buffered.len() as u64 > cl {
+            &buffered[..cl as usize]
+        } else {
+            buffered
+        };
+        if !buffered.is_empty() && upstream.write_all(buffered).await.is_err() {
+            return Err(anyhow::anyhow!("failed to write buffered body upstream"));
+        }
+
+        let mut remaining = cl - buffered.len() as u64;
+        if remaining == 0 {
+            return Ok(());
+        }
+
+        let mut tmp = self.buffer_pool.get();
+        let tmp_slice = tmp.as_mut_slice();
+        while remaining > 0 {
+            let want = std::cmp::min(remaining as usize, tmp_slice.len());
+            let n =
+                match tokio::time::timeout(self.timeout, client.read(&mut tmp_slice[..want])).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        if !is_benign_close_error(&e) {
+                            warn!("Error reading request body from {}: {}", self.client_addr, e);
+                        }
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        warn!("Timeout reading request body from {}", self.client_addr);
+                        return Err(anyhow::anyhow!("timeout reading request body"));
+                    }
+                };
+            if n == 0 {
+                // 客户端提前关闭：body 不完整，但请求头已送达，仍可尝试读响应
+                warn!(
+                    "Client {} closed before sending complete request body",
+                    self.client_addr
+                );
+                return Ok(());
+            }
+            if upstream.write_all(&tmp_slice[..n]).await.is_err() {
+                return Err(anyhow::anyhow!("failed to write request body upstream"));
+            }
+            remaining -= n as u64;
+        }
+
+        Ok(())
+    }
+
+    /// 读上游响应并原样转发给客户端
+    ///
+    /// 拷贝缓冲自适应（8KB 起步，长传输 / 大 body 翻倍到 256KB）：一次读 + 一次写，
+    /// 中间不做额外分配，也不解析响应语义（代理不关心内容）。
+    async fn relay_response<S>(
+        &self,
+        client: &mut S,
+        upstream: &mut TcpStream,
+        target: &ForwardTarget<'_>,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let mut response_buf = AdaptiveBuffer::new();
+
+        loop {
+            response_buf.prepare();
+            match tokio::time::timeout(self.timeout, upstream.read(response_buf.as_mut_slice())).await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    response_buf.note_copied(n);
+                    if client
+                        .write_all(&response_buf.as_mut_slice()[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    if is_benign_close_error(&e) {
+                        debug!("Read from {}:{} ended: {}", target.host, target.port, e);
+                    } else {
+                        warn!("Error reading from {}:{}: {}", target.host, target.port, e);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    warn!("Response from {}:{} timed out", target.host, target.port);
+                    break;
+                }
+            }
+        }
+
+        debug!(
+            "Response copy buffer for {}:{} ended at {} KB",
+            target.host,
+            target.port,
+            response_buf.current_size() / 1024
+        );
+
+        Ok(())
+    }
+}
+
+/// 转发一次普通代理请求（认证已在调用前完成）
+///
+/// 四段流水线，每段可独立阅读与测试：
+/// 1. [`ForwardTarget::parse`] —— 请求行 → 目标 host / port / origin-form
+/// 2. 连接上游（`connect_host` 统一处理 IPv4 / IPv6 / DNS）
+/// 3. [`UpstreamHead::build`] + [`RelayCtx::forward_request_body`] —— 建头、转发 body
+/// 4. [`RelayCtx::relay_response`] —— 回传响应
 async fn handle_http_request_generic<S>(
     mut client: S,
     request_data: &[u8],
@@ -560,229 +855,48 @@ async fn handle_http_request_generic<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let head = &request_data[..head_end];
-    let head_str = String::from_utf8_lossy(head);
-    let mut lines = head_str.lines();
-
-    let request_line = match lines.next() {
-        Some(line) => line,
-        None => return,
-    };
-
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
+    let head_str = String::from_utf8_lossy(&request_data[..head_end]);
+    let Some(target) = ForwardTarget::parse(&head_str, client_addr) else {
         return;
-    }
-
-    let method = parts[0];
-    let url = parts[1];
-
-    // Parse URL to get host and port
-    let parsed_url = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Failed to parse URL '{}' from {}: {}", url, client_addr, e);
-            return;
-        }
     };
 
-    let host = match parsed_url.host_str() {
-        Some(h) => h,
-        None => {
-            error!("No host in URL '{}' from {}", url, client_addr);
-            return;
-        }
-    };
-
-    let port = parsed_url.port().unwrap_or(80);
-
-    info!("{} -> {} {}:{} -> {}", client_addr, method, host, port, url);
-
-    let mut target = match connect_host(host, port, timeout_duration).await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to connect to {}:{} from {}: {}", host, port, client_addr, e);
-            return;
-        }
-    };
-
-    // 转发请求行：origin-form（path + query），这是直连目标服务器的标准形式
-    let target_path = match parsed_url.query() {
-        Some(q) => format!("{}?{}", parsed_url.path(), q),
-        None => parsed_url.path().to_string(),
-    };
-    let mut header_buffer = String::with_capacity(512);
-    header_buffer.push_str(method);
-    header_buffer.push(' ');
-    header_buffer.push_str(&target_path);
-    header_buffer.push_str(" HTTP/1.1\r\n");
-
-    // 解析头部并过滤逐跳头（proxy-connection、proxy-authorization，避免凭据泄漏）；
-    // 保留 transfer-encoding（body 以原始 chunked 分帧转发）；connection 改写为 close。
-    let mut content_length: Option<u64> = None;
-    let mut chunked = false;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        // 精确按头名匹配（旧实现用 contains 匹配子串，会误伤合法头）
-        let (name, value) = match line.split_once(':') {
-            Some(pair) => pair,
-            None => {
-                // 无冒号的行（如续行）原样转发
-                header_buffer.push_str(line);
-                header_buffer.push_str("\r\n");
-                continue;
-            }
-        };
-        let name = name.trim();
-        let value = value.trim();
-
-        if name.eq_ignore_ascii_case("connection") {
-            header_buffer.push_str("Connection: close\r\n");
-            continue;
-        }
-        if name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-        {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            if value.to_ascii_lowercase().contains("chunked") {
-                chunked = true;
-            }
-            header_buffer.push_str(line);
-            header_buffer.push_str("\r\n");
-            continue;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse::<u64>().ok();
-            header_buffer.push_str(line);
-            header_buffer.push_str("\r\n");
-            continue;
-        }
-        header_buffer.push_str(line);
-        header_buffer.push_str("\r\n");
-    }
-    header_buffer.push_str("\r\n");
-
-    if target.write_all(header_buffer.as_bytes()).await.is_err() {
-        return;
-    }
-
-    // 转发 body：按 chunked / Content-Length 流式转发（已缓冲的字节一并交给下游处理）
-    let buffered_body = &request_data[head_end..];
-
-    if chunked {
-        // 流式转发 chunked 请求体，直到终止块（0\r\n\r\n）。
-        // 已缓冲字节必须交给分帧状态机消费——终止块可能就落在缓冲区里，
-        // 若先原样写出再读 socket，状态机会永远等不到结束而挂住。
-        let result = forward_chunked_body(
-            &mut client,
-            &mut target,
-            buffered_body,
-            timeout_duration,
-            &buffer_pool,
-        )
-        .await;
-        if let Err(e) = result {
-            if !is_benign_close_error(&e) {
-                warn!("Failed to forward chunked request body from {}: {}", client_addr, e);
-            }
-            return;
-        }
-    } else {
-        // 非 chunked：先转发已缓冲字节，超出 Content-Length 的部分属于管道化下一个请求
-        let mut buffered = buffered_body;
-        if let Some(cl) = content_length {
-            if buffered.len() as u64 > cl {
-                buffered = &buffered[..cl as usize];
-            }
-        }
-        if !buffered.is_empty() && target.write_all(buffered).await.is_err() {
-            return;
-        }
-
-        if let Some(cl) = content_length {
-            // 按 Content-Length 精确流式转发剩余 body（支持大文件上传）
-            let already_sent = buffered.len() as u64;
-            if cl > already_sent {
-                let mut remaining = cl - already_sent;
-                let mut tmp = buffer_pool.get();
-                let tmp_slice = tmp.as_mut_slice();
-                loop {
-                    let want = std::cmp::min(remaining as usize, tmp_slice.len());
-                    let m =
-                        match tokio::time::timeout(timeout_duration, client.read(&mut tmp_slice[..want]))
-                            .await
-                        {
-                            Ok(Ok(m)) => m,
-                            Ok(Err(e)) => {
-                                if !is_benign_close_error(&e) {
-                                    warn!("Error reading request body from {}: {}", client_addr, e);
-                                }
-                                return;
-                            }
-                            Err(_) => {
-                                warn!("Timeout reading request body from {}", client_addr);
-                                return;
-                            }
-                        };
-                    if m == 0 {
-                        // 客户端提前关闭，body 不完整
-                        warn!("Client {} closed before sending complete request body", client_addr);
-                        break;
-                    }
-                    if target.write_all(&tmp_slice[..m]).await.is_err() {
-                        return;
-                    }
-                    remaining -= m as u64;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    // 无 Content-Length 且非 chunked：仅转发已缓冲字节（历史行为）
-
-    // 读取响应并转发给客户端：拷贝缓冲自适应（8KB 起步，长传输/大body 翻倍到 256KB）
-    let mut response_buf = AdaptiveBuffer::new();
-
-    loop {
-        response_buf.prepare();
-        match tokio::time::timeout(timeout_duration, target.read(response_buf.as_mut_slice())).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => {
-                response_buf.note_copied(n);
-                // 直接从缓冲区写到客户端（一次读 + 一次写，零中间分配）
-                if client.write_all(&response_buf.as_mut_slice()[..n]).await.is_err() {
-                    break;
-                }
-            }
-            Ok(Err(e)) => {
-                if is_benign_close_error(&e) {
-                    debug!("Read from {}:{} ended: {}", host, port, e);
-                } else {
-                    warn!("Error reading from {}:{}: {}", host, port, e);
-                }
-                break;
-            }
-            Err(_) => {
-                warn!("Response from {}:{} timed out", host, port);
-                break;
-            }
-        }
-    }
-
-    debug!(
-        "Response copy buffer for {}:{} ended at {} KB",
-        host,
-        port,
-        response_buf.current_size() / 1024
+    info!(
+        "{} -> {} {}:{} -> {}",
+        client_addr, target.method, target.host, target.port, target.url
     );
 
-    info!("Request completed: {} {}", method, url);
+    let mut upstream = match connect_host(&target.host, target.port, timeout_duration).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                "Failed to connect to {}:{} from {}: {}",
+                target.host, target.port, client_addr, e
+            );
+            return;
+        }
+    };
+
+    let head = UpstreamHead::build(&target, &head_str);
+    if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
+        return;
+    }
+
+    let relay = RelayCtx {
+        client_addr,
+        timeout: timeout_duration,
+        buffer_pool: &buffer_pool,
+    };
+    if relay
+        .forward_request_body(&mut client, &mut upstream, &request_data[head_end..], &head)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let _ = relay.relay_response(&mut client, &mut upstream, &target).await;
+
+    info!("Request completed: {} {}", target.method, target.url);
 }
 
 /// Extract `(username, password)` from the userinfo component of a proxy URL.
@@ -1431,4 +1545,93 @@ mod tests {
 
     // ─── host:port 解析 / chunked 分帧 ───
     // 这两组原语的实现与测试已迁至 `crate::net` 与 `crate::http_body`（消除模块循环依赖）。
+
+    // ─── 转发目标解析（B3 拆分后的纯函数） ───
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:12345".parse().unwrap()
+    }
+
+    #[test]
+    fn test_forward_target_parses_absolute_url() {
+        let head = "GET http://example.com/a/b?x=1 HTTP/1.1
+Host: example.com
+
+";
+        let t = ForwardTarget::parse(head, addr()).expect("absolute URL must parse");
+        assert_eq!(t.method, "GET");
+        assert_eq!(t.host, "example.com");
+        assert_eq!(t.port, 80, "缺省端口应为 80");
+        assert_eq!(t.origin_form, "/a/b?x=1", "query 必须保留");
+    }
+
+    #[test]
+    fn test_forward_target_keeps_explicit_port() {
+        let head = "POST http://127.0.0.1:8080/p HTTP/1.1
+
+";
+        let t = ForwardTarget::parse(head, addr()).expect("parse");
+        assert_eq!(t.port, 8080);
+        assert_eq!(t.host, "127.0.0.1");
+        assert_eq!(t.origin_form, "/p");
+    }
+
+    #[test]
+    fn test_forward_target_rejects_non_absolute_target() {
+        // 相对 URL（非代理请求）与残缺请求行都必须返回 None，由上层走 404 反扫描
+        assert!(ForwardTarget::parse("GET / HTTP/1.1\r\n\r\n", addr()).is_none());
+        assert!(ForwardTarget::parse("GARBAGE\r\n\r\n", addr()).is_none());
+        assert!(ForwardTarget::parse("", addr()).is_none());
+    }
+
+    // ─── 上游请求头构造（含逐跳头与凭据过滤） ───
+
+    #[test]
+    fn test_upstream_head_rewrites_connection_and_drops_proxy_headers() {
+        let head = "GET http://example.com/x HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Proxy-Connection: keep-alive\r\n\
+                    Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+                    Connection: keep-alive\r\n\
+                    User-Agent: test\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+
+        assert!(up.bytes.starts_with("GET /x HTTP/1.1\r\n"), "请求行应改写为 origin-form");
+        assert!(up.bytes.contains("Connection: close\r\n"), "Connection 必须改写为 close");
+        assert!(!up.bytes.to_ascii_lowercase().contains("proxy-authorization"), "凭据不得上游化");
+        assert!(!up.bytes.to_ascii_lowercase().contains("proxy-connection"), "代理专用头应丢弃");
+        assert!(up.bytes.contains("User-Agent: test\r\n"), "普通头必须保留");
+        assert!(up.bytes.ends_with("\r\n\r\n"), "头部必须以空行结束");
+        assert!(!up.chunked);
+        assert_eq!(up.content_length, None);
+    }
+
+    #[test]
+    fn test_upstream_head_records_framing() {
+        // Content-Length
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 12\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        assert_eq!(up.content_length, Some(12));
+        assert!(!up.chunked);
+
+        // Transfer-Encoding: chunked（保留原头，同时置位）
+        let head = "POST http://h/p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        assert!(up.chunked);
+        assert_eq!(up.content_length, None);
+        assert!(up.bytes.contains("Transfer-Encoding: chunked"));
+    }
+
+    #[test]
+    fn test_upstream_head_does_not_match_header_substrings() {
+        // 头名必须精确匹配：X-Forwarded-For 不能被当作 connection 类头处理
+        let head = "GET http://h/p HTTP/1.1\r\nX-Connection-Info: keep\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head);
+        assert!(up.bytes.contains("X-Connection-Info: keep\r\n"));
+        assert!(!up.bytes.contains("Connection: close"), "不含 Connection 头时不应凭空追加");
+    }
 }

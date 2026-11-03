@@ -227,6 +227,7 @@ stream {
 | TLS 握手超时 | 客户端 TLS 版本不支持（rustls 支持 1.2/1.3）、未信任自签证书（需 `--proxy-insecure` 或导入 CA）、中间设备拦截 |
 | 客户端收到 `502 Bad Gateway` | 代理连不上目标：目标宕机、端口不通、DNS 解析失败或超过读超时。代理不会静默断开，`502` 即"到目标这一段不通" |
 | 客户端收到 `431 Request Header Fields Too Large` | 请求头超过 64KB（常见于超大 Cookie 或畸形客户端）。代理直接拒绝而不转发，避免把截断的头送给上游 |
+| 客户端收到 `400 Bad Request` | 分帧头自相矛盾：多个不一致的 `Content-Length`、非数字长度值。代理与上游对 body 边界的理解不同就会形成请求走私面，因此只能拒绝；`Content-Length` 与 `Transfer-Encoding: chunked` 并存时按 RFC 7230 §3.3.3 丢弃前者 |
 
 ```bash
 openssl x509 -in cert.pem -text -noout    # 验证证书
@@ -254,7 +255,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
 | `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
 | `http_body.rs` | chunked 分帧状态机与流式转发 |
-| `http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 共用骨架） |
+| `http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 / 400 共用骨架） |
 | `io.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
 | `buffer_pool.rs` | 自适应缓冲区池 |
 | `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |

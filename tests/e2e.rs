@@ -15,6 +15,8 @@
 //! 8. chunked 请求体：分帧字节原样转发，不补 `Content-Length`
 //! 9. 上游不可达：HTTP 与 CONNECT 均回 502（不得静默关闭）
 //! 10. 超长请求头：超过 64KB 回 431，且不把截断的头转发给上游
+//! 11. 分帧头互斥：`Content-Length` 与 `Transfer-Encoding` 并存时丢弃 CL，
+//!     多个不一致的 CL 回 400（请求走私面）
 //!
 //! 全部走 loopback，不依赖外网，可在 CI 稳定运行。
 
@@ -787,5 +789,73 @@ async fn oversized_request_head_rejected_before_forwarding() {
     assert!(
         !String::from_utf8_lossy(&resp).contains("Example Domain"),
         "超长请求绝不能被转发到上游"
+    );
+}
+
+/// 链路 11a：`Content-Length` 与 `Transfer-Encoding` 并存
+///
+/// RFC 7230 §3.3.3 要求代理在转发前**丢弃** `Content-Length`。两者同时到达上游时，
+/// 若上游按 CL 解析，会把分帧字节当成 body 内容，随后管道化的请求就被拼进同一个
+/// 请求——请求走私。
+///
+/// 路径前缀模式早已这样做（`test_build_upstream_request_chunked_drops_content_length`），
+/// 经典代理此前是原样转发，同一项目两种行为。
+#[tokio::test]
+async fn chunked_with_content_length_drops_cl_before_upstream() {
+    let origin = spawn_chunked_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let req = format!(
+        "POST http://{origin}/smuggle HTTP/1.1\r\n\
+         Host: {origin}\r\n\
+         Content-Length: 5\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Connection: close\r\n\
+         \r\n\
+         5\r\nhello\r\n0\r\n\r\n"
+    );
+    let resp = request_raw(proxy.addr, req.as_bytes()).await;
+
+    assert_eq!(status_code(&resp), 200, "上游应正常完成分帧读取");
+    let echoed = body_of(&resp).to_lowercase();
+    assert!(
+        echoed.contains("transfer-encoding: chunked"),
+        "分帧头必须保留：{echoed}"
+    );
+    assert!(
+        !echoed.contains("content-length:"),
+        "CL 与 TE 不得同时转发给上游：{echoed}"
+    );
+}
+
+/// 链路 11b：多个不一致的 `Content-Length`
+///
+/// 代理与上游对 body 边界的理解必然不同，只能拒绝，不能"挑一个用"。
+/// 用可达的 origin 做对照：若被误转发，用例会看到 200 而不是 400。
+#[tokio::test]
+async fn conflicting_duplicate_content_length_returns_400() {
+    let origin = spawn_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let req = format!(
+        "POST http://{origin}/ambiguous HTTP/1.1\r\n\
+         Host: {origin}\r\n\
+         Content-Length: 5\r\n\
+         Content-Length: 6\r\n\
+         Connection: close\r\n\
+         \r\n\
+         hello"
+    );
+    let resp = request_raw(proxy.addr, req.as_bytes()).await;
+
+    assert_eq!(
+        status_code(&resp),
+        400,
+        "多个不一致的 CL 必须拒绝，实际：{:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        !body_of(&resp).contains("/ambiguous"),
+        "畸形请求不得转发到上游"
     );
 }

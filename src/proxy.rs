@@ -360,6 +360,21 @@ async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
     .await;
 }
 
+/// 分帧头自相矛盾（多个不一致的 `Content-Length` / 非数字值）时的 400 响应
+///
+/// 只能拒绝、不能"挑一个用"：代理与上游对 body 边界的理解一旦不同，
+/// 后续字节就会被解释成另一个请求（请求走私）。此处已确认是代理请求，
+/// 返回 400 不会暴露代理特征。
+async fn send_bad_request<W: AsyncWrite + Unpin>(client: &mut W) {
+    write_response(
+        client,
+        "400 Bad Request",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        b"400 Bad Request",
+    )
+    .await;
+}
+
 /// 请求头超过上限时的 431 响应
 ///
 /// 用 431 而不是 400：语义精确（RFC 6585 §5 专为"头部过大"定义），且只会在客户端
@@ -530,7 +545,7 @@ struct UpstreamHead {
 }
 
 impl UpstreamHead {
-    /// 按 `head_str` 构造上游请求头
+    /// 按 `head_str` 构造上游请求头；分帧信息自相矛盾时返回 `None`
     ///
     /// 过滤规则：
     /// - `Connection` → 改写为 `close`（本代理每个请求独占一条上游连接）
@@ -538,12 +553,20 @@ impl UpstreamHead {
     ///   `Upgrade` 等逐跳头 → 丢弃（[`is_hop_by_hop`]，RFC 7230 §6.1）
     /// - `Expect: 100-continue` → 丢弃并置位，由代理直接回 `100 Continue`
     ///   （转发该头会让客户端等上游的临时响应，而代理此刻正在收 body，白等一个 RTT）
-    /// - `Transfer-Encoding` → 保留（body 按原始 chunked 分帧转发，需与状态机一致）
-    /// - `Content-Length` → 保留并记录，供 body 精确转发
+    /// - `Transfer-Encoding` → 原样保留（body 按原始分帧转发；`gzip, chunked` 这类
+    ///   多编码只声明 chunked 会让上游把仍是 gzip 的块数据当明文）
+    /// - `Content-Length` → **延迟到循环后统一输出**，因为它与 `Transfer-Encoding`
+    ///   互斥，必须等看清全部头才能决定写不写（见函数末尾）
     ///
     /// 头名按冒号精确切分匹配（用 `contains` 匹配子串会误伤 `X-Forwarded-For`
     /// 这类合法头）；无冒号的行（含续行）原样转发，避免破坏上游解析。
-    fn build(target: &ForwardTarget<'_>, head_str: &str) -> Self {
+    ///
+    /// 返回 `None` 的两种情况（调用方应回 400）：
+    /// - `Content-Length` 值不是十进制数字；
+    /// - 出现多个**不一致**的 `Content-Length`。
+    ///
+    /// 这两种情况下代理与上游对 body 边界必然有不同的理解，转发等于制造走私面。
+    fn build(target: &ForwardTarget<'_>, head_str: &str) -> Option<Self> {
         let mut bytes = String::with_capacity(512);
         bytes.push_str(target.method);
         bytes.push(' ');
@@ -551,6 +574,7 @@ impl UpstreamHead {
         bytes.push_str(" HTTP/1.1\r\n");
 
         let mut content_length: Option<u64> = None;
+        let mut content_length_conflict = false;
         let mut chunked = false;
         let mut expect_continue = false;
 
@@ -583,9 +607,15 @@ impl UpstreamHead {
                 continue;
             }
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse::<u64>().ok();
-                bytes.push_str(line);
-                bytes.push_str("\r\n");
+                // 延迟输出：chunked 与 CL 互斥，此刻还不知道后面有没有 TE
+                match value.parse::<u64>() {
+                    Ok(v) => match content_length {
+                        Some(prev) if prev != v => content_length_conflict = true,
+                        Some(_) => {} // 重复且一致：合并成一条，不给上游留多值歧义
+                        None => content_length = Some(v),
+                    },
+                    Err(_) => content_length_conflict = true,
+                }
                 continue;
             }
             // `100-continue` 由代理直接应答；其余 `Expect` 值同样丢弃（无从满足）
@@ -599,14 +629,30 @@ impl UpstreamHead {
             bytes.push_str(line);
             bytes.push_str("\r\n");
         }
+
+        // 代理与上游对 body 边界的理解必须完全一致，否则就是走私面
+        if content_length_conflict {
+            return None;
+        }
+
+        // 分帧头二选一（RFC 7230 §3.3.3）：存在 chunked 时**必须**丢弃 Content-Length。
+        // 两者同时转发时，若上游按 CL 解析，会把分帧字节当成 body 内容，
+        // 后续管道化的请求就被拼进同一个请求（请求走私）。
+        if chunked {
+            content_length = None;
+        } else if let Some(cl) = content_length {
+            bytes.push_str("Content-Length: ");
+            bytes.push_str(&cl.to_string());
+            bytes.push_str("\r\n");
+        }
         bytes.push_str("\r\n");
 
-        Self {
+        Some(Self {
             bytes,
             content_length,
             chunked,
             expect_continue,
-        }
+        })
     }
 }
 
@@ -777,6 +823,17 @@ async fn handle_http_request_generic<S>(
         client_addr, target.method, target.host, target.port, target.url
     );
 
+    // 先校验分帧头再连上游：畸形请求不该消耗一条到目标的连接（也避免把
+    // 走私试探真的打到目标上）。
+    let Some(head) = UpstreamHead::build(&target, &head_str) else {
+        warn!(
+            "{} -> malformed framing headers (conflicting or non-numeric Content-Length)",
+            client_addr
+        );
+        send_bad_request(&mut client).await;
+        return;
+    };
+
     let mut upstream = match connect_host(&target.host, target.port, timeout_duration).await {
         Ok(t) => t,
         Err(e) => {
@@ -789,7 +846,6 @@ async fn handle_http_request_generic<S>(
         }
     };
 
-    let head = UpstreamHead::build(&target, &head_str);
     if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
         return;
     }
@@ -972,7 +1028,7 @@ Host: example.com
                     Connection: keep-alive\r\n\
                     User-Agent: test\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
 
         assert!(up.bytes.starts_with("GET /x HTTP/1.1\r\n"), "请求行应改写为 origin-form");
         assert!(up.bytes.contains("Connection: close\r\n"), "Connection 必须改写为 close");
@@ -989,14 +1045,14 @@ Host: example.com
         // Content-Length
         let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 12\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         assert_eq!(up.content_length, Some(12));
         assert!(!up.chunked);
 
         // Transfer-Encoding: chunked（保留原头，同时置位）
         let head = "POST http://h/p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         assert!(up.chunked);
         assert_eq!(up.content_length, None);
         assert!(up.bytes.contains("Transfer-Encoding: chunked"));
@@ -1007,7 +1063,7 @@ Host: example.com
         // 头名必须精确匹配：X-Forwarded-For 不能被当作 connection 类头处理
         let head = "GET http://h/p HTTP/1.1\r\nX-Connection-Info: keep\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         assert!(up.bytes.contains("X-Connection-Info: keep\r\n"));
         assert!(!up.bytes.contains("Connection: close"), "不含 Connection 头时不应凭空追加");
     }
@@ -1020,7 +1076,7 @@ Host: example.com
                     Content-Length: 4\r\n\
                     Expect: 100-continue\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         assert!(up.expect_continue, "必须置位，供调用方回 100 Continue");
         assert!(
             !up.bytes.to_ascii_lowercase().contains("expect:"),
@@ -1034,9 +1090,67 @@ Host: example.com
         // 其它 Expect 值无从满足，同样丢弃，但不应误触发 100 Continue
         let head = "POST http://h/p HTTP/1.1\r\nExpect: 42-continue\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         assert!(!up.expect_continue);
         assert!(!up.bytes.to_ascii_lowercase().contains("expect:"));
+    }
+
+    #[test]
+    fn test_upstream_head_drops_content_length_when_chunked() {
+        // RFC 7230 §3.3.3：存在 Transfer-Encoding 时 Content-Length **必须**丢弃。
+        // 两者一起转发时，若上游按 CL 解析，分帧字节会被当成 body 内容，
+        // 后续管道化的请求就被拼进同一个请求——请求走私。
+        let head = "POST http://h/p HTTP/1.1\r\n\
+                    Host: h\r\n\
+                    Content-Length: 5\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.chunked);
+        assert_eq!(up.content_length, None, "chunked 时 CL 必须清零");
+        let lower = up.bytes.to_ascii_lowercase();
+        assert!(
+            lower.contains("transfer-encoding: chunked"),
+            "分帧头必须保留：{}",
+            up.bytes
+        );
+        assert!(
+            !lower.contains("content-length"),
+            "CL 不得与 TE 一起转发：{}",
+            up.bytes
+        );
+    }
+
+    #[test]
+    fn test_upstream_head_rejects_conflicting_content_length() {
+        // 多个不一致的 CL：代理与上游对 body 边界的理解必然不同 → 拒绝而不是挑一个
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        assert!(UpstreamHead::build(&target, head).is_none());
+    }
+
+    #[test]
+    fn test_upstream_head_rejects_non_numeric_content_length() {
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5x\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        assert!(UpstreamHead::build(&target, head).is_none());
+    }
+
+    #[test]
+    fn test_upstream_head_collapses_duplicate_content_length() {
+        // 重复但一致：合并成一条，不给上游留多值歧义
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert_eq!(up.content_length, Some(5));
+        let count = up
+            .bytes
+            .to_ascii_lowercase()
+            .matches("content-length:")
+            .count();
+        assert_eq!(count, 1, "重复 CL 必须合并：{}", up.bytes);
     }
 
     #[test]
@@ -1050,7 +1164,7 @@ Host: example.com
                     Proxy-Authenticate: Basic\r\n\
                     Accept: */*\r\n\r\n";
         let target = ForwardTarget::parse(head, addr()).unwrap();
-        let up = UpstreamHead::build(&target, head);
+        let up = UpstreamHead::build(&target, head).unwrap();
         let lower = up.bytes.to_ascii_lowercase();
         for hop in ["keep-alive:", "te:", "trailer:", "upgrade:", "proxy-authenticate:"] {
             assert!(!lower.contains(hop), "逐跳头 {hop} 不应转发: {}", up.bytes);

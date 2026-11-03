@@ -45,38 +45,6 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 启动代理服务器，根据配置可能同时监听 HTTP 和 HTTPS (TLS) 端口
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
-    let buffer_pool = Arc::new(BufferPool::new());
-    let auth = Arc::new(args.auth.clone());
-
-    // ── 路径前缀直连模式（可选）──
-    // 前缀合法性在此校验（配置层无法记录日志）；非法前缀直接启动失败，避免静默降级。
-    let path_proxy = match &args.path_proxy_prefix {
-        Some(prefix) => {
-            let cfg = PathProxyConfig::new(
-                prefix,
-                args.path_proxy_insecure_tls,
-                args.path_proxy_rewrite_location,
-            )?;
-            info!(
-                "Path-prefix direct proxy enabled: /{}/http://host/path and /{}/https://host/path \
-                 (insecure_tls={}, rewrite_location={})",
-                cfg.prefix(),
-                cfg.prefix(),
-                cfg.insecure_tls,
-                cfg.rewrite_location
-            );
-            if args.auth.is_none() {
-                warn!(
-                    "Path-prefix direct proxy is open to anyone reaching this port \
-                     (no [[auth]] configured); consider [[auth]] to avoid being used as an open relay"
-                );
-            }
-            Some(cfg)
-        }
-        None => None,
-    };
-    let path_proxy = Arc::new(path_proxy);
-
     // ── 根据 TLS 配置构建 TlsReloader ──
     // config 层已确保：args.tls 为 Some ⟺ 用户显式指定了 https_port
     // 因此这里只需要决定：用用户证书还是回退到自签证书
@@ -219,20 +187,28 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
 
     // 连接期不变量一次性收进 ConnContext：后续 accept / dispatch / 各处理函数
     // 只需传递一个共享引用，避免 8~10 参数的签名在各层反复展开。
-    let ctx = Arc::new(ConnContext {
-        timeout: args.timeout,
-        buffer_pool,
-        auth,
-        path_proxy,
-        pp_policy: PpPolicy {
-            http_mode: args.http_proxy_protocol,
-            https_mode: args.https_proxy_protocol,
-            trusted_ips: Arc::new(args.proxy_protocol_trusted_ips.clone()),
-        },
-    });
+    let ctx = Arc::new(ConnContext::from_args(args)?);
 
     accept_connections_dual(http_listener, https_listener, ctx, shutdown_rx).await;
 
+    Ok(())
+}
+
+/// 在**已绑定**的监听器上运行代理（不做端口绑定与 TLS 装配）
+///
+/// 两个用途：
+/// - 集成测试：测试先绑定 `127.0.0.1:0` 拿到临时端口，再交给代理，避免写死端口
+///   或"探测空闲端口后重绑"的竞态；
+/// - 嵌入式复用：上层已完成绑定（如 socket activation），只需要代理的 accept 循环。
+///
+/// HTTPS 不在本入口范围内——TLS 装配需要证书来源与热重载，属于 [`run_server`] 的职责。
+pub async fn run_server_with_listener(
+    listener: TcpListener,
+    args: &Args,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
+    let ctx = Arc::new(ConnContext::from_args(args)?);
+    accept_connections_dual(Some(listener), None, ctx, shutdown_rx).await;
     Ok(())
 }
 
@@ -267,6 +243,50 @@ impl PpPolicy {
 }
 
 impl ConnContext {
+    /// 由合并后的配置构造连接期上下文
+    ///
+    /// 路径前缀配置的合法性在这里校验（配置层无法记录日志）：非法前缀直接失败，
+    /// 避免静默降级成"看起来启动了但其实没生效"。
+    fn from_args(args: &Args) -> Result<Self> {
+        let path_proxy = match &args.path_proxy_prefix {
+            Some(prefix) => {
+                let cfg = PathProxyConfig::new(
+                    prefix,
+                    args.path_proxy_insecure_tls,
+                    args.path_proxy_rewrite_location,
+                )?;
+                info!(
+                    "Path-prefix direct proxy enabled: /{}/http://host/path and /{}/https://host/path \
+                     (insecure_tls={}, rewrite_location={})",
+                    cfg.prefix(),
+                    cfg.prefix(),
+                    cfg.insecure_tls,
+                    cfg.rewrite_location
+                );
+                if args.auth.is_none() {
+                    warn!(
+                        "Path-prefix direct proxy is open to anyone reaching this port \
+                         (no [[auth]] configured); consider [[auth]] to avoid being used as an open relay"
+                    );
+                }
+                Some(cfg)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            timeout: args.timeout,
+            buffer_pool: Arc::new(BufferPool::new()),
+            auth: Arc::new(args.auth.clone()),
+            path_proxy: Arc::new(path_proxy),
+            pp_policy: PpPolicy {
+                http_mode: args.http_proxy_protocol,
+                https_mode: args.https_proxy_protocol,
+                trusted_ips: Arc::new(args.proxy_protocol_trusted_ips.clone()),
+            },
+        })
+    }
+
     /// 不做 PROXY 解析的直连处理（明文 TCP）
     async fn handle_plain_tcp(&self, client: tokio::net::TcpStream) {
         handle_client(

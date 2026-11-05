@@ -33,8 +33,8 @@ pub(super) fn install(ctx: ServiceInstallCtx) -> Result<()> {
 
 /// 服务进程入口（`--run-as-service` 分支）
 pub fn run_as_service() -> Result<()> {
-    let start_args = parse_service_args();
-    let args = Args::from_run_args(&start_args);
+    let start_args = parse_service_args()?;
+    let args = Args::from_run_args(&start_args)?;
 
     // 服务模式下没有终端，日志必须落文件；未配置时放在可执行文件旁边
     let effective_log_file = if args.log_file.is_some() {

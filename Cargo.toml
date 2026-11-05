@@ -1,6 +1,6 @@
 [package]
 name = "rust-proxy"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 
 [profile.release]
@@ -21,17 +21,19 @@ anyhow = "1.0"
 url = "2.5"
 base64 = "0.22"
 
-tokio-native-tls = "0.3"
 tokio-rustls = "0.26"
 rustls = "0.23"
+# 客户端 TLS（自检客户端 / 路径模式上游）统一走 rustls，根证书取自系统信任库
+rustls-native-certs = "0.8"
 rustls-pemfile = "2.0"
 rcgen = "0.14"
 # `local-offset`：日志时间戳需要本地时区（跨平台实现由 crate 负责，避免自写 FFI）
 time = { version = "0.3", features = ["local-offset"] }
 service-manager = "0.11"
 
+[dev-dependencies]
+# `test-util`：慢速头用例需要 `tokio::time::pause()` 虚拟时钟，避免测试真实等待
+tokio = { version = "1.52", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.6"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }

@@ -10,6 +10,7 @@
 - **自签证书自动生成**：指定 `--https-port` 但证书缺失/加载失败时，自动生成 10 年自签证书
 - **TLS 证书热重载**：用户证书更新后自动生效，无需重启
 - **PROXY Protocol**：挂在 nginx/HAProxy 后自动识别真实客户端 IP
+- **TLS 单栈**：服务端、自检客户端、路径模式上游全部使用 rustls；客户端默认用**系统信任库**校验证书（Windows 证书库 / macOS Keychain / Linux CA bundle），不再链接 OpenSSL
 - 动态缓冲区池（8KB → 256KB 自适应，纯流式零拷贝）
 - Windows / Linux，可安装为系统服务
 
@@ -81,7 +82,7 @@ curl -x https://127.0.0.1:8443 --proxy-cacert cert.pem https://example.com
 ./rust-proxy test https://127.0.0.1:8443 https://example.com
 ```
 
-代理地址**必须带 `http://` 或 `https://`**。`https://` 接入会自动跳过代理证书校验（支持自签）；目标 HTTPS 走 CONNECT 隧道后用系统 CA 验证。
+代理地址**必须带 `http://` 或 `https://`**。`https://` 接入会自动跳过代理证书校验（支持自签）；目标 HTTPS 走 CONNECT 隧道后用系统信任库验证（rustls + `rustls-native-certs`，与 native-tls 读取的是同一份系统 CA）。
 
 ### server（系统服务，需管理员权限）
 
@@ -93,11 +94,13 @@ sc query rust-proxy          # Windows 验证
 
 `server install` 参数与 `start` 一致（`--log-file` 默认落到可执行文件同目录 `proxy.log`），安装时参数写入服务配置。停止/关机时会等待活跃连接处理完毕再退出。
 
+服务进程（`--run-as-service`）的参数解析失败时会打出明确的 `error`（含具体失败参数）并以非零码退出，**不会**回退默认值——否则可能丢掉 `--config` 或认证配置，属于 fail-open。
+
 ## 配置文件
 
 TOML，所有项可选，**优先级：命令行 > 配置文件 > 默认值**。
 
-配置采用**严格解析**：出现未知键会直接报错（如把 `proxy_protocol_mode` 拼错、或把顶层键写在 `[[auth]]` 段之后——按 TOML 语义它会被算作该数组元素的字段），不再静默忽略。`--config` 指定的文件读取/解析失败时，日志会打出 `error` 并回退到"仅命令行参数"，避免"以为开了认证其实没开"。
+配置采用**严格解析**：出现未知键会直接报错（如把 `proxy_protocol_mode` 拼错、或把顶层键写在 `[[auth]]` 段之后——按 TOML 语义它会被算作该数组元素的字段），不再静默忽略。`--config` 指定的文件（以及自动发现的 `config.toml`）读取/解析失败时，日志会打出 `error` 并以非零码退出，避免"以为开了认证其实没开"。
 
 ```toml
 port = 8080
@@ -158,7 +161,7 @@ curl -u admin:secret "http://1.2.3.4/px/https://example.com/file.zip"
 | 上游 3xx | `Location` 重写为 `/{prefix}/<绝对URL>`（可关） |
 | 请求体 | 按 Content-Length / chunked 流式转发；两者并存以 chunked 为准（防请求走私） |
 | 响应体 | 原始字节流式转发，chunked / gzip / br 原样保留 |
-| 逐跳头 | `Connection`、`Keep-Alive`、`Proxy-*`、`Upgrade`、`TE`、`Trailer`、`Expect` 不转发；`Host` 重写为上游主机 |
+| 逐跳头 | `Connection`、`Keep-Alive`、`Proxy-*`、`Upgrade`、`TE`、`Trailer`、`Expect` 不转发；`Connection` 里点名的自定义字段（如 `Connection: X-Foo`）同样不转发；`Host` 重写为上游主机 |
 | 认证 | 复用 `[[auth]]`，接受 `Authorization` 或 `Proxy-Authorization`，质询返回 401 |
 | 凭据隔离 | 用于本代理认证的头不会转发给上游 |
 | `Expect: 100-continue` | 代理直接回 100，不转发给上游 |
@@ -228,6 +231,9 @@ stream {
 | 客户端收到 `502 Bad Gateway` | 代理连不上目标：目标宕机、端口不通、DNS 解析失败或超过读超时。代理不会静默断开，`502` 即"到目标这一段不通" |
 | 客户端收到 `431 Request Header Fields Too Large` | 请求头超过 64KB（常见于超大 Cookie 或畸形客户端）。代理直接拒绝而不转发，避免把截断的头送给上游 |
 | 客户端收到 `400 Bad Request` | 分帧头自相矛盾：多个不一致的 `Content-Length`、非数字长度值。代理与上游对 body 边界的理解不同就会形成请求走私面，因此只能拒绝；`Content-Length` 与 `Transfer-Encoding: chunked` 并存时按 RFC 7230 §3.3.3 丢弃前者 |
+| 上游收到的 `Host` 不对 / 没有 `Host` | 经典代理按 RFC 7230 §5.4 以绝对 URL 的 authority 重写 `Host`（含端口、IPv6 方括号）；客户端漏发时自动补写，不会把客户端的错误 `Host` 透传给上游 |
+| 客户端没发完请求头就断开 | 代理直接关闭连接，不把截断的头转发给上游（否则上游会把残缺请求当成合法请求处理，白白消耗一条到目标的连接） |
+| 客户端把 `https://` 绝对 URL 直接发给经典代理（未先 CONNECT） | 回 `400 Bad Request`，不会尝试连接 443。访问 https 站点必须先 `CONNECT host:443` 建隧道，再在隧道内做 TLS；把绝对 URL 交给明文代理属于协议误用，直接拒绝而不做"明文打 TLS 端口"的无意义连接 |
 
 ```bash
 openssl x509 -in cert.pem -text -noout    # 验证证书
@@ -244,21 +250,24 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | --- | --- |
 | `lib.rs` / `main.rs` | 库入口（模块导出与分层）/ 薄壳二进制 |
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
-| `proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发 |
+| `proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发（`Host` 按绝对 URL 重写 / 补写） |
 | `auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
-| `client.rs` | `test-proxy` 自检客户端（CONNECT + TLS） |
+| `client.rs` | `test-proxy` 自检客户端（CONNECT + TLS，证书校验由 `tls_client` 提供） |
+| `tls_client.rs` | 客户端 TLS 配置与握手：系统根证书 / `insecure` 跳过校验（自检客户端与路径模式上游共用） |
 | `path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭 |
 | `tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
 | `proxy_protocol.rs` | PROXY Protocol v1/v2 解析、模式映射、真实地址解析（`PpPolicy`） |
-| `config.rs` | 配置解析与合并（命令行 + TOML） |
+| `config.rs` / `config/schema.rs` | 配置声明与合并（声明层字段表统一生成 CLI/TOML/服务参数结构） |
 | `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
 | `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
 | `http_body.rs` | chunked 分帧状态机与流式转发 |
 | `http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 / 400 共用骨架） |
-| `io.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
+| `stream.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
 | `buffer_pool.rs` | 自适应缓冲区池 |
 | `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |
-| `service/`（`mod` + `windows` + `unix`） | 系统服务安装与管理：命令行拼装、状态查询跨平台共用；SCM 与 systemd 的差异各自成文件 |
+| `service/`（`mod` + `args` + `windows` + `unix`） | 系统服务安装与管理：`args` 负责参数适配与 argv 序列化，状态查询跨平台共用；SCM 与 systemd 的差异各自成文件 |
 
 前台 `start` 也支持优雅关停：SIGINT/SIGTERM（Linux/macOS）与 Ctrl+C（Windows）后停止接受新连接、等待活跃连接处理完再退出。
+
+TLS 依赖说明：服务端（`tls.rs`）与客户端（`tls_client.rs`）共用 rustls，因此不再需要 `native-tls`；Linux 构建也不再启用 `openssl/vendored`（它原先只为 native-tls 提供 OpenSSL 后端），不需要 OpenSSL 工具链。但 rustls 默认 crypto provider（`aws-lc-rs`）含 C/汇编实现，本地构建需要 C 编译器，`aws-lc-sys` 通过 CMake 驱动构建，因此还需 CMake；Linux 端的构建与测试后续由 GitHub Actions CI 覆盖。

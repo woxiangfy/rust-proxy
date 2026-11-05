@@ -1,0 +1,31 @@
+===== default =====
+--run-as-service
+===== all_explicit =====
+--run-as-service
+--config
+<CONFIG_DIR>/config.toml
+--port
+8081
+--log-file
+<CWD>/logs/proxy.log
+--timeout
+9
+--log-level
+debug
+--https-port
+9443
+--tls-cert
+<CWD>/cert.pem
+--tls-key
+<CWD>/key.pem
+--proxy-protocol-mode
+require
+--proxy-protocol-trusted-ips
+10.0.0.1,10.0.0.2
+--path-proxy-prefix
+px
+--path-proxy-insecure
+--multi-thread
+===== legacy_proxy_protocol =====
+--run-as-service
+--proxy-protocol

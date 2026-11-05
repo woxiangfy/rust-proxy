@@ -8,12 +8,12 @@
 //! 完全不同的代码互相干扰（也各自拖着用不到的依赖）。
 
 use crate::net::AsyncStream;
+use crate::tls_client::connect_tls;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_native_tls::{native_tls, TlsConnector};
 
 /// Extract `(username, password)` from the userinfo component of a proxy URL.
 ///
@@ -152,17 +152,12 @@ pub async fn test_proxy(
         .with_context(|| format!("Failed to connect to proxy {}", proxy_addr))?;
 
     // 若代理为 HTTPS：用 TLS 包装 TCP 连接
-    // danger_accept_invalid_certs=true 以支持自签证书（等价于 curl --proxy-insecure）
+    // insecure=true 以支持自签证书（等价于 curl --proxy-insecure）
     let proxy_stream: Box<dyn AsyncStream> = if proxy_scheme == "https" {
-        let mut tls_builder = native_tls::TlsConnector::builder();
-        tls_builder.danger_accept_invalid_certs(true);
-        let native_connector = tls_builder.build()?;
-        let tls_connector = TlsConnector::from(native_connector);
         Box::new(
-            tokio::time::timeout(Duration::from_secs(30), tls_connector.connect(&proxy_host, tcp_stream))
+            connect_tls(tcp_stream, &proxy_host, true, Duration::from_secs(30))
                 .await
-                .with_context(|| "Timeout during TLS handshake with proxy")?
-                .with_context(|| "TLS handshake with proxy failed")?,
+                .with_context(|| format!("TLS handshake with proxy {} failed", proxy_addr))?,
         )
     } else {
         Box::new(tcp_stream)
@@ -221,9 +216,12 @@ pub async fn test_proxy(
                 anyhow::bail!("CONNECT failed: {}", status_line);
             }
 
-            // Upgrade to TLS (use system CA roots to verify target cert)
-            let cx = TlsConnector::from(native_tls::TlsConnector::new()?);
-            Box::new(cx.connect(&host, stream).await?)
+            // Upgrade to TLS：目标站点用系统根证书严格校验（不做 insecure）
+            Box::new(
+                connect_tls(stream, &host, false, Duration::from_secs(30))
+                    .await
+                    .with_context(|| format!("TLS handshake with {} failed", host))?,
+            )
         } else {
             proxy_stream
         };
@@ -266,6 +264,10 @@ pub async fn test_proxy(
         {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&temp[..n]),
+            // 对端直接关 TCP、未发 TLS `close_notify` 时 rustls 会报 UnexpectedEof。
+            // 这类"读到连接结尾"与 Ok(0) 语义相同（native-tls 时代就是如此），
+            // 自检只需把已收到的响应打印出来，不因此判失败。
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
     }
@@ -364,5 +366,74 @@ mod tests {
         // 仅 --username 无 --password，URL 也无凭证
         let header = build_proxy_auth_header("http://proxy.local:8080", Some("user"), None);
         assert_eq!(header.as_deref(), Some("Basic dXNlcjo="));
+    }
+
+    // ─── TLS 证书校验路径 ───
+    //
+    // 这两条用例钉住 `connect_tls` 的安全语义，也与 `--proxy-insecure` 的对外承诺一致：
+    // 默认（insecure=false）必须拒绝自签证书；显式 insecure 才接受。迁移底层 TLS 栈
+    // （native-tls → rustls）时用例保持不动，作为"行为不变"的回归证据。
+
+    /// 生成一份仅对 `localhost` 自签的 rustls 服务端配置（不依赖磁盘证书）
+    fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+        let key_pair = rcgen::KeyPair::generate().expect("generate key pair");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("build certificate params");
+        let cert = params.self_signed(&key_pair).expect("self-sign certificate");
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialized_der().to_vec())
+            .expect("private key DER");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        std::sync::Arc::new(config)
+    }
+
+    /// 起一个只接受一次握手并关闭的本地 TLS 服务端
+    async fn spawn_self_signed_tls_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tls server");
+        let addr = listener.local_addr().expect("tls server local_addr");
+        let acceptor = tokio_rustls::TlsAcceptor::from(self_signed_server_config());
+
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                // 客户端拒绝时这里会返回 Err，正是"默认校验生效"的旁证
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_connect_tls_rejects_self_signed_by_default() {
+        let addr = spawn_self_signed_tls_server().await;
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect tls server");
+
+        let result = connect_tls(tcp, "localhost", false, Duration::from_secs(5)).await;
+        assert!(
+            result.is_err(),
+            "默认配置必须拒绝自签证书（系统根证书 + 主机名校验）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_tls_accepts_self_signed_when_insecure() {
+        let addr = spawn_self_signed_tls_server().await;
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect tls server");
+
+        let result = connect_tls(tcp, "localhost", true, Duration::from_secs(5)).await;
+        assert!(
+            result.is_ok(),
+            "insecure 必须接受自签证书（HTTPS 代理接入场景），实际错误：{:?}",
+            result.err()
+        );
     }
 }

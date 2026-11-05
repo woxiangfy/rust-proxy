@@ -10,6 +10,12 @@ use std::path::PathBuf;
 // `config → logging`（单向），避免 `logging` 为了一个枚举反查配置模块。
 pub use crate::logging::LogLevel;
 
+// 声明层：配置项的唯一真源。`ServerRunArgs` / `Config` / `ServiceArgs`
+// 均由 `src/config/schema.rs` 的字段表生成，这里重导出以保持既有路径
+// `config::ServerRunArgs` / `config::Config` 不变。
+mod schema;
+pub use schema::{Config, ServerRunArgs, ServiceArgs};
+
 #[derive(Parser, Debug)]
 #[command(name = "rust-proxy")]
 #[command(about = "A simple HTTP proxy server")]
@@ -54,80 +60,6 @@ impl std::str::FromStr for ProxyProtocolMode {
             )),
         }
     }
-}
-
-#[derive(clap::Parser, Debug, Clone, Default)]
-pub struct ServerRunArgs {
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-
-    #[arg(long)]
-    pub port: Option<u16>,
-
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
-
-    #[arg(long)]
-    pub timeout: Option<u64>,
-
-    #[arg(long)]
-    pub log_level: Option<LogLevel>,
-
-    /// 启用多线程运行时（默认使用单线程）
-    #[arg(long)]
-    pub multi_thread: bool,
-
-    /// HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）
-    #[arg(long)]
-    pub https_port: Option<u16>,
-
-    /// TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供
-    #[arg(long)]
-    pub tls_cert: Option<PathBuf>,
-
-    /// TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供
-    #[arg(long)]
-    pub tls_key: Option<PathBuf>,
-
-    /// PROXY Protocol 模式（disable / auto / require）
-    ///
-    /// - `disable`：完全禁用 PROXY Protocol
-    /// - `auto`：自动检测（默认），连接开头匹配 PROXY v1/v2 签名时解析真实 IP，
-    ///   否则按普通流量处理（HTTP 直连、不带 PROXY 头的 HTTPS 均兼容）
-    /// - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
-    ///
-    /// 注意：该模式同时作为 HTTP/HTTPS 端口的缺省值；如需分别控制可在配置文件中
-    /// 使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。
-    #[arg(long, value_name = "MODE")]
-    pub proxy_protocol_mode: Option<ProxyProtocolMode>,
-
-    /// 启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
-    ///
-    /// 旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。
-    #[arg(long)]
-    pub proxy_protocol: bool,
-
-    /// PROXY Protocol 可信代理 IP 列表
-    ///
-    /// 仅当 `proxy_protocol_mode` 为 auto/require 时生效。
-    /// 仅接受来自这些 IP 的连接发送的 PROXY Protocol 头，防止客户端伪造 IP。
-    /// 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
-    #[arg(long, value_delimiter = ',')]
-    pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
-
-    /// 启用路径前缀直连模式并指定前缀（如 px）
-    ///
-    /// 启用后，请求 `http://代理地址/px/https://example.com/` 会被代理服务器
-    /// 直连到 `https://example.com/`，客户端无需配置代理即可使用（类似 gh-proxy）。
-    /// 前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。
-    #[arg(long, value_name = "PREFIX")]
-    pub path_proxy_prefix: Option<String>,
-
-    /// 路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
-    ///
-    /// 仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。
-    #[arg(long)]
-    pub path_proxy_insecure: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -187,13 +119,23 @@ pub struct RunAsServiceArgs {
 ///
 /// 通过配置文件的 `[[auth]]` 段定义。配置后，客户端必须通过 HTTP Basic 认证
 /// （携带 `Proxy-Authorization` 头）才能使用代理。
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AuthUser {
     /// 用户名
     pub username: String,
     /// 密码（明文存储于配置文件中）
     pub password: String,
+}
+
+/// 手写 `Debug`：密码不进入任何日志或调试输出（安全不变量）。
+impl std::fmt::Debug for AuthUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthUser")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 /// TLS 配置信息（证书+私钥+HTTPS监听端口）
@@ -253,6 +195,31 @@ impl Args {
     pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
     pub const DEFAULT_CONFIG_FILE: &'static str = "config.toml";
 
+    /// 启动前校验运行时配置
+    ///
+    /// 把「至少启用一个端口」与「HTTP/HTTPS 端口冲突」前移到配置层：
+    /// 错误文案保持与 `server` 原先的实现逐字一致，调用方只需在绑定端口前
+    /// 调一次。证书缺失/加载失败不在这里处理——那是自签回退路径，不是配置错误。
+    pub fn validate(&self) -> Result<()> {
+        if self.port.is_none() && self.tls.is_none() {
+            anyhow::bail!(
+                "Neither HTTP nor HTTPS proxy is enabled. Specify --port and/or --https-port."
+            );
+        }
+
+        if let (Some(http_port), Some(tls)) = (self.port, self.tls.as_ref()) {
+            if http_port == tls.https_port {
+                anyhow::bail!(
+                    "HTTP port {} conflicts with HTTPS port {}; please specify different ports",
+                    http_port,
+                    tls.https_port
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn find_default_config() -> Option<PathBuf> {
         if let Ok(current_dir) = std::env::current_dir() {
             let config_path = current_dir.join(Self::DEFAULT_CONFIG_FILE);
@@ -273,151 +240,70 @@ impl Args {
         None
     }
 
-    pub fn from_run_args(run_args: &ServerRunArgs) -> Self {
+    /// 从 CLI 子集解析出运行时配置
+    ///
+    /// 流程：加载 TOML（唯一完整模型）→ CLI 覆盖进配置 → 派生运行时视图。
+    /// 配置文件是核心信息：显式指定或自动发现到的文件读取/解析失败都直接返回错误；
+    /// 只有在完全没有找到配置文件时，才按 CLI 与默认值启动。
+    pub fn from_run_args(run_args: &ServerRunArgs) -> Result<Self> {
         let config_path = run_args.config.clone().or_else(Self::find_default_config);
-        // 配置加载失败不能静默：用户显式给了 --config 却写错路径/语法时，
-        // 静默忽略等于用默认值（无认证）继续跑，是安全上的静默降级。
-        let config = match config_path.as_ref() {
-            Some(path) => match load_config(path) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    log::error!(
-                        "Failed to load config {}: {} — continuing with command-line options only",
-                        path.display(),
-                        e
-                    );
-                    None
-                }
-            },
-            None => None,
+        let mut config = match config_path.as_ref() {
+            Some(path) => load_config(path)?,
+            None => Config::default(),
         };
+        config.apply_cli(run_args)?;
+        Ok(Self::from_config(&config, config_path.as_ref()))
+    }
 
-        let mut log_file = run_args.log_file.clone();
-        if log_file.is_none() {
-            if let Some(c) = &config {
-                if let Some(lf) = &c.log_file {
-                    log_file = Some(Self::resolve_log_file_path(lf, config_path.as_ref()));
-                }
-            }
-        }
-
-        // TLS 配置合并：命令行参数优先于配置文件
-        // 新语义（严格）：
-        //   只有用户**显式指定 https_port**（命令行 --https-port 或配置 https_port）
-        //   才启用 HTTPS 代理。即使配置了 tls_cert + tls_key，未指定 https_port 也不启用。
-        //   - https_port 已指定 + cert+key 完整 → 使用用户证书（支持热重载）
-        //   - https_port 已指定 + cert/key 缺失/无效 → 自动生成 10 年自签证书
-        //   - https_port 未指定 → 不启用 HTTPS（忽略 cert+key 配置）
-        let https_port_from_cli = run_args.https_port;
-        let https_port_from_config = config.as_ref().and_then(|c| c.https_port);
-        let https_port = https_port_from_cli.or(https_port_from_config);
-
-        let tls = if let Some(port) = https_port {
-            // 用户显式启用了 HTTPS：携带 cert/key 路径（如有的话），由 server 层决定是否回退自签
-            let cert_path = run_args
+    /// 由有效 TOML 配置派生运行时视图（默认值、端口规则、TLS、PROXY Protocol）
+    ///
+    /// 这里只做派生，不再引入第二套并行配置来源。
+    fn from_config(config: &Config, config_path: Option<&PathBuf>) -> Self {
+        // TLS 启用语义（严格）：
+        //   只有显式 https_port 才启用 HTTPS；cert/key 缺失由 server 层回退自签证书。
+        //   未指定 https_port 时忽略 cert/key。
+        let tls = config.https_port.map(|port| TlsConfig {
+            https_port: port,
+            cert_path: config
                 .tls_cert
-                .clone()
-                .or_else(|| config.as_ref().and_then(|c| c.tls_cert.clone()))
-                .map(|p| Self::resolve_path_relative_to_config(&p, config_path.as_ref()));
-            let key_path = run_args
+                .as_ref()
+                .map(|p| Self::resolve_path_relative_to_config(p, config_path)),
+            key_path: config
                 .tls_key
-                .clone()
-                .or_else(|| config.as_ref().and_then(|c| c.tls_key.clone()))
-                .map(|p| Self::resolve_path_relative_to_config(&p, config_path.as_ref()));
-            Some(TlsConfig {
-                https_port: port,
-                cert_path,
-                key_path,
-            })
-        } else {
-            // 未指定 https_port：不启用 HTTPS（即使配置了 cert/key 也忽略）
-            None
-        };
+                .as_ref()
+                .map(|p| Self::resolve_path_relative_to_config(p, config_path)),
+        });
 
-        // PROXY Protocol 全局默认模式合并优先级：
-        // 1. CLI --proxy-protocol-mode（显式指定优先级最高）
-        // 2. CLI --proxy-protocol（旧布尔参数，新语义等价于 Auto 全自动识别）
-        // 3. 配置文件 proxy_protocol_mode
-        // 4. 默认 Auto（自动检测）
-        // 之后：http/https 端口可用各自覆盖项（http_proxy_protocol / https_proxy_protocol）
-        //       覆盖全局默认，未覆盖的端口使用全局默认。
-        let global_pp = {
-            let cli_mode = run_args.proxy_protocol_mode;
-            let cli_flag = run_args.proxy_protocol;
-            let cfg_mode = config.as_ref().and_then(|c| c.proxy_protocol_mode);
+        let global_pp = config.proxy_protocol_mode.unwrap_or(ProxyProtocolMode::Auto);
 
-            if let Some(m) = cli_mode {
-                m
-            } else if cli_flag {
-                // 旧 `--proxy-protocol` 现在映射为 Auto（全自动识别），不再强制 Require，
-                // 避免 HTTP 直连流量被误判/强制解析而中断。
-                ProxyProtocolMode::Auto
-            } else if let Some(m) = cfg_mode {
-                m
-            } else {
-                ProxyProtocolMode::Auto
-            }
-        };
-
-        Args {
-            // port 合并语义：
+        Self {
+            // port 派生语义：
             //   - port 显式指定 → Some(port)
-            //   - port 未指定 + https_port 显式指定 → None（仅 HTTPS 模式，不启用 HTTP）
+            //   - port 未指定 + https_port 指定 → None（仅 HTTPS 模式，不启用 HTTP）
             //   - port 未指定 + https_port 未指定 → Some(DEFAULT_PORT)（默认仅 HTTP 模式）
-            port: match (
-                run_args.port.or(config.as_ref().and_then(|c| c.port)),
-                https_port.is_some(),
-            ) {
+            port: match (config.port, config.https_port.is_some()) {
                 (Some(p), _) => Some(p),
                 (None, true) => None,
                 (None, false) => Some(Self::DEFAULT_PORT),
             },
-            log_file,
-            timeout: run_args.timeout
-                .or(config.as_ref().and_then(|c| c.timeout))
-                .unwrap_or(Self::DEFAULT_TIMEOUT),
-            log_level: run_args.log_level
-                .or(config.as_ref().and_then(|c| c.log_level))
-                .unwrap_or(Self::DEFAULT_LOG_LEVEL),
-            multi_thread: run_args.multi_thread
-                || config.as_ref().map(|c| c.multi_thread).unwrap_or(false),
+            log_file: config
+                .log_file
+                .as_ref()
+                .map(|lf| Self::resolve_log_file_path(lf, config_path)),
+            timeout: config.timeout.unwrap_or(Self::DEFAULT_TIMEOUT),
+            log_level: config.log_level.unwrap_or(Self::DEFAULT_LOG_LEVEL),
+            multi_thread: config.multi_thread,
             // 认证信息仅来自配置文件（命令行不暴露用户名/密码）
-            auth: config.as_ref().and_then(|c| c.auth.clone()),
+            auth: config.auth.clone(),
             tls,
-            // PROXY Protocol 最终模式：http/https 端口使用全局默认或各自覆盖值
-            http_proxy_protocol: config
-                .as_ref()
-                .and_then(|c| c.http_proxy_protocol)
-                .unwrap_or(global_pp),
-            https_proxy_protocol: config
-                .as_ref()
-                .and_then(|c| c.https_proxy_protocol)
-                .unwrap_or(global_pp),
+            // PROXY Protocol：http/https 端口使用全局默认或各自覆盖值
+            http_proxy_protocol: config.http_proxy_protocol.unwrap_or(global_pp),
+            https_proxy_protocol: config.https_proxy_protocol.unwrap_or(global_pp),
             proxy_protocol: global_pp,
-            proxy_protocol_trusted_ips: {
-                let cli_ips = run_args.proxy_protocol_trusted_ips.clone();
-                if !cli_ips.is_empty() {
-                    cli_ips
-                } else {
-                    config.as_ref()
-                        .map(|c| c.proxy_protocol_trusted_ips.clone())
-                        .unwrap_or_default()
-                }
-            },
-            // 路径前缀直连模式：前缀 CLI 优先于配置文件；两个开关项取「配置 ∪ CLI」
-            path_proxy_prefix: run_args
-                .path_proxy_prefix
-                .clone()
-                .or_else(|| config.as_ref().and_then(|c| c.path_proxy_prefix.clone())),
-            path_proxy_insecure_tls: run_args.path_proxy_insecure
-                || config
-                    .as_ref()
-                    .map(|c| c.path_proxy_insecure_tls)
-                    .unwrap_or(false),
-            path_proxy_rewrite_location: config
-                .as_ref()
-                .and_then(|c| c.path_proxy_rewrite_location)
-                .unwrap_or(true),
+            proxy_protocol_trusted_ips: config.proxy_protocol_trusted_ips.clone(),
+            path_proxy_prefix: config.path_proxy_prefix.clone(),
+            path_proxy_insecure_tls: config.path_proxy_insecure_tls,
+            path_proxy_rewrite_location: config.path_proxy_rewrite_location.unwrap_or(true),
         }
     }
 
@@ -464,63 +350,6 @@ impl Args {
 
         log_file.clone()
     }
-}
-
-/// Configuration loaded from TOML file
-///
-/// `deny_unknown_fields`：拼错键名（如把 `proxy_protocol_mode` 写成
-/// `proxy_protocal_mode`）必须报错而不是被静默忽略——配置里既有代理认证也有
-/// 来源校验，静默丢一个键等于静默降低安全性。
-#[derive(Deserialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// Port to bind
-    pub port: Option<u16>,
-    /// Log file path
-    pub log_file: Option<PathBuf>,
-    /// Request timeout in seconds
-    pub timeout: Option<u64>,
-    /// Log level
-    pub log_level: Option<LogLevel>,
-    /// Use multi-threaded runtime
-    #[serde(default)]
-    pub multi_thread: bool,
-    /// 代理认证用户列表。省略整个 `[[auth]]` 段时不启用认证。
-    pub auth: Option<Vec<AuthUser>>,
-    /// HTTPS 代理监听端口（需同时配置 tls_cert 和 tls_key）
-    pub https_port: Option<u16>,
-    /// TLS 证书文件路径（PEM 格式），需与 tls_key 同时配置
-    pub tls_cert: Option<PathBuf>,
-    /// TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置
-    pub tls_key: Option<PathBuf>,
-    /// PROXY Protocol 全局默认模式（disable / auto / require）
-    ///
-    /// 均作为 HTTP/HTTPS 端口的缺省模式；若同时配置了
-    /// `http_proxy_protocol` / `https_proxy_protocol` 覆盖项，则对应端口优先使用覆盖值。
-    pub proxy_protocol_mode: Option<ProxyProtocolMode>,
-    /// HTTP 端口覆盖模式（可选；缺省回退到 `proxy_protocol_mode`）
-    ///
-    /// 典型用法：HTTP 为普通直连、HTTPS 走 PROXY Protocol 时，
-    /// 分别设 `http_proxy_protocol = "disable"`、`https_proxy_protocol = "auto"`。
-    #[serde(default)]
-    pub http_proxy_protocol: Option<ProxyProtocolMode>,
-    /// HTTPS 端口覆盖模式（可选；缺省回退到 `proxy_protocol_mode`）
-    #[serde(default)]
-    pub https_proxy_protocol: Option<ProxyProtocolMode>,
-    /// PROXY Protocol 可信代理 IP 列表（空列表表示不限制）
-    #[serde(default)]
-    pub proxy_protocol_trusted_ips: Vec<std::net::IpAddr>,
-    /// 路径前缀直连模式前缀（如 "px"）。省略即不启用该模式。
-    ///
-    /// 启用后：`http://代理地址/px/https://example.com/` → 直连 `https://example.com/`。
-    pub path_proxy_prefix: Option<String>,
-    /// 路径前缀直连模式下跳过上游 TLS 证书校验（默认 false）
-    #[serde(default)]
-    pub path_proxy_insecure_tls: bool,
-    /// 是否把 3xx 响应的 `Location` 重写为 `/<prefix>/<绝对URL>`（默认 true）
-    ///
-    /// 开启后重定向仍由本代理转发；关闭则原样透传上游 Location（客户端会直连上游）。
-    pub path_proxy_rewrite_location: Option<bool>,
 }
 
 /// Load configuration from a TOML file
@@ -582,6 +411,67 @@ password = "p@ss"
         assert_eq!(auth[0].password, "p@ss");
     }
 
+    /// 至少启用一个端口的校验：错误文案必须与 `server` 原先的实现逐字一致
+    #[test]
+    fn test_validate_requires_at_least_one_port() {
+        let args = Args {
+            port: None,
+            log_file: None,
+            timeout: Args::DEFAULT_TIMEOUT,
+            log_level: Args::DEFAULT_LOG_LEVEL,
+            multi_thread: false,
+            auth: None,
+            tls: None,
+            http_proxy_protocol: ProxyProtocolMode::Auto,
+            https_proxy_protocol: ProxyProtocolMode::Auto,
+            proxy_protocol: ProxyProtocolMode::Auto,
+            proxy_protocol_trusted_ips: Vec::new(),
+            path_proxy_prefix: None,
+            path_proxy_insecure_tls: false,
+            path_proxy_rewrite_location: true,
+        };
+        let err = args.validate().expect_err("no listener must fail");
+        assert_eq!(
+            err.to_string(),
+            "Neither HTTP nor HTTPS proxy is enabled. Specify --port and/or --https-port."
+        );
+    }
+
+    /// 端口冲突校验：仅在 HTTP 与 HTTPS 同时启用时触发
+    #[test]
+    fn test_validate_rejects_port_conflict() {
+        let run_args = ServerRunArgs {
+            port: Some(18080),
+            https_port: Some(18080),
+            ..Default::default()
+        };
+        let args = Args::from_run_args(&run_args).unwrap();
+        let err = args.validate().expect_err("port conflict must fail");
+        assert_eq!(
+            err.to_string(),
+            "HTTP port 18080 conflicts with HTTPS port 18080; please specify different ports"
+        );
+    }
+
+    /// 仅 HTTPS（无 HTTP 端口）与双端口不冲突时校验通过
+    #[test]
+    fn test_validate_allows_only_https_and_distinct_ports() {
+        let only_https = Args::from_run_args(&ServerRunArgs {
+            https_port: Some(9443),
+            ..Default::default()
+        })
+        .unwrap();
+        only_https.validate().expect("only HTTPS must be valid");
+
+        let both = Args::from_run_args(&ServerRunArgs {
+            port: Some(8080),
+            https_port: Some(9443),
+            ..Default::default()
+        })
+        .unwrap();
+        both.validate().expect("distinct ports must be valid");
+    }
+
     #[test]
     fn test_parse_tls_full_config() {
         // 完整 TLS 配置应正确解析
@@ -605,7 +495,7 @@ tls_key = "/etc/proxy/key.pem"
 
     #[test]
     fn test_parse_tls_partial_config_uses_default_port() {
-        // 仅配置证书和私钥时，https_port 为 None，由 Args 合并时使用默认 8443
+        // 仅配置证书和私钥时，https_port 为 None，不启用 HTTPS
         let toml_str = r#"
 tls_cert = "cert.pem"
 tls_key = "key.pem"
@@ -638,7 +528,7 @@ port = 8080
             tls_key: Some("/tmp/key.pem".into()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         let tls = args.tls.expect("TLS should be enabled");
         assert_eq!(tls.https_port, 9443);
         assert_eq!(
@@ -662,7 +552,7 @@ port = 8080
             tls_cert: Some("/tmp/cert.pem".into()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         let tls = args.tls.expect(
             "TLS should be enabled when https_port is explicitly set (even if only cert provided)",
         );
@@ -681,7 +571,7 @@ port = 8080
             tls_key: Some("/tmp/key.pem".into()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert!(
             args.tls.is_none(),
             "TLS must NOT be enabled when https_port is not specified, even with cert+key"
@@ -708,7 +598,7 @@ tls_key = "key.pem"
             https_port: Some(9999), // 命令行覆盖
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         let tls = args.tls.expect("TLS should be enabled");
         assert_eq!(tls.https_port, 9999, "命令行 https_port 应覆盖配置文件");
         // 证书路径应解析为配置文件目录下的相对路径
@@ -724,7 +614,7 @@ tls_key = "key.pem"
             https_port: Some(8443),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.port, None, "port must be None when only https_port is specified");
         assert!(args.tls.is_some(), "TLS must be enabled");
     }
@@ -735,7 +625,7 @@ tls_key = "key.pem"
         let run_args = ServerRunArgs {
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.port, Some(Args::DEFAULT_PORT));
         assert!(args.tls.is_none(), "TLS must be disabled when https_port not specified");
     }
@@ -748,7 +638,7 @@ tls_key = "key.pem"
             https_port: Some(8443),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.port, Some(9090), "explicit port should be preserved");
         assert!(args.tls.is_some());
     }
@@ -768,7 +658,7 @@ port = 7777
             config: Some(config_file.clone()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.port, Some(7777));
         assert!(args.tls.is_none());
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -813,7 +703,6 @@ port = 8080
         // CLI 参数应覆盖配置文件中的可信 IP
         let toml_str = r#"
 port = 8080
-proxy_protocol = true
 proxy_protocol_trusted_ips = ["10.0.0.1"]
 "#;
         let tmp_dir = std::env::temp_dir().join("test_pp_trusted_ips_dir");
@@ -831,7 +720,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1"]
             proxy_protocol_trusted_ips: cli_ips.clone(),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol_trusted_ips, cli_ips);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -853,7 +742,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol: true,
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol_trusted_ips.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -865,7 +754,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
         let run_args = ServerRunArgs {
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
     }
 
@@ -876,7 +765,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol: true,
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
     }
 
@@ -887,7 +776,7 @@ proxy_protocol_trusted_ips = ["10.0.0.1", "10.0.0.2"]
             proxy_protocol: true,
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
     }
 
@@ -906,16 +795,15 @@ proxy_protocol_mode = "auto"
             config: Some(config_file.clone()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
-    fn test_pp_mode_unknown_legacy_key_falls_back_to_auto() {
+    fn test_pp_mode_unknown_legacy_key_is_fatal() {
         // 旧的布尔 `proxy_protocol = true` 已从 Config 移除；现在它属于未知键，
-        // 会让整个配置文件解析失败（deny_unknown_fields）并打出 error 日志，
-        // 进程随后按默认值启动——默认即 Auto（全自动识别），不中断服务。
+        // 配置文件解析失败，必须直接退出而不是静默按默认值启动。
         let toml_str = r#"
 port = 8080
 proxy_protocol = true
@@ -929,8 +817,10 @@ proxy_protocol = true
             config: Some(config_file.clone()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
-        assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
+        assert!(
+            Args::from_run_args(&run_args).is_err(),
+            "unknown legacy key must fail closed"
+        );
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
@@ -953,7 +843,7 @@ https_proxy_protocol = "require"
             config: Some(config_file.clone()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         // 全局默认仍为 auto
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Auto);
         // http/https 各用覆盖值
@@ -969,7 +859,8 @@ proxy_protocol_mode = "auto"
         let args2 = Args::from_run_args(&ServerRunArgs {
             config: Some(config_file.clone()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(args2.http_proxy_protocol, ProxyProtocolMode::Auto);
         assert_eq!(args2.https_proxy_protocol, ProxyProtocolMode::Auto);
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -991,7 +882,7 @@ proxy_protocol_mode = "disable"
             config: Some(config_file.clone()),
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(args.proxy_protocol, ProxyProtocolMode::Disable);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -1090,7 +981,7 @@ path_proxy_rewrite_location = false
             path_proxy_insecure: true,
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert_eq!(
             args.path_proxy_prefix.as_deref(),
             Some("px"),
@@ -1109,7 +1000,7 @@ path_proxy_rewrite_location = false
         let run_args = ServerRunArgs {
             ..Default::default()
         };
-        let args = Args::from_run_args(&run_args);
+        let args = Args::from_run_args(&run_args).unwrap();
         assert!(args.path_proxy_prefix.is_none());
         assert!(args.path_proxy_rewrite_location, "默认应重写 Location");
     }
@@ -1189,5 +1080,59 @@ path_proxy_rewrite_location = false
         .unwrap();
         assert!(load_config(&f).is_err(), "错位的键必须报错");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── fail-closed：配置是核心信息，读取/解析失败必须退出 ───
+
+    #[test]
+    fn test_missing_explicit_config_is_fatal() {
+        let missing = std::env::temp_dir().join("rust_proxy_missing_config.toml");
+        let _ = std::fs::remove_file(&missing);
+        let run_args = ServerRunArgs {
+            config: Some(missing),
+            ..Default::default()
+        };
+        assert!(
+            Args::from_run_args(&run_args).is_err(),
+            "显式指定的配置文件不存在时必须失败"
+        );
+    }
+
+    #[test]
+    fn test_invalid_config_is_fatal_from_run_args() {
+        let dir = std::env::temp_dir().join("rust_proxy_fail_closed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        std::fs::write(&f, "proxy_protocal_mode = \"auto\"\n").unwrap();
+        let run_args = ServerRunArgs {
+            config: Some(f),
+            ..Default::default()
+        };
+        let err = Args::from_run_args(&run_args).expect_err("损坏的配置必须失败");
+        assert!(
+            format!("{err:#}").contains("Failed to parse config"),
+            "错误信息应指出解析失败：{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 敏感信息：密码不得进入 Debug/日志 ───
+
+    #[test]
+    fn test_auth_password_is_redacted_in_debug() {
+        let user = AuthUser {
+            username: "admin".into(),
+            password: "top-secret".into(),
+        };
+        let user_debug = format!("{user:?}");
+        assert!(!user_debug.contains("top-secret"));
+        assert!(user_debug.contains("***"));
+
+        let config = Config {
+            auth: Some(vec![user]),
+            ..Default::default()
+        };
+        let config_debug = format!("{config:?}");
+        assert!(!config_debug.contains("top-secret"));
     }
 }

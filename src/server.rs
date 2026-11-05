@@ -44,6 +44,9 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 启动代理服务器，根据配置可能同时监听 HTTP 和 HTTPS (TLS) 端口
 pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>) -> Result<()> {
+    // 端口存在性与冲突属于配置校验，统一在 `Args::validate` 中完成。
+    args.validate()?;
+
     // ── 根据 TLS 配置构建 TlsReloader ──
     // config 层已确保：args.tls 为 Some ⟺ 用户显式指定了 https_port
     // 因此这里只需要决定：用用户证书还是回退到自签证书
@@ -73,24 +76,6 @@ pub async fn run_server(args: &Args, shutdown_rx: Option<oneshot::Receiver<()>>)
     } else {
         None
     };
-
-    // ── 校验：HTTP 与 HTTPS 至少启用其一 ──
-    if args.port.is_none() && tls_reloader.is_none() {
-        anyhow::bail!(
-            "Neither HTTP nor HTTPS proxy is enabled. Specify --port and/or --https-port."
-        );
-    }
-
-    // ── 端口冲突检测（仅在两者都启用时检查） ──
-    if let (Some(http_port), Some(tls)) = (args.port, args.tls.as_ref()) {
-        if http_port == tls.https_port {
-            anyhow::bail!(
-                "HTTP port {} conflicts with HTTPS port {}; please specify different ports",
-                http_port,
-                tls.https_port
-            );
-        }
-    }
 
     // ── 绑定 HTTP 端口（如启用） ──
     let http_listener = if let Some(port) = args.port {

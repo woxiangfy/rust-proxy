@@ -5,12 +5,15 @@ use crate::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_pa
 use crate::config::AuthUser;
 use crate::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::http_response::write_response;
-use crate::http_util::{find_header_end, head_end_offset, is_hop_by_hop, MAX_HEAD_BYTES};
-use crate::io::PrefixedStream;
+use crate::http_util::{
+    authority_of, connection_named_headers, find_header_end, head_end_offset, is_hop_by_hop,
+    MAX_HEAD_BYTES,
+};
 use crate::net::{connect_host, is_benign_close_error, parse_host_port};
 use crate::path_proxy::{
     handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
 };
+use crate::stream::PrefixedStream;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,7 +82,7 @@ async fn handle_client_generic<S>(
     let timeout_duration = Duration::from_secs(timeout);
 
     // 读取完整请求头（含可能的 body 前缀），常见情况零拷贝复用池化缓冲区
-    let (storage, head_overflow) = match read_request_head(&mut client, &buffer_pool, timeout_duration)
+    let (storage, head_status) = match read_request_head(&mut client, &buffer_pool, timeout_duration)
         .await
     {
         Ok(s) => s,
@@ -93,26 +96,35 @@ async fn handle_client_generic<S>(
         }
     };
 
-    // 头部超过 MAX_HEAD_BYTES：畸形或恶意，必须在分派前拒绝。
-    // 历史实现把已读字节当作完整头继续处理：`head_end_offset` 找不到 `\r\n\r\n` 时
-    // 退化为 `data.len()`，于是截断的头被转发给上游——上游等不到剩余头部，代理却
-    // 已在发 body，两侧一直卡到各自超时；若截断点恰好落在合法请求行之后，还会把
-    // 畸形流量当成正常代理请求放行。
-    if head_overflow {
-        warn!(
-            "Request head from {} exceeds {} bytes, rejecting",
-            client_addr, MAX_HEAD_BYTES
-        );
-        send_head_too_large(&mut client).await;
-        return;
+    match head_status {
+        // 头部超过 MAX_HEAD_BYTES：畸形或恶意，必须在分派前拒绝。
+        // 历史实现把已读字节当作完整头继续处理：`head_end_offset` 找不到 `\r\n\r\n` 时
+        // 退化为 `data.len()`，于是截断的头被转发给上游——上游等不到剩余头部，代理却
+        // 已在发 body，两侧一直卡到各自超时；若截断点恰好落在合法请求行之后，还会把
+        // 畸形流量当成正常代理请求放行。
+        HeadStatus::Overflow => {
+            warn!(
+                "Request head from {} exceeds {} bytes, rejecting",
+                client_addr, MAX_HEAD_BYTES
+            );
+            send_head_too_large(&mut client).await;
+            return;
+        }
+        // 客户端在头结束前断开：同样不能当完整头解析。转发时 `UpstreamHead::build`
+        // 会补上结束空行，上游会把截断的头当作合法请求，客户端却已不在——
+        // 白白消耗一条到目标的连接。直接丢弃，与"读到 0 字节"的处理一致。
+        HeadStatus::Incomplete => {
+            debug!(
+                "Client {} closed before request head was complete, dropping",
+                client_addr
+            );
+            return;
+        }
+        HeadStatus::Complete => {}
     }
 
     let data = storage.as_slice();
-    if data.is_empty() {
-        return;
-    }
-
-    // 请求头结束位置（body 起始偏移）；未找到头结束符时视为整个数据都是头
+    // 请求头结束位置（body 起始偏移）；只有 `Complete` 才会走到这里，结束符必然存在
     let head_end = head_end_offset(data);
     let head = &data[..head_end];
     // 请求头为 ASCII，lossy 转换不会损坏后续二进制 body（body 按字节切片处理）
@@ -234,18 +246,30 @@ impl RequestStorage {
     }
 }
 
+/// 请求头的读取结果状态
+///
+/// "读到数据"不等于"读到了完整的头"。截断的头既不能当完整头解析，更不能转发：
+/// 转发给上游时会补上结束空行，上游把它当作合法请求处理，而代理与客户端对
+/// "这条请求到底发了什么"理解不同（历史实现在超限时就是这样把截断头送出去的，见 D5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadStatus {
+    /// 已找到 `\r\n\r\n`，可以安全解析与转发
+    Complete,
+    /// 客户端在头结束前关闭连接（EOF）：内容不完整，只能丢弃
+    Incomplete,
+    /// 达到 [`MAX_HEAD_BYTES`] 仍无结束符：畸形或恶意，回 431
+    Overflow,
+}
+
 /// 读取请求头，直到出现 `\r\n\r\n`（或达到 `MAX_HEAD_BYTES` 上限 / 客户端 EOF）。
 ///
 /// 整个读取过程受一次 `timeout` 约束，防止慢速攻击（slowloris）逐次续期。
 /// 常见情况（一次读取即含完整头）复用池化缓冲区，零拷贝。
-///
-/// 第二个返回值表示"是否因超过 [`MAX_HEAD_BYTES`] 而停止读取"。调用方必须区别对待：
-/// 超限的头部是**不完整**的，既不能当完整头解析，也不能转发（见调用点注释）。
 async fn read_request_head<S>(
     client: &mut S,
     buffer_pool: &BufferPool,
     timeout: Duration,
-) -> std::io::Result<(RequestStorage, bool)>
+) -> std::io::Result<(RequestStorage, HeadStatus)>
 where
     S: AsyncRead + Unpin,
 {
@@ -262,7 +286,7 @@ where
 async fn read_request_head_inner<S>(
     client: &mut S,
     buffer_pool: &BufferPool,
-) -> std::io::Result<(RequestStorage, bool)>
+) -> std::io::Result<(RequestStorage, HeadStatus)>
 where
     S: AsyncRead + Unpin,
 {
@@ -270,10 +294,11 @@ where
     let mut buf = buffer_pool.get();
     let n = client.read(buf.as_mut_slice()).await?;
     if n == 0 {
-        return Ok((RequestStorage::Pooled(buf, 0), false));
+        // 连接建立后一个字节都没发就关闭：按不完整处理（调用方会直接丢弃）
+        return Ok((RequestStorage::Pooled(buf, 0), HeadStatus::Incomplete));
     }
     if find_header_end(&buf.as_slice()[..n]).is_some() {
-        return Ok((RequestStorage::Pooled(buf, n), false));
+        return Ok((RequestStorage::Pooled(buf, n), HeadStatus::Complete));
     }
 
     // 慢路径：多次读取累积到堆缓冲。
@@ -284,7 +309,8 @@ where
     loop {
         let m = client.read(buf.as_mut_slice()).await?;
         if m == 0 {
-            break; // EOF：用已有数据返回
+            // EOF：已读内容里仍没有结束符 → 头是截断的，不能当完整头转发
+            return Ok((RequestStorage::Heap(data), HeadStatus::Incomplete));
         }
         data.extend_from_slice(&buf.as_slice()[..m]);
         if find_header_end(&data).is_some() {
@@ -292,10 +318,10 @@ where
         }
         if data.len() >= MAX_HEAD_BYTES {
             // 读够了上限仍未见到头结束符：标记超限，不再继续读（防慢速续期）
-            return Ok((RequestStorage::Heap(data), true));
+            return Ok((RequestStorage::Heap(data), HeadStatus::Overflow));
         }
     }
-    Ok((RequestStorage::Heap(data), false))
+    Ok((RequestStorage::Heap(data), HeadStatus::Complete))
 }
 
 /// 代理请求分类结果
@@ -478,17 +504,16 @@ async fn handle_connect_generic<S>(
     }
 }
 
-/// Handle standard HTTP proxy request with buffer reuse（泛型版本，支持 TCP/TLS 客户端流）
-///
-/// `request_data` 为已读入的全部数据（头 + 可能的 body 前缀），`head_end` 为 body 起始偏移。
-/// 请求行以 origin-form 转发给目标服务器（旧实现遗漏请求行，导致明文 HTTP 代理失效）。
-/// body 按 Content-Length / Transfer-Encoding: chunked 流式转发，支持大请求体。
 /// 一次转发的目标信息（由请求行 + 绝对 URL 解析得出）
 struct ForwardTarget<'a> {
     method: &'a str,
     url: &'a str,
+    /// 请求目标协议（分类阶段只允许 http/https；经典转发只服务 http）
+    scheme: String,
     host: String,
     port: u16,
+    /// 上游 `Host` 头值：绝对 URL 的 authority（IPv6 带方括号，显式端口保留）
+    authority: String,
     /// origin-form 请求目标：path + query，直连上游的标准形式
     origin_form: String,
 }
@@ -517,6 +542,20 @@ impl<'a> ForwardTarget<'a> {
             }
         };
 
+        // 端口按 scheme 取已知默认值：https 绝对 URL 不能落到 80（历史实现写死 80）
+        let port = match parsed.port_or_known_default() {
+            Some(p) => p,
+            None => {
+                error!(
+                    "No known default port for scheme '{}' in URL '{}' from {}",
+                    parsed.scheme(),
+                    url,
+                    client_addr
+                );
+                return None;
+            }
+        };
+
         let origin_form = match parsed.query() {
             Some(q) => format!("{}?{}", parsed.path(), q),
             None => parsed.path().to_string(),
@@ -525,8 +564,10 @@ impl<'a> ForwardTarget<'a> {
         Some(Self {
             method,
             url,
+            scheme: parsed.scheme().to_string(),
             host,
-            port: parsed.port().unwrap_or(80),
+            port,
+            authority: authority_of(&parsed),
             origin_form,
         })
     }
@@ -548,6 +589,9 @@ impl UpstreamHead {
     /// 按 `head_str` 构造上游请求头；分帧信息自相矛盾时返回 `None`
     ///
     /// 过滤规则：
+    /// - `Host` → 按绝对 URL 的 authority 重写 / 补写（RFC 7230 §5.4：收到 absolute-form
+    ///   请求时，代理必须忽略客户端的 `Host` 并改用请求目标的 host）。客户端漏发 `Host`
+    ///   时同样补上，否则 HTTP/1.1 上游会直接回 400
     /// - `Connection` → 改写为 `close`（本代理每个请求独占一条上游连接）
     /// - `Proxy-Connection` / `Proxy-Authorization` / `Keep-Alive` / `TE` / `Trailer` /
     ///   `Upgrade` 等逐跳头 → 丢弃（[`is_hop_by_hop`]，RFC 7230 §6.1）
@@ -572,6 +616,13 @@ impl UpstreamHead {
         bytes.push(' ');
         bytes.push_str(&target.origin_form);
         bytes.push_str(" HTTP/1.1\r\n");
+        bytes.push_str("Host: ");
+        bytes.push_str(&target.authority);
+        bytes.push_str("\r\n");
+
+        // `Connection: X-Foo` 点名的字段同样是逐跳头（RFC 7230 §6.1），
+        // 必须在遍历前先收集，否则名字在头尾不同位置时过滤结果会不稳定
+        let connection_named = connection_named_headers(head_str);
 
         let mut content_length: Option<u64> = None;
         let mut content_length_conflict = false;
@@ -593,6 +644,10 @@ impl UpstreamHead {
             let name = name.trim();
             let value = value.trim();
 
+            if name.eq_ignore_ascii_case("host") {
+                // 已按绝对 URL 的 authority 输出，客户端的 Host 一律忽略
+                continue;
+            }
             if name.eq_ignore_ascii_case("connection") {
                 bytes.push_str("Connection: close\r\n");
                 continue;
@@ -623,7 +678,7 @@ impl UpstreamHead {
                 expect_continue = value.eq_ignore_ascii_case("100-continue");
                 continue;
             }
-            if is_hop_by_hop(name) {
+            if is_hop_by_hop(name, &connection_named) {
                 continue;
             }
             bytes.push_str(line);
@@ -818,6 +873,19 @@ async fn handle_http_request_generic<S>(
         return;
     };
 
+    // 经典代理只服务明文 http。`https://` absolute-form 是客户端用错了协议：
+    // 访问 https 站点必须先 CONNECT 建隧道、再在隧道内做 TLS，而不是把绝对 URL
+    // 直接交给明文代理。这里直接 400，既不连接 443（明文打到 TLS 端口必然失败），
+    // 也不假装成功，省掉一次注定失败的上游连接。
+    if target.scheme != "http" {
+        warn!(
+            "{} -> unsupported scheme '{}' in absolute-form (use CONNECT for https)",
+            client_addr, target.scheme
+        );
+        send_bad_request(&mut client).await;
+        return;
+    }
+
     info!(
         "{} -> {} {}:{} -> {}",
         client_addr, target.method, target.host, target.port, target.url
@@ -882,6 +950,9 @@ async fn handle_http_request_generic<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     // ─── classify_proxy_request 反扫描测试 ───
 
@@ -996,6 +1067,7 @@ Host: example.com
         assert_eq!(t.host, "example.com");
         assert_eq!(t.port, 80, "缺省端口应为 80");
         assert_eq!(t.origin_form, "/a/b?x=1", "query 必须保留");
+        assert_eq!(t.authority, "example.com", "缺省端口不应写进 Host");
     }
 
     #[test]
@@ -1007,6 +1079,17 @@ Host: example.com
         assert_eq!(t.port, 8080);
         assert_eq!(t.host, "127.0.0.1");
         assert_eq!(t.origin_form, "/p");
+    }
+
+    #[test]
+    fn test_forward_target_marks_https_scheme_with_known_default_port() {
+        // URL 解析层仍按 scheme 求默认端口（https → 443），但经典代理入口据 `scheme`
+        // 拒绝 https absolute-form（见 `handle_http_request_generic` 与
+        // `https_absolute_form_is_rejected_with_400`）
+        let head = "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let t = ForwardTarget::parse(head, addr()).expect("https absolute URL must parse");
+        assert_eq!(t.scheme, "https");
+        assert_eq!(t.port, 443);
     }
 
     #[test]
@@ -1031,6 +1114,13 @@ Host: example.com
         let up = UpstreamHead::build(&target, head).unwrap();
 
         assert!(up.bytes.starts_with("GET /x HTTP/1.1\r\n"), "请求行应改写为 origin-form");
+        assert_eq!(
+            up.bytes.matches("Host: ").count(),
+            1,
+            "客户端 Host 必须被替换而不是重复输出：{}",
+            up.bytes
+        );
+        assert!(up.bytes.contains("Host: example.com\r\n"), "Host 由绝对 URL 决定");
         assert!(up.bytes.contains("Connection: close\r\n"), "Connection 必须改写为 close");
         assert!(!up.bytes.to_ascii_lowercase().contains("proxy-authorization"), "凭据不得上游化");
         assert!(!up.bytes.to_ascii_lowercase().contains("proxy-connection"), "代理专用头应丢弃");
@@ -1038,6 +1128,63 @@ Host: example.com
         assert!(up.bytes.ends_with("\r\n\r\n"), "头部必须以空行结束");
         assert!(!up.chunked);
         assert_eq!(up.content_length, None);
+    }
+
+    // ─── Host 头（RFC 7230 §5.4：absolute-form 必须以请求目标的 host 为准） ───
+
+    #[test]
+    fn test_upstream_head_rewrites_host_from_absolute_url() {
+        // 客户端 Host 与 URL 不一致（如把代理地址写进 Host）：一律以 URL 为准
+        let head = "GET http://example.com:8080/p HTTP/1.1\r\nHost: 10.0.0.1:3128\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.bytes.contains("Host: example.com:8080\r\n"), "显式端口必须保留");
+        assert!(!up.bytes.contains("10.0.0.1"), "客户端的 Host 不得转发：{}", up.bytes);
+    }
+
+    #[test]
+    fn test_upstream_head_inserts_host_when_client_omits_it() {
+        // HTTP/1.1 上游要求 Host；客户端漏发时由代理补写，否则上游直接 400
+        let head = "GET http://example.com/p HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.bytes.contains("Host: example.com\r\n"), "缺失 Host 必须补写");
+        assert!(up.bytes.contains("Accept: */*\r\n"));
+    }
+
+    #[test]
+    fn test_upstream_head_host_brackets_ipv6() {
+        let head = "GET http://[::1]:8080/p HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(up.bytes.contains("Host: [::1]:8080\r\n"), "IPv6 authority 必须带方括号");
+    }
+
+    /// `Connection` 里点名的自定义字段同样是逐跳头（RFC 7230 §6.1）
+    #[test]
+    fn test_upstream_head_drops_connection_named_headers() {
+        let head = "GET http://example.com/x HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Connection: close, X-Hop\r\n\
+                    X-Hop: secret\r\n\
+                    X-Keep: ok\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        let lower = up.bytes.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-hop"),
+            "Connection 点名的头必须丢弃：{}",
+            up.bytes
+        );
+        assert!(up.bytes.contains("X-Keep: ok\r\n"), "未点名的端到端头必须保留");
+        assert_eq!(
+            lower.matches("connection:").count(),
+            1,
+            "只保留代理改写的 Connection: close"
+        );
     }
 
     #[test]
@@ -1172,16 +1319,118 @@ Host: example.com
         assert!(up.bytes.contains("Accept: */*\r\n"), "端到端头必须保留");
     }
 
+    // ─── 慢速头（slowloris）──────────────────────────────
+
+    /// 慢速滴水客户端：每 `interval` 才吐 1 字节。
+    ///
+    /// 关键在于**每次读取都真的等待**：如果实现把 deadline 重置到每次 `read` 上，
+    /// 这个读取器就能一直续期、永远读不完；只有「整段读取共享一个 deadline」才会超时。
+    struct DripReader {
+        data: Vec<u8>,
+        pos: usize,
+        interval: Duration,
+        delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl DripReader {
+        fn new(data: Vec<u8>, interval: Duration) -> Self {
+            Self {
+                data,
+                pos: 0,
+                interval,
+                delay: None,
+            }
+        }
+    }
+
+    impl AsyncRead for DripReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            if me.pos >= me.data.len() {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            let interval = me.interval;
+            let delay = me
+                .delay
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(interval)));
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            me.delay = None;
+            buf.put_slice(&me.data[me.pos..me.pos + 1]);
+            me.pos += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 慢速滴水必须在**整体** deadline 处放弃，而不是被逐次读取续期。
+    ///
+    /// 用 `start_paused` 的虚拟时钟：每秒 1 字节、200 字节的头，若逐次续期要 200 秒；
+    /// 虚拟时间下断言的是「恰好 5 秒放弃」，既不真实等待也不受机器快慢影响。
+    #[tokio::test(start_paused = true)]
+    async fn test_read_request_head_times_out_on_slow_drip() {
+        let pool = BufferPool::new();
+        let head = format!(
+            "GET http://a.com/ HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+            "a".repeat(200)
+        );
+        let total = head.len();
+        let mut reader = DripReader::new(head.into_bytes(), Duration::from_secs(1));
+
+        let start = tokio::time::Instant::now();
+        let err = match read_request_head(&mut reader, &pool, Duration::from_secs(5)).await {
+            Ok(_) => panic!("慢速滴水必须超时，不能一直等到读完 {total} 字节"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(5),
+            "整体 deadline 必须生效，不能被逐次读取续期"
+        );
+        assert!(
+            reader.pos < total,
+            "超时时请求头只应收到 {} / {} 字节",
+            reader.pos,
+            total
+        );
+    }
+
+    /// 对照组：同样逐字节到达，但在 deadline 内读完必须成功。
+    ///
+    /// 没有这条，上一条用例可能只是因为「分片就读不出来」而通过。
+    #[tokio::test(start_paused = true)]
+    async fn test_read_request_head_accepts_slow_but_within_deadline() {
+        let pool = BufferPool::new();
+        let head = format!(
+            "GET http://a.com/ HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+            "a".repeat(200)
+        );
+        let mut reader = DripReader::new(head.as_bytes().to_vec(), Duration::from_millis(1));
+
+        let (storage, status) = read_request_head(&mut reader, &pool, Duration::from_secs(5))
+            .await
+            .expect("deadline 内读完应成功");
+
+        assert_eq!(status, HeadStatus::Complete);
+        assert_eq!(storage.as_slice(), head.as_bytes());
+    }
+
     #[tokio::test]
     async fn test_read_request_head_flags_overflow_only_when_incomplete() {
         let pool = BufferPool::new();
 
         // 完整头（含结束符）：不标记超限
         let mut complete = &b"GET http://a.com/ HTTP/1.1\r\nHost: a.com\r\n\r\n"[..];
-        let (storage, overflow) = read_request_head(&mut complete, &pool, Duration::from_secs(1))
+        let (storage, status) = read_request_head(&mut complete, &pool, Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(!overflow, "完整头不得判为超限");
+        assert_eq!(status, HeadStatus::Complete, "完整头不得判为超限");
         assert!(storage.as_slice().ends_with(b"\r\n\r\n"));
 
         // 顶满上限仍无结束符：必须标记超限——否则调用方会把截断的头当成完整头转发
@@ -1189,9 +1438,75 @@ Host: example.com
         big.extend_from_slice(b"GET http://a.com/ HTTP/1.1\r\nX-Pad: ");
         big.resize(MAX_HEAD_BYTES, b'a');
         let mut incomplete = &big[..];
-        let (_, overflow) = read_request_head(&mut incomplete, &pool, Duration::from_secs(1))
+        let (_, status) = read_request_head(&mut incomplete, &pool, Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(overflow, "读满 {MAX_HEAD_BYTES} 字节仍无结束符必须标记超限");
+        assert_eq!(
+            status,
+            HeadStatus::Overflow,
+            "读满 {MAX_HEAD_BYTES} 字节仍无结束符必须标记超限"
+        );
+    }
+
+    /// 客户端在头结束前关闭：状态必须是 `Incomplete`，调用方据此丢弃。
+    ///
+    /// 这条与超限用例区分开：截断的原因不同（EOF vs 长度上限），处理方式也不同
+    /// （静默丢弃 vs 回 431），但共同点是**都不能当完整头解析或转发**。
+    #[tokio::test]
+    async fn test_read_request_head_marks_eof_truncated_head_incomplete() {
+        let pool = BufferPool::new();
+        let mut partial = &b"GET http://a.com/ HTTP/1.1\r\nHost: a.com"[..];
+        let (storage, status) = read_request_head(&mut partial, &pool, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(status, HeadStatus::Incomplete);
+        assert_eq!(
+            storage.as_slice(),
+            b"GET http://a.com/ HTTP/1.1\r\nHost: a.com",
+            "已读字节仍需保留，供调用方记录日志"
+        );
+    }
+
+    /// `https://` absolute-form 必须以 400 拒绝，且**不能尝试连接上游**
+    ///
+    /// 用一个不可能连通的 host（`example.com` 的解析在单测里不保证成功，但即使成功
+    /// 也会因为 400 提前返回）即可证明"先拒绝、后连接"的顺序：响应在 handler 内部
+    /// 立刻写完，不依赖任何网络。
+    #[tokio::test]
+    async fn test_https_absolute_form_is_rejected_with_400() {
+        let (client, mut proxy_side) = tokio::io::duplex(4096);
+        let request = b"GET https://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        handle_http_request_generic(
+            client,
+            request,
+            request.len(),
+            addr(),
+            Duration::from_secs(1),
+            BufferPool::new(),
+        )
+        .await;
+
+        let mut resp = Vec::new();
+        proxy_side
+            .read_to_end(&mut resp)
+            .await
+            .expect("read 400 response from handler");
+
+        let status_line = String::from_utf8_lossy(&resp)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            status_line, "HTTP/1.1 400 Bad Request",
+            "https absolute-form 必须回 400，实际：{:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert!(
+            !String::from_utf8_lossy(&resp).contains("Server:"),
+            "错误响应不得暴露指纹头"
+        );
     }
 }

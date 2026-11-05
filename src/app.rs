@@ -93,7 +93,7 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
     // 仅 Start 命令支持多线程运行时，Test 和 Server 管理命令始终使用单线程
     match cli.command {
         Commands::Start(start_args) => {
-            let args = Args::from_run_args(&start_args);
+            let args = Args::from_run_args(&start_args)?;
             logging::setup_logging(&args.log_file, &args.log_level)?;
             let runtime = create_runtime(args.multi_thread)?;
             let shutdown_rx = spawn_shutdown_signal(&runtime)?;

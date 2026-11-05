@@ -11,21 +11,22 @@
 //!
 //! ```text
 //! 叶子层（无内部依赖）：
-//!   buffer_pool  io  net  http_util  http_body  http_response  logging
+//!   buffer_pool  stream  net  http_util  http_body  http_response  logging
 //!
 //! 中层：
 //!   config   → logging
 //!   auth     → config, http_response
 //!   tls      → buffer_pool
-//!   client   → net                    （`test-proxy` 自检客户端）
+//!   tls_client            （客户端 TLS：自检客户端 / 路径模式上游共用）
+//!   client   → net, tls_client        （`test-proxy` 自检客户端）
 //!
 //! 处理层：
-//!   proxy        → auth, path_proxy, http_body, http_util, http_response, net, io, buffer_pool
-//!   path_proxy   → net, http_body, http_util, http_response, buffer_pool
-//!   proxy_protocol → io
+//!   proxy        → auth, path_proxy, http_body, http_util, http_response, net, stream, buffer_pool
+//!   path_proxy   → net, http_body, http_util, http_response, buffer_pool, tls_client
+//!   proxy_protocol → stream
 //!
 //! 装配层：
-//!   server → tls, proxy_protocol, proxy, path_proxy, config, buffer_pool, io
+//!   server → tls, proxy_protocol, proxy, path_proxy, config, buffer_pool, stream
 //!   service → config, logging, server
 //!   app    → 以上全部 + clap 分派
 //! ```
@@ -38,7 +39,6 @@ pub mod config;
 pub mod http_body;
 pub mod http_response;
 pub mod http_util;
-pub mod io;
 pub mod logging;
 pub mod net;
 pub mod path_proxy;
@@ -46,4 +46,6 @@ pub mod proxy;
 pub mod proxy_protocol;
 pub mod server;
 pub mod service;
+pub mod stream;
 pub mod tls;
+pub mod tls_client;

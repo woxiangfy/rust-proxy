@@ -33,7 +33,7 @@ use std::time::Duration;
 use log::{debug, warn};
 
 use crate::config::ProxyProtocolMode;
-use crate::io::PrefixedStream;
+use crate::stream::PrefixedStream;
 
 /// PROXY Protocol v2 签名（12 字节）
 const PP_V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";

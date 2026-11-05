@@ -17,6 +17,10 @@
 //! 10. 超长请求头：超过 64KB 回 431，且不把截断的头转发给上游
 //! 11. 分帧头互斥：`Content-Length` 与 `Transfer-Encoding` 并存时丢弃 CL，
 //!     多个不一致的 CL 回 400（请求走私面）
+//! 12. `Host` 头按绝对 URL 重写 / 缺失时补写（RFC 7230 §5.4）
+//! 13. 截断的请求头（客户端发完半截就关闭）直接丢弃，不转发给上游
+//! 14. 经典代理收到 `https://` absolute-form 直接回 400，不尝试连接（https 必须走 CONNECT）
+//! 15. `Connection` 头点名的自定义逐跳字段不转发给上游（RFC 7230 §6.1）
 //!
 //! 全部走 loopback，不依赖外网，可在 CI 稳定运行。
 
@@ -27,7 +31,6 @@ use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tokio_native_tls::{native_tls, TlsConnector};
 
 use rust_proxy::config::{Args, AuthUser, LogLevel, ProxyProtocolMode};
 use rust_proxy::server;
@@ -113,16 +116,33 @@ async fn spawn_tls_proxy(args: Args) -> Proxy {
 }
 
 /// 与代理建立 TLS 连接（自签证书，跳过验证）
-async fn connect_tls(addr: SocketAddr) -> tokio_native_tls::TlsStream<TcpStream> {
-    let mut builder = native_tls::TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    let connector = TlsConnector::from(builder.build().expect("build tls connector"));
+///
+/// 客户端 TLS 统一走 crate 内的 rustls 配置（与自检客户端同一份实现），
+/// 这里显式用 insecure 分支以接受 `tls::self_signed` 生成的测试证书。
+async fn connect_tls(addr: SocketAddr) -> tokio_rustls::client::TlsStream<TcpStream> {
     let tcp = TcpStream::connect(addr).await.expect("connect tls proxy");
-
-    tokio::time::timeout(IO_TIMEOUT, connector.connect("localhost", tcp))
+    rust_proxy::tls_client::connect_tls(tcp, "localhost", true, IO_TIMEOUT)
         .await
-        .expect("tls handshake timed out")
         .expect("tls handshake failed")
+}
+
+/// 读取 TLS 响应直到连接关闭
+///
+/// 代理在本项目里的连接收尾是"直接关 TCP"，不会发送 TLS `close_notify`；
+/// rustls 客户端会把它报成 `UnexpectedEof`。这与 native-tls 时代的 `Ok(0)` 语义相同，
+/// 因此按正常 EOF 处理（响应完整性由后续状态行/body 断言保证）。
+async fn read_tls_response<S>(sock: &mut S) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut resp = Vec::new();
+    match tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Ok(Err(e)) => panic!("read tls response failed: {e}"),
+        Err(_) => panic!("tls response timed out"),
+    }
+    resp
 }
 
 /// 假上游：读完整请求头后，把请求头原文回显进响应体，便于断言 Host / 路径 / 头部过滤
@@ -635,11 +655,7 @@ async fn tls_listener_proxies_and_keeps_anti_scan() {
     sock.write_all(req.as_bytes())
         .await
         .expect("write over tls");
-    let mut resp = Vec::new();
-    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp))
-        .await
-        .expect("tls response timed out")
-        .expect("read tls response");
+    let resp = read_tls_response(&mut sock).await;
 
     assert_eq!(status_code(&resp), 200, "TLS 下应正常转发");
     assert!(
@@ -653,11 +669,7 @@ async fn tls_listener_proxies_and_keeps_anti_scan() {
     sock.write_all(b"GET / HTTP/1.1\r\nHost: whatever\r\nConnection: close\r\n\r\n")
         .await
         .expect("write scan over tls");
-    let mut resp = Vec::new();
-    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp))
-        .await
-        .expect("scan response timed out")
-        .expect("read scan response");
+    let resp = read_tls_response(&mut sock).await;
 
     assert_eq!(status_code(&resp), 404);
     let lower = String::from_utf8_lossy(&resp).to_lowercase();
@@ -857,5 +869,185 @@ async fn conflicting_duplicate_content_length_returns_400() {
     assert!(
         !body_of(&resp).contains("/ambiguous"),
         "畸形请求不得转发到上游"
+    );
+}
+
+/// 链路 12：`Host` 头必须以请求目标的 authority 为准
+///
+/// RFC 7230 §5.4：代理收到 absolute-form 请求时必须忽略客户端的 `Host`，改用请求目标
+/// 的 host；客户端漏发 `Host` 时也要补写（HTTP/1.1 上游没有 `Host` 直接回 400）。
+/// 历史实现原样透传客户端的 `Host`，客户端只要填错就会让上游收到错误的虚拟主机名。
+#[tokio::test]
+async fn classic_proxy_rewrites_and_synthesizes_host() {
+    let origin = spawn_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    // (a) 客户端 Host 与 URL 不一致 → 以 URL 为准
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET http://{origin}/host HTTP/1.1\r\nHost: wrong.example:9999\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 200);
+    let upstream_head = body_of(&resp).to_lowercase();
+    assert!(
+        upstream_head.contains(&format!("host: {origin}\r\n")),
+        "Host 必须按绝对 URL 重写，实际上游收到：{upstream_head}"
+    );
+    assert!(
+        !upstream_head.contains("wrong.example"),
+        "客户端的 Host 不得转发给上游：{upstream_head}"
+    );
+
+    // (b) 客户端完全没发 Host → 代理补写
+    let resp = request_raw(
+        proxy.addr,
+        format!("GET http://{origin}/no-host HTTP/1.1\r\nUser-Agent: e2e\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 200);
+    let upstream_head = body_of(&resp).to_lowercase();
+    assert!(
+        upstream_head.contains(&format!("host: {origin}\r\n")),
+        "缺失 Host 必须补写，实际上游收到：{upstream_head}"
+    );
+}
+
+/// 链路 13：客户端在请求头结束前关闭 → 直接丢弃
+///
+/// 旧实现把 EOF 当作"头已读完"，`UpstreamHead::build` 还会补上结束空行，
+/// 于是半截头被当成合法请求发给上游（客户端早已不在，白耗一条上游连接）。
+/// 断言"代理不回应且不转发"：旧实现会返回 200 回显，新实现读到的是空响应。
+#[tokio::test]
+async fn truncated_request_head_is_not_forwarded() {
+    let origin = spawn_origin().await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let mut sock = TcpStream::connect(proxy.addr)
+        .await
+        .expect("connect proxy");
+    sock.write_all(format!("GET http://{origin}/partial HT").as_bytes())
+        .await
+        .expect("write partial head");
+    sock.shutdown().await.expect("close write half");
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut resp))
+        .await
+        .expect("proxy must close the connection after a truncated head")
+        .expect("read response after truncated head");
+    assert!(
+        resp.is_empty(),
+        "截断的请求头不得被转发或回应，实际：{:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
+/// 链路 14：`https://` absolute-form 必须以 400 拒绝，而不是尝试连接
+///
+/// 经典代理只服务明文 http；访问 https 站点必须先 CONNECT。这里特意指向一个
+/// **已释放的端口**：如果代理仍然去连接，会得到 502（而不是 400），据此可以
+/// 区分"未连接"与"连接失败"。同一条用例再跑一次普通 http absolute-form，
+/// 确认拒绝逻辑没有误伤正常转发。
+#[tokio::test]
+async fn https_absolute_form_is_rejected_with_400() {
+    // 取一个已释放的本地端口：监听后立即 drop，端口处于"无人监听"
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temporary listener");
+        listener.local_addr().expect("temporary local_addr")
+    };
+    let proxy = spawn_proxy(base_args()).await;
+
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET https://{dead}/secure HTTP/1.1\r\nHost: {dead}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        status_code(&resp),
+        400,
+        "https absolute-form 必须回 400（若尝试连接会变成 502），实际：{:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let body = body_of(&resp);
+    assert!(
+        !body.contains("502 Bad Gateway"),
+        "不应出现上游连接失败的痕迹：{body}"
+    );
+
+    // 对照：普通 http absolute-form 不受影响
+    let origin = spawn_origin().await;
+    let resp = request_raw(
+        proxy.addr,
+        format!("GET http://{origin}/ok HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 200, "http absolute-form 仍应正常转发");
+}
+
+/// 链路 15：`Connection` 头点名的自定义逐跳字段不得转发给上游
+///
+/// RFC 7230 §6.1：`Connection: X-Hop` 表示 `X-Hop` 只对当前这一跳有效，代理必须连同
+/// `Connection` 一起丢弃。仅过滤固定名单（Keep-Alive / Proxy-* / TE 等）会漏掉这类
+/// 自定义字段，等于把上一跳的私有语义泄漏给上游。两条建头链路（经典代理与路径前缀
+/// 直连）共用同一套判定，因此同一条用例两处都验。
+#[tokio::test]
+async fn connection_named_headers_are_not_forwarded() {
+    let origin = spawn_origin().await;
+
+    // (a) 经典代理（absolute-form）
+    let proxy = spawn_proxy(base_args()).await;
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET http://{origin}/hop HTTP/1.1\r\nHost: {origin}\r\nConnection: close, X-Hop\r\nX-Hop: leak\r\nX-Keep: ok\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 200);
+    let upstream_head = body_of(&resp).to_lowercase();
+    assert!(
+        !upstream_head.contains("x-hop: leak"),
+        "Connection 点名的字段必须丢弃，实际上游收到：{upstream_head}"
+    );
+    assert!(
+        upstream_head.contains("x-keep: ok"),
+        "未被点名的字段必须保留，实际上游收到：{upstream_head}"
+    );
+
+    // (b) 路径前缀直连（origin-form）
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let path_proxy = spawn_proxy(args).await;
+    let resp = request_raw(
+        path_proxy.addr,
+        format!(
+            "GET /px/http://{origin}/hop HTTP/1.1\r\nHost: {}\r\nConnection: close, X-Hop\r\nX-Hop: leak\r\nX-Keep: ok\r\n\r\n",
+            path_proxy.addr
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 200);
+    let upstream_head = body_of(&resp).to_lowercase();
+    assert!(
+        !upstream_head.contains("x-hop: leak"),
+        "路径前缀直连同样必须丢弃 Connection 点名的字段：{upstream_head}"
+    );
+    assert!(
+        upstream_head.contains("x-keep: ok"),
+        "路径前缀直连也必须保留未被点名的字段：{upstream_head}"
     );
 }

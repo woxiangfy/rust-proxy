@@ -20,10 +20,13 @@ use service_manager::{
     ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::{RunAsServiceArgs, ServerRunArgs};
+
+/// 服务参数适配层（`ServiceArgs` 的构造与 argv 序列化）
+mod args;
 
 #[cfg(windows)]
 mod windows;
@@ -61,19 +64,6 @@ fn native_manager() -> Result<Box<dyn ServiceManager>> {
     <dyn ServiceManager>::native().context("Failed to detect service management platform")
 }
 
-/// 相对路径 → 绝对路径（不要求目标存在）
-///
-/// 服务进程的工作目录由 SCM / systemd 决定，相对路径到那时会指向别处，
-/// 因此安装时一次性转成绝对路径。
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    Ok(std::env::current_dir()
-        .context("Failed to get current directory")?
-        .join(path))
-}
-
 /// 解析服务模式下的运行参数
 ///
 /// 系统服务启动时（Windows SCM / systemd），命令行由 [`install_service`] 生成，
@@ -84,17 +74,27 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 /// 相比此前手写的逐参数 `match`，新增一个 flag 时只需改 `ServerRunArgs` 一处，
 /// 不会再出现"CLI 支持、服务模式静默丢配置"的漏项。
 ///
-/// 解析失败（例如人工追加了未知参数）时告警并回退默认值：服务模式下没有终端可交互，
-/// 直接退出会让系统服务反复重启，回退到"仅用配置文件"更可控。
-fn parse_service_args() -> ServerRunArgs {
-    match RunAsServiceArgs::try_parse_from(std::env::args_os()) {
-        Ok(parsed) => parsed.run_args,
+/// 解析失败时 **fail-fast**：打印明确 error 并返回错误（进程以非零码退出）。
+/// clap 的错误文本会指出具体参数（`--port` / 未知参数名），错误信息直接复用，
+/// 避免"服务静默按默认值启动、认证配置丢失"的 fail-open 风险。
+fn parse_service_args() -> Result<ServerRunArgs> {
+    parse_service_args_from(std::env::args_os())
+}
+
+/// [`parse_service_args`] 的可测试版本：从给定 argv 解析服务模式参数
+///
+/// 单独抽出是为了在不篡改进程全局 argv 的情况下覆盖失败路径（单元测试只能
+/// 安全地传自定义参数）。错误文案包含具体失败参数，便于服务日志定位。
+fn parse_service_args_from<I, T>(argv: I) -> Result<ServerRunArgs>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    match RunAsServiceArgs::try_parse_from(argv) {
+        Ok(parsed) => Ok(parsed.run_args),
         Err(e) => {
-            log::warn!(
-                "Failed to parse service-mode arguments ({}); falling back to defaults",
-                e
-            );
-            ServerRunArgs::default()
+            log::error!("Failed to parse service-mode arguments: {}", e);
+            Err(anyhow::anyhow!("Invalid service-mode arguments: {}", e))
         }
     }
 }
@@ -111,88 +111,9 @@ fn build_service_command(run_args: &ServerRunArgs) -> Result<(PathBuf, PathBuf, 
         .context("Failed to get executable directory")?
         .to_path_buf();
 
-    let mut command_args = vec![OsString::from("--run-as-service")];
-
-    // 配置文件额外 canonicalize：它必须存在，且服务进程的解析起点不同，
-    // 相对路径在装载时会指向别处（表现为"配了认证但服务没生效"）。
-    if let Some(config) = &run_args.config {
-        let config = absolute_path(config)?
-            .canonicalize()
-            .context("Failed to canonicalize config path")?;
-        command_args.push(OsString::from("--config"));
-        command_args.push(OsString::from(config.display().to_string()));
-    }
-
-    if let Some(port) = run_args.port {
-        command_args.push(OsString::from("--port"));
-        command_args.push(OsString::from(port.to_string()));
-    }
-
-    if let Some(log_file) = &run_args.log_file {
-        let log_file = absolute_path(log_file)?;
-        command_args.push(OsString::from("--log-file"));
-        command_args.push(OsString::from(log_file.display().to_string()));
-    }
-
-    if let Some(timeout) = run_args.timeout {
-        command_args.push(OsString::from("--timeout"));
-        command_args.push(OsString::from(timeout.to_string()));
-    }
-
-    if let Some(log_level) = run_args.log_level {
-        command_args.push(OsString::from("--log-level"));
-        command_args.push(OsString::from(log_level.to_string()));
-    }
-
-    // HTTPS/TLS 配置参数
-    if let Some(https_port) = run_args.https_port {
-        command_args.push(OsString::from("--https-port"));
-        command_args.push(OsString::from(https_port.to_string()));
-    }
-    if let Some(tls_cert) = &run_args.tls_cert {
-        let tls_cert = absolute_path(tls_cert)?;
-        command_args.push(OsString::from("--tls-cert"));
-        command_args.push(OsString::from(tls_cert.display().to_string()));
-    }
-    if let Some(tls_key) = &run_args.tls_key {
-        let tls_key = absolute_path(tls_key)?;
-        command_args.push(OsString::from("--tls-key"));
-        command_args.push(OsString::from(tls_key.display().to_string()));
-    }
-
-    if let Some(pp_mode) = run_args.proxy_protocol_mode {
-        command_args.push(OsString::from("--proxy-protocol-mode"));
-        command_args.push(OsString::from(pp_mode.to_string()));
-    } else if run_args.proxy_protocol {
-        command_args.push(OsString::from("--proxy-protocol"));
-    }
-
-    if !run_args.proxy_protocol_trusted_ips.is_empty() {
-        let ips_str = run_args
-            .proxy_protocol_trusted_ips
-            .iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        command_args.push(OsString::from("--proxy-protocol-trusted-ips"));
-        command_args.push(OsString::from(ips_str));
-    }
-
-    // 路径前缀直连模式
-    if let Some(prefix) = &run_args.path_proxy_prefix {
-        command_args.push(OsString::from("--path-proxy-prefix"));
-        command_args.push(OsString::from(prefix));
-    }
-    if run_args.path_proxy_insecure {
-        command_args.push(OsString::from("--path-proxy-insecure"));
-    }
-
-    // `--multi-thread` 此前漏传：安装时指定了多线程，服务进程仍跑单线程运行时
-    // （`ServerRunArgs::default()` 的 `multi_thread = false`），而 CLI 侧一直被
-    // 告知该选项有效。
-    if run_args.multi_thread {
-        command_args.push(OsString::from("--multi-thread"));
-    }
+    // argv 拼装全部收敛到 `ServiceArgs::to_argv`（见 `service/args.rs`），
+    // 这里只负责定位可执行文件与工作目录。
+    let command_args = crate::config::ServiceArgs::from_run_args(run_args).to_argv()?;
 
     Ok((exe_path, exe_dir, command_args))
 }
@@ -309,6 +230,169 @@ pub fn status_service() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// 快照夹具目录（与 `tests/config_golden.rs` 共用）
+    fn golden_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config_golden")
+            .join(name)
+    }
+
+    /// 断言/更新服务 argv 金标准
+    ///
+    /// `UPDATE_GOLDEN=1` 时写入基线；其余情况只读。
+    fn assert_golden(name: &str, actual: &str) {
+        let path = golden_path(name);
+        let actual = actual.replace("\r\n", "\n");
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture dir");
+            std::fs::write(&path, &actual)
+                .unwrap_or_else(|e| panic!("write golden {}: {e}", path.display()));
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing golden {}: {e}", path.display()));
+        assert_eq!(
+            expected.replace("\r\n", "\n"),
+            actual,
+            "golden mismatch: {}",
+            path.display()
+        );
+    }
+
+    /// 路径的稳定展示形式（去掉 Windows canonicalize 的 `\\?\` 前缀）
+    fn norm_str(path: &Path) -> String {
+        path.display()
+            .to_string()
+            .replace('\\', "/")
+            .replace("//?/", "")
+    }
+
+    /// 把 argv 渲染成稳定文本，并归一化本机路径
+    fn render_argv(args: &[OsString]) -> String {
+        let cwd = std::env::current_dir().expect("cwd");
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned().replace('\\', "/").replace("//?/", ""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(&norm_str(&cwd), "<CWD>")
+    }
+
+    /// 服务 argv 金标准：默认空、全字段显式、auth 永不出现
+    #[test]
+    fn test_golden_service_argv() {
+        let mut out = String::new();
+
+        out.push_str("===== default =====\n");
+        let (_, _, args) = build_service_command(&ServerRunArgs::default()).unwrap();
+        out.push_str(&render_argv(&args));
+        out.push('\n');
+
+        // 全字段显式（config 用临时文件，验证 canonicalize）
+        let dir = std::env::temp_dir().join(format!(
+            "rust_proxy_service_golden_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "port = 8080\n").unwrap();
+
+        let source = ServerRunArgs {
+            config: Some(cfg.clone()),
+            port: Some(8081),
+            log_file: Some(PathBuf::from("logs/proxy.log")),
+            timeout: Some(9),
+            log_level: Some(crate::logging::LogLevel::Debug),
+            multi_thread: true,
+            https_port: Some(9443),
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            proxy_protocol_mode: Some(crate::config::ProxyProtocolMode::Require),
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: vec![
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+            ],
+            path_proxy_prefix: Some("px".into()),
+            path_proxy_insecure: true,
+        };
+
+        out.push_str("===== all_explicit =====\n");
+        let (_, _, args) = build_service_command(&source).unwrap();
+        let mut rendered = render_argv(&args).replace(&norm_str(&dir), "<CONFIG_DIR>");
+        if let Ok(canon) = dir.canonicalize() {
+            rendered = rendered.replace(&norm_str(&canon), "<CONFIG_DIR>");
+        }
+        out.push_str(&rendered);
+        out.push('\n');
+
+        // 安全不变量：auth 密码不在结构里，也不得出现在 argv 中
+        assert!(
+            !args.iter().any(|a| {
+                let s = a.to_string_lossy();
+                s.contains("--auth") || s.contains("password") || s.contains("secret")
+            }),
+            "auth material must never reach service argv: {:?}",
+            args
+        );
+
+        // 旧 `--proxy-protocol` 兼容参数单独快照
+        out.push_str("===== legacy_proxy_protocol =====\n");
+        let legacy = ServerRunArgs {
+            proxy_protocol: true,
+            ..Default::default()
+        };
+        let (_, _, args) = build_service_command(&legacy).unwrap();
+        out.push_str(&render_argv(&args));
+        out.push('\n');
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_golden("service_argv.txt", &out);
+    }
+
+    /// 服务模式解析失败必须 fail-fast，且错误信息指出具体参数
+    #[test]
+    fn test_parse_service_args_fail_fast_reports_offending_argument() {
+        // 非数字端口：clap 的错误包含参数名与非法值
+        let err = parse_service_args_from([
+            "rust-proxy",
+            "--run-as-service",
+            "--port",
+            "not-a-port",
+        ])
+        .expect_err("invalid --port must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--port"), "error must name --port: {msg}");
+        assert!(
+            msg.contains("not-a-port"),
+            "error must show invalid value: {msg}"
+        );
+
+        // 未知参数：错误包含未知参数名
+        let err = parse_service_args_from(["rust-proxy", "--run-as-service", "--bogus"])
+            .expect_err("unknown flag must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--bogus"), "error must name --bogus: {msg}");
+    }
+
+    /// 合法服务参数走同一条解析路径（正常路径回归）
+    #[test]
+    fn test_parse_service_args_accepts_valid_argv() {
+        let parsed = parse_service_args_from([
+            "rust-proxy",
+            "--run-as-service",
+            "--port",
+            "9090",
+            "--log-level",
+            "debug",
+        ])
+        .expect("valid argv must parse");
+        assert_eq!(parsed.port, Some(9090));
+        assert_eq!(parsed.log_level, Some(crate::logging::LogLevel::Debug));
+    }
 
     /// 服务模式参数必须由 clap 统一解析（B11 / A4 的回归）
     ///
@@ -423,5 +507,48 @@ mod tests {
         ] {
             assert!(!args.iter().any(|a| a == absent), "{absent} 不该被写入");
         }
+    }
+
+    /// 服务 argv 与 CLI 子集必须逐字段可逆
+    ///
+    /// 这里显式列出 `ServerRunArgs` 的**全部字段**（不带 `..`）：新增字段时
+    /// 该测试会编译失败，强制检查 `build_service_command` 是否同步。
+    #[test]
+    fn test_build_service_command_round_trips_every_explicit_field() {
+        let source = ServerRunArgs {
+            config: None,
+            port: Some(8081),
+            log_file: Some(PathBuf::from("logs/proxy.log")),
+            timeout: Some(9),
+            log_level: Some(crate::logging::LogLevel::Debug),
+            multi_thread: true,
+            https_port: Some(9443),
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            proxy_protocol_mode: Some(crate::config::ProxyProtocolMode::Require),
+            proxy_protocol: false,
+            proxy_protocol_trusted_ips: vec![
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+            ],
+            path_proxy_prefix: Some("px".into()),
+            path_proxy_insecure: true,
+        };
+
+        let cwd = std::env::current_dir().unwrap();
+        let expected = ServerRunArgs {
+            log_file: Some(cwd.join("logs/proxy.log")),
+            tls_cert: Some(cwd.join("cert.pem")),
+            tls_key: Some(cwd.join("key.pem")),
+            ..source.clone()
+        };
+
+        let (_program, _dir, args) = build_service_command(&source).unwrap();
+        let mut argv = vec![OsString::from("rust-proxy")];
+        argv.extend(args);
+
+        let parsed = RunAsServiceArgs::try_parse_from(argv).unwrap();
+        assert!(parsed.run_as_service);
+        assert_eq!(parsed.run_args, expected);
     }
 }

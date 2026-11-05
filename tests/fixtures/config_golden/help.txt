@@ -1,0 +1,171 @@
+===== top =====
+A simple HTTP proxy server
+
+Usage: rust-proxy <COMMAND>
+
+Commands:
+  start   命令行支持的配置子集（CLI 适配层）
+  test    
+  server  服务管理子命令
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+===== start =====
+命令行支持的配置子集（CLI 适配层）
+
+这里只声明"命令行能修改哪些配置"，不是完整配置模型；完整模型以 [`Config`]（TOML） 为准，CLI 值最终由 [`Config::apply_cli`] 覆盖进配置。
+
+Usage: rust-proxy start [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          
+
+      --port <PORT>
+          
+
+      --log-file <LOG_FILE>
+          
+
+      --timeout <TIMEOUT>
+          
+
+      --log-level <LOG_LEVEL>
+          
+
+      --multi-thread
+          启用多线程运行时（默认使用单线程）
+
+      --https-port <HTTPS_PORT>
+          HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）
+
+      --tls-cert <TLS_CERT>
+          TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供
+
+      --tls-key <TLS_KEY>
+          TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供
+
+      --proxy-protocol-mode <MODE>
+          PROXY Protocol 模式（disable / auto / require）
+          
+          - `disable`：完全禁用 PROXY Protocol - `auto`：自动检测（默认），连接开头匹配 PROXY v1/v2 签名时解析真实 IP， 否则按普通流量处理（HTTP 直连、不带 PROXY 头的 HTTPS 均兼容） - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
+          
+          注意：该模式同时作为 HTTP/HTTPS 端口的缺省值；如需分别控制可在配置文件中 使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。
+
+      --proxy-protocol
+          启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
+          
+          旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。
+
+      --proxy-protocol-trusted-ips <PROXY_PROTOCOL_TRUSTED_IPS>
+          PROXY Protocol 可信代理 IP 列表
+          
+          仅当 `proxy_protocol_mode` 为 auto/require 时生效。 仅接受来自这些 IP 的连接发送的 PROXY Protocol 头，防止客户端伪造 IP。 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
+
+      --path-proxy-prefix <PREFIX>
+          启用路径前缀直连模式并指定前缀（如 px）
+          
+          启用后，请求 `http://代理地址/px/https://example.com/` 会被代理服务器 直连到 `https://example.com/`，客户端无需配置代理即可使用（类似 gh-proxy）。 前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。
+
+      --path-proxy-insecure
+          路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
+          
+          仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。
+
+  -h, --help
+          Print help (see a summary with '-h')
+===== server =====
+服务管理子命令
+
+`Install` 携带完整的运行参数（与 `start` 一致），因此该枚举各变体大小差异较大； 枚举仅在启动时构造一次，装箱带来的间接访问反而无收益。
+
+Usage: rust-proxy server <COMMAND>
+
+Commands:
+  install    命令行支持的配置子集（CLI 适配层）
+  uninstall  
+  start      
+  stop       
+  restart    
+  status     
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+===== server_install =====
+命令行支持的配置子集（CLI 适配层）
+
+这里只声明"命令行能修改哪些配置"，不是完整配置模型；完整模型以 [`Config`]（TOML） 为准，CLI 值最终由 [`Config::apply_cli`] 覆盖进配置。
+
+Usage: rust-proxy server install [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          
+
+      --port <PORT>
+          
+
+      --log-file <LOG_FILE>
+          
+
+      --timeout <TIMEOUT>
+          
+
+      --log-level <LOG_LEVEL>
+          
+
+      --multi-thread
+          启用多线程运行时（默认使用单线程）
+
+      --https-port <HTTPS_PORT>
+          HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）
+
+      --tls-cert <TLS_CERT>
+          TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供
+
+      --tls-key <TLS_KEY>
+          TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供
+
+      --proxy-protocol-mode <MODE>
+          PROXY Protocol 模式（disable / auto / require）
+          
+          - `disable`：完全禁用 PROXY Protocol - `auto`：自动检测（默认），连接开头匹配 PROXY v1/v2 签名时解析真实 IP， 否则按普通流量处理（HTTP 直连、不带 PROXY 头的 HTTPS 均兼容） - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
+          
+          注意：该模式同时作为 HTTP/HTTPS 端口的缺省值；如需分别控制可在配置文件中 使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。
+
+      --proxy-protocol
+          启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
+          
+          旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。
+
+      --proxy-protocol-trusted-ips <PROXY_PROTOCOL_TRUSTED_IPS>
+          PROXY Protocol 可信代理 IP 列表
+          
+          仅当 `proxy_protocol_mode` 为 auto/require 时生效。 仅接受来自这些 IP 的连接发送的 PROXY Protocol 头，防止客户端伪造 IP。 示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2
+
+      --path-proxy-prefix <PREFIX>
+          启用路径前缀直连模式并指定前缀（如 px）
+          
+          启用后，请求 `http://代理地址/px/https://example.com/` 会被代理服务器 直连到 `https://example.com/`，客户端无需配置代理即可使用（类似 gh-proxy）。 前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。
+
+      --path-proxy-insecure
+          路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
+          
+          仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。
+
+  -h, --help
+          Print help (see a summary with '-h')
+===== test =====
+Usage: rust-proxy test [OPTIONS] <PROXY_URL> [URL]
+
+Arguments:
+  <PROXY_URL>  代理服务器 URL，必须包含 http:// 或 https:// 协议头 例：http://10.0.0.1:8080 / https://10.0.0.1:8443 支持在 URL 中嵌入认证凭证：http://user:pass@host:port HTTPS 代理会跳过证书验证（等价于 curl --proxy-insecure），以支持自签证书
+  [URL]        [default: https://api.myip.la/cn]
+
+Options:
+      --username <USERNAME>  代理用户名（优先级高于 URL 中的 userinfo 部分）
+      --password <PASSWORD>  代理密码（优先级高于 URL 中的 userinfo 部分）
+  -h, --help                 Print help

@@ -1,0 +1,42 @@
+===== unknown_top_level =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 1, column 1
+  |
+1 | proxy_protocal_mode = "auto"
+  | ^^^^^^^^^^^^^^^^^^^
+unknown field `proxy_protocal_mode`, expected one of `port`, `log_file`, `timeout`, `log_level`, `multi_thread`, `auth`, `https_port`, `tls_cert`, `tls_key`, `proxy_protocol_mode`, `http_proxy_protocol`, `https_proxy_protocol`, `proxy_protocol_trusted_ips`, `path_proxy_prefix`, `path_proxy_insecure_tls`, `path_proxy_rewrite_location`
+
+===== misplaced_after_auth =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 4, column 1
+  |
+4 | path_proxy_prefix = "px"
+  | ^^^^^^^^^^^^^^^^^
+unknown field `path_proxy_prefix`, expected `username` or `password`
+
+===== legacy_boolean_proxy_protocol =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 2, column 1
+  |
+2 | proxy_protocol = true
+  | ^^^^^^^^^^^^^^
+unknown field `proxy_protocol`, expected one of `port`, `log_file`, `timeout`, `log_level`, `multi_thread`, `auth`, `https_port`, `tls_cert`, `tls_key`, `proxy_protocol_mode`, `http_proxy_protocol`, `https_proxy_protocol`, `proxy_protocol_trusted_ips`, `path_proxy_prefix`, `path_proxy_insecure_tls`, `path_proxy_rewrite_location`
+
+===== unknown_auth_field =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 4, column 1
+  |
+4 | foo = "x"
+  | ^^^
+unknown field `foo`, expected `username` or `password`
+
+===== auth_missing_password =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 1, column 1
+  |
+1 | [[auth]]
+  | ^^^^^^^^
+missing field `password`
+
+===== wrong_type_port =====
+Failed to parse config file: <CONFIG_DIR>/config.toml: TOML parse error at line 1, column 8
+  |
+1 | port = "abc"
+  |        ^^^^^
+invalid type: string "abc", expected u16
+

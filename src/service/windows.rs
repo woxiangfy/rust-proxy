@@ -80,8 +80,8 @@ fn service_main(_arguments: Vec<OsString>) {
 }
 
 fn run_service() -> Result<()> {
-    let start_args = parse_service_args();
-    let args = Args::from_run_args(&start_args);
+    let start_args = parse_service_args()?;
+    let args = Args::from_run_args(&start_args)?;
 
     // 服务模式下没有终端，日志必须落文件；未配置时放在可执行文件旁边
     let log_file = args.log_file.clone().unwrap_or_else(|| {

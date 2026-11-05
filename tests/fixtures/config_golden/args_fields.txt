@@ -1,0 +1,45 @@
+===== empty_config =====
+port: Some(8080)
+log_file: None
+timeout: 30
+log_level: Info
+multi_thread: false
+auth: None
+tls: None
+http_proxy_protocol: auto
+https_proxy_protocol: auto
+proxy_protocol: auto
+proxy_protocol_trusted_ips: []
+path_proxy_prefix: None
+path_proxy_insecure_tls: false
+path_proxy_rewrite_location: true
+===== cli_all_fields =====
+port: Some(9090)
+log_file: Some(<CONFIG_DIR>/proxy.log)
+timeout: 7
+log_level: Debug
+multi_thread: true
+auth: None
+tls: Some(https_port=9443, cert_path=Some("<CONFIG_DIR>/cert.pem"), key_path=Some("<CONFIG_DIR>/key.pem"))
+http_proxy_protocol: require
+https_proxy_protocol: require
+proxy_protocol: require
+proxy_protocol_trusted_ips: ["10.0.0.1", "10.0.0.2"]
+path_proxy_prefix: Some("px")
+path_proxy_insecure_tls: true
+path_proxy_rewrite_location: true
+===== toml_full_fields =====
+port: Some(8080)
+log_file: None
+timeout: 60
+log_level: Warn
+multi_thread: true
+auth: Some(len=2, users=[admin,user2])
+tls: Some(https_port=8443, cert_path=Some("<CONFIG_DIR>/cert.pem"), key_path=Some("<CONFIG_DIR>/key.pem"))
+http_proxy_protocol: auto
+https_proxy_protocol: require
+proxy_protocol: disable
+proxy_protocol_trusted_ips: ["10.0.0.1"]
+path_proxy_prefix: Some("cfg")
+path_proxy_insecure_tls: true
+path_proxy_rewrite_location: false

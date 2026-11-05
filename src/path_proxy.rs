@@ -26,14 +26,16 @@
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::http_body::{forward_chunked_body, forward_content_length_body};
-use crate::http_util::{authority_of, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES};
+use crate::http_response::write_response;
+use crate::http_util::{
+    authority_of, connection_named_headers, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES,
+};
 use crate::net::{connect_host, is_benign_close_error, AsyncStream};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_native_tls::{native_tls, TlsConnector};
 
 /// 路径前缀直连模式配置
 #[derive(Debug, Clone)]
@@ -285,19 +287,10 @@ async fn connect_upstream(
     let _ = tcp.set_nodelay(true);
 
     if parsed.scheme() == "https" {
-        let mut builder = native_tls::TlsConnector::builder();
-        if cfg.insecure_tls {
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-        }
-        let connector = TlsConnector::from(
-            builder
-                .build()
-                .context("failed to build TLS connector for upstream")?,
-        );
-        let tls = tokio::time::timeout(timeout, connector.connect(host, tcp))
+        // 客户端 TLS 统一走 rustls（见 tls_client 模块）：
+        // 默认系统根证书严格校验，`path_proxy_insecure_tls` 才跳过链/主机名校验
+        let tls = crate::tls_client::connect_tls(tcp, host, cfg.insecure_tls, timeout)
             .await
-            .with_context(|| format!("TLS handshake with {} timed out", host))?
             .with_context(|| format!("TLS handshake with {} failed", host))?;
         debug!("Path-proxy: TLS established with {}:{}", host, port);
         Ok(Box::new(tls))
@@ -344,6 +337,10 @@ fn build_upstream_request(
     out.push_str(&authority_of(parsed));
     out.push_str("\r\n");
 
+    // `Connection: X-Foo` 点名的字段同样是逐跳头（RFC 7230 §6.1），先统一收集，
+    // 保证过滤结果与头出现位置无关；两条链路（经典代理 / 路径前缀）共用同一判定
+    let connection_named = connection_named_headers(request_head);
+
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
     let mut expect_continue = false;
@@ -382,7 +379,7 @@ fn build_upstream_request(
             expect_continue = value.eq_ignore_ascii_case("100-continue");
             continue;
         }
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name, &connection_named) {
             continue;
         }
         if drop_header.is_some_and(|h| name.eq_ignore_ascii_case(h)) {
@@ -638,19 +635,18 @@ fn rewrite_location(location: &str, cfg: &PathProxyConfig, base: &url::Url) -> O
 }
 
 /// 发送最小化错误响应（用于 400 / 502，不暴露运行时细节）
+///
+/// 报文骨架统一交给 [`write_response`] 构造（`Content-Type` → `Content-Length` →
+/// `Connection: close`），本模块不再手写字符串：这类响应是机器可读的协议输出，
+/// 漏写 `Content-Length` 或 `Connection: close` 都会让客户端挂起。
 async fn send_error<W: AsyncWrite + Unpin>(client: &mut W, code: u16, reason: &str, msg: &str) {
-    let body = msg.as_bytes();
-    let response = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        code,
-        reason,
-        body.len()
-    );
-    let _ = client.write_all(response.as_bytes()).await;
-    let _ = client.write_all(body).await;
+    write_response(
+        client,
+        &format!("{} {}", code, reason),
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        msg.as_bytes(),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -769,6 +765,22 @@ mod tests {
         assert!(req.expect_continue, "must remember to answer 100-continue");
     }
 
+    /// `Connection` 里点名的自定义字段同样不得转发（RFC 7230 §6.1）
+    #[test]
+    fn test_build_upstream_request_drops_connection_named_headers() {
+        let u = url::Url::parse("http://example.com/").unwrap();
+        let head = "GET /px/http://example.com/ HTTP/1.1\r\n\
+                    Host: 1.2.3.4\r\n\
+                    Connection: close, X-Hop\r\n\
+                    X-Hop: secret\r\n\
+                    X-Keep: ok\r\n\r\n";
+        let req = build_upstream_request("GET", &u, head, None);
+
+        let lower = req.head.to_ascii_lowercase();
+        assert!(!lower.contains("x-hop"), "Connection 点名的头必须丢弃：{}", req.head);
+        assert!(req.head.contains("X-Keep: ok"), "未点名的端到端头必须保留");
+    }
+
     /// 用于认证的 `Authorization` 头不得转发给目标站点（凭据泄漏）。
     #[test]
     fn test_build_upstream_request_drops_authorization_used_for_auth() {
@@ -814,6 +826,30 @@ mod tests {
         assert!(!req.chunked);
         assert!(!req.head.contains("Transfer-Encoding"));
         assert_eq!(req.content_length, None);
+    }
+
+    // ─── 错误响应 ───
+
+    #[tokio::test]
+    async fn test_send_error_uses_shared_response_skeleton() {
+        // 错误响应必须与 http_response::write_response 完全一致（含 CL 与 Connection: close），
+        // 否则客户端可能因为缺少分帧信息而挂起
+        let mut out = Vec::new();
+        send_error(&mut out, 400, "Bad Request", "bad path").await;
+
+        let mut expected = Vec::new();
+        write_response(
+            &mut expected,
+            "400 Bad Request",
+            &[("Content-Type", "text/plain; charset=utf-8")],
+            b"bad path",
+        )
+        .await;
+
+        assert_eq!(out, expected);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(!text.contains("Server:"), "错误响应不得暴露 Server 头");
     }
 
     // ─── 响应头重写 ───

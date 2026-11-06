@@ -535,31 +535,7 @@ async fn process_tls_client_pp(
         return; // 报文畸形，已记录日志
     };
 
-    // 流类型为 PrefixedStream<TcpStream>，与 process_tls_client 的 TcpStream 不同，
-    // 因此握手代码无法直接复用（泛型化会让调用方也多一层类型参数）。
-    let acceptor = tls_reloader.current_acceptor();
-    let tls_stream =
-        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!("TLS handshake failed for {}: {}", real_addr, e);
-                return;
-            }
-            Err(_) => {
-                warn!("TLS handshake timed out for {}", real_addr);
-                return;
-            }
-        };
-
-    handle_client_with_addr(
-        tls_stream,
-        real_addr,
-        ctx.timeout,
-        ctx.buffer_pool.clone(),
-        ctx.auth.clone(),
-        Arc::clone(&ctx.path_proxy),
-    )
-    .await;
+    tls_handshake_and_dispatch(stream, real_addr, &tls_reloader, ctx).await;
 }
 
 /// 对 accept 下来的 HTTPS socket 执行 TLS 握手，成功后交给 handle_client_with_addr
@@ -569,9 +545,24 @@ async fn process_tls_client(
     tls_reloader: Arc<TlsReloader>,
     ctx: &ConnContext,
 ) {
+    tls_handshake_and_dispatch(client, addr, &tls_reloader, ctx).await;
+}
+
+/// 对任意已接入的流（`TcpStream` / `PrefixedStream<TcpStream>`）执行 TLS 握手并分派
+///
+/// 两个调用点只负责“是否先解析 PROXY Protocol 头”；握手超时、日志文案与错误分类
+/// 集中在这里，避免同一段逻辑出现两份实现后各自漂移。
+async fn tls_handshake_and_dispatch<S>(
+    stream: S,
+    addr: SocketAddr,
+    tls_reloader: &TlsReloader,
+    ctx: &ConnContext,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // 获取当前 acceptor（支持热重载，每次握手获取最新版本）
     let acceptor = tls_reloader.current_acceptor();
-    let tls_stream = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client)).await
+    let tls_stream = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {

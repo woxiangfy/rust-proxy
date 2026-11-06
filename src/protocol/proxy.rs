@@ -8,10 +8,8 @@ use crate::protocol::auth::{check_path_auth, check_proxy_auth, send_auth_require
 use crate::config::AuthUser;
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::protocol::http_response::write_response;
-use crate::protocol::http_util::{
-    authority_of, connection_named_headers, find_header_end, head_end_offset, is_hop_by_hop,
-    MAX_HEAD_BYTES,
-};
+use crate::protocol::forward::{ForwardTarget, UpstreamHead};
+use crate::protocol::http_util::{find_header_end, head_end_offset, MAX_HEAD_BYTES};
 use crate::support::net::{connect_host, is_benign_close_error, parse_host_port};
 use crate::protocol::path_proxy::{
     handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
@@ -507,213 +505,6 @@ async fn handle_connect_generic<S>(
     }
 }
 
-/// 一次转发的目标信息（由请求行 + 绝对 URL 解析得出）
-struct ForwardTarget<'a> {
-    method: &'a str,
-    url: &'a str,
-    /// 请求目标协议（分类阶段只允许 http/https；经典转发只服务 http）
-    scheme: String,
-    host: String,
-    port: u16,
-    /// 上游 `Host` 头值：绝对 URL 的 authority（IPv6 带方括号，显式端口保留）
-    authority: String,
-    /// origin-form 请求目标：path + query，直连上游的标准形式
-    origin_form: String,
-}
-
-impl<'a> ForwardTarget<'a> {
-    /// 从请求头解析转发目标；格式非法时返回 `None`（调用方保持"静默丢弃"语义）
-    fn parse(head_str: &'a str, client_addr: SocketAddr) -> Option<Self> {
-        let request_line = head_str.lines().next()?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next()?;
-        let url = parts.next()?;
-
-        let parsed = match url::Url::parse(url) {
-            Ok(u) => u,
-            Err(e) => {
-                error!("Failed to parse URL '{}' from {}: {}", url, client_addr, e);
-                return None;
-            }
-        };
-
-        let host = match parsed.host_str() {
-            Some(h) => h.to_string(),
-            None => {
-                error!("No host in URL '{}' from {}", url, client_addr);
-                return None;
-            }
-        };
-
-        // 端口按 scheme 取已知默认值：https 绝对 URL 不能落到 80（历史实现写死 80）
-        let port = match parsed.port_or_known_default() {
-            Some(p) => p,
-            None => {
-                error!(
-                    "No known default port for scheme '{}' in URL '{}' from {}",
-                    parsed.scheme(),
-                    url,
-                    client_addr
-                );
-                return None;
-            }
-        };
-
-        let origin_form = match parsed.query() {
-            Some(q) => format!("{}?{}", parsed.path(), q),
-            None => parsed.path().to_string(),
-        };
-
-        Some(Self {
-            method,
-            url,
-            scheme: parsed.scheme().to_string(),
-            host,
-            port,
-            authority: authority_of(&parsed),
-            origin_form,
-        })
-    }
-}
-
-/// 发往上游的请求头（已过滤逐跳头、改写 `Connection`）及请求体分帧信息
-struct UpstreamHead {
-    /// 请求行 + 过滤后的头部 + 结尾空行，可直接 `write_all`
-    bytes: String,
-    /// 请求体长度（`None` 表示没有 `Content-Length`）
-    content_length: Option<u64>,
-    /// 请求体是否为 chunked 分帧
-    chunked: bool,
-    /// 客户端是否声明了 `Expect: 100-continue`（该头不转发上游，由代理直接应答）
-    expect_continue: bool,
-}
-
-impl UpstreamHead {
-    /// 按 `head_str` 构造上游请求头；分帧信息自相矛盾时返回 `None`
-    ///
-    /// 过滤规则：
-    /// - `Host` → 按绝对 URL 的 authority 重写 / 补写（RFC 7230 §5.4：收到 absolute-form
-    ///   请求时，代理必须忽略客户端的 `Host` 并改用请求目标的 host）。客户端漏发 `Host`
-    ///   时同样补上，否则 HTTP/1.1 上游会直接回 400
-    /// - `Connection` → 改写为 `close`（本代理每个请求独占一条上游连接）
-    /// - `Proxy-Connection` / `Proxy-Authorization` / `Keep-Alive` / `TE` / `Trailer` /
-    ///   `Upgrade` 等逐跳头 → 丢弃（[`is_hop_by_hop`]，RFC 7230 §6.1）
-    /// - `Expect: 100-continue` → 丢弃并置位，由代理直接回 `100 Continue`
-    ///   （转发该头会让客户端等上游的临时响应，而代理此刻正在收 body，白等一个 RTT）
-    /// - `Transfer-Encoding` → 原样保留（body 按原始分帧转发；`gzip, chunked` 这类
-    ///   多编码只声明 chunked 会让上游把仍是 gzip 的块数据当明文）
-    /// - `Content-Length` → **延迟到循环后统一输出**，因为它与 `Transfer-Encoding`
-    ///   互斥，必须等看清全部头才能决定写不写（见函数末尾）
-    ///
-    /// 头名按冒号精确切分匹配（用 `contains` 匹配子串会误伤 `X-Forwarded-For`
-    /// 这类合法头）；无冒号的行（含续行）原样转发，避免破坏上游解析。
-    ///
-    /// 返回 `None` 的两种情况（调用方应回 400）：
-    /// - `Content-Length` 值不是十进制数字；
-    /// - 出现多个**不一致**的 `Content-Length`。
-    ///
-    /// 这两种情况下代理与上游对 body 边界必然有不同的理解，转发等于制造走私面。
-    fn build(target: &ForwardTarget<'_>, head_str: &str) -> Option<Self> {
-        let mut bytes = String::with_capacity(512);
-        bytes.push_str(target.method);
-        bytes.push(' ');
-        bytes.push_str(&target.origin_form);
-        bytes.push_str(" HTTP/1.1\r\n");
-        bytes.push_str("Host: ");
-        bytes.push_str(&target.authority);
-        bytes.push_str("\r\n");
-
-        // `Connection: X-Foo` 点名的字段同样是逐跳头（RFC 7230 §6.1），
-        // 必须在遍历前先收集，否则名字在头尾不同位置时过滤结果会不稳定
-        let connection_named = connection_named_headers(head_str);
-
-        let mut content_length: Option<u64> = None;
-        let mut content_length_conflict = false;
-        let mut chunked = false;
-        let mut expect_continue = false;
-
-        for line in head_str.lines().skip(1) {
-            if line.is_empty() {
-                break;
-            }
-            let (name, value) = match line.split_once(':') {
-                Some(pair) => pair,
-                None => {
-                    bytes.push_str(line);
-                    bytes.push_str("\r\n");
-                    continue;
-                }
-            };
-            let name = name.trim();
-            let value = value.trim();
-
-            if name.eq_ignore_ascii_case("host") {
-                // 已按绝对 URL 的 authority 输出，客户端的 Host 一律忽略
-                continue;
-            }
-            if name.eq_ignore_ascii_case("connection") {
-                bytes.push_str("Connection: close\r\n");
-                continue;
-            }
-            // 分帧相关头先处理：它们需要"改写 / 记录"而不是"丢弃"
-            if name.eq_ignore_ascii_case("transfer-encoding") {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    chunked = true;
-                }
-                bytes.push_str(line);
-                bytes.push_str("\r\n");
-                continue;
-            }
-            if name.eq_ignore_ascii_case("content-length") {
-                // 延迟输出：chunked 与 CL 互斥，此刻还不知道后面有没有 TE
-                match value.parse::<u64>() {
-                    Ok(v) => match content_length {
-                        Some(prev) if prev != v => content_length_conflict = true,
-                        Some(_) => {} // 重复且一致：合并成一条，不给上游留多值歧义
-                        None => content_length = Some(v),
-                    },
-                    Err(_) => content_length_conflict = true,
-                }
-                continue;
-            }
-            // `100-continue` 由代理直接应答；其余 `Expect` 值同样丢弃（无从满足）
-            if name.eq_ignore_ascii_case("expect") {
-                expect_continue = value.eq_ignore_ascii_case("100-continue");
-                continue;
-            }
-            if is_hop_by_hop(name, &connection_named) {
-                continue;
-            }
-            bytes.push_str(line);
-            bytes.push_str("\r\n");
-        }
-
-        // 代理与上游对 body 边界的理解必须完全一致，否则就是走私面
-        if content_length_conflict {
-            return None;
-        }
-
-        // 分帧头二选一（RFC 7230 §3.3.3）：存在 chunked 时**必须**丢弃 Content-Length。
-        // 两者同时转发时，若上游按 CL 解析，会把分帧字节当成 body 内容，
-        // 后续管道化的请求就被拼进同一个请求（请求走私）。
-        if chunked {
-            content_length = None;
-        } else if let Some(cl) = content_length {
-            bytes.push_str("Content-Length: ");
-            bytes.push_str(&cl.to_string());
-            bytes.push_str("\r\n");
-        }
-        bytes.push_str("\r\n");
-
-        Some(Self {
-            bytes,
-            content_length,
-            chunked,
-            expect_continue,
-        })
-    }
-}
-
 /// 一次转发中各阶段共用的进程级参数
 struct RelayCtx<'a> {
     client_addr: SocketAddr,
@@ -830,14 +621,14 @@ impl RelayCtx<'_> {
                 }
                 Ok(Err(e)) => {
                     if is_benign_close_error(&e) {
-                        debug!("Read from {}:{} ended: {}", target.host, target.port, e);
+                        debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
                     } else {
-                        warn!("Error reading from {}:{}: {}", target.host, target.port, e);
+                        warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
                     }
                     break;
                 }
                 Err(_) => {
-                    warn!("Response from {}:{} timed out", target.host, target.port);
+                    warn!("Response from {}:{} timed out", target.connect_host, target.port);
                     break;
                 }
             }
@@ -845,7 +636,7 @@ impl RelayCtx<'_> {
 
         debug!(
             "Response copy buffer for {}:{} ended at {} KB",
-            target.host,
+            target.connect_host,
             target.port,
             response_buf.current_size() / 1024
         );
@@ -891,7 +682,7 @@ async fn handle_http_request_generic<S>(
 
     info!(
         "{} -> {} {}:{} -> {}",
-        client_addr, target.method, target.host, target.port, target.url
+        client_addr, target.method, target.connect_host, target.port, target.url
     );
 
     // 先校验分帧头再连上游：畸形请求不该消耗一条到目标的连接（也避免把
@@ -905,12 +696,12 @@ async fn handle_http_request_generic<S>(
         return;
     };
 
-    let mut upstream = match connect_host(&target.host, target.port, timeout_duration).await {
+    let mut upstream = match connect_host(&target.connect_host, target.port, timeout_duration).await {
         Ok(t) => t,
         Err(e) => {
             error!(
                 "Failed to connect to {}:{} from {}: {}",
-                target.host, target.port, client_addr, e
+                target.connect_host, target.port, client_addr, e
             );
             send_bad_gateway(&mut client).await;
             return;
@@ -1067,7 +858,7 @@ Host: example.com
 ";
         let t = ForwardTarget::parse(head, addr()).expect("absolute URL must parse");
         assert_eq!(t.method, "GET");
-        assert_eq!(t.host, "example.com");
+        assert_eq!(t.connect_host, "example.com");
         assert_eq!(t.port, 80, "缺省端口应为 80");
         assert_eq!(t.origin_form, "/a/b?x=1", "query 必须保留");
         assert_eq!(t.authority, "example.com", "缺省端口不应写进 Host");
@@ -1080,7 +871,7 @@ Host: example.com
 ";
         let t = ForwardTarget::parse(head, addr()).expect("parse");
         assert_eq!(t.port, 8080);
-        assert_eq!(t.host, "127.0.0.1");
+        assert_eq!(t.connect_host, "127.0.0.1");
         assert_eq!(t.origin_form, "/p");
     }
 

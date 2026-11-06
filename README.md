@@ -158,8 +158,10 @@ curl -u admin:secret "http://1.2.3.4/px/https://example.com/file.zip"
 | `/{prefix}`、`/{prefix}/`、其他相对路径 | 404（保持反扫描特性，前缀本身就是路径口令） |
 | 目标非法 / 非 http(s) | 400 |
 | 上游不可达 | 502 |
+| 畸形 `Content-Length`（非数字或出现多个不一致值） | 400（与经典代理一致，避免代理与上游对 body 边界理解不同） |
+| `Transfer-Encoding` | 整行原样转发（`gzip, chunked` 不会被折叠）；存在 `chunked` 时丢弃 `Content-Length` |
 | 上游 3xx | `Location` 重写为 `/{prefix}/<绝对URL>`（可关） |
-| 请求体 | 按 Content-Length / chunked 流式转发；两者并存以 chunked 为准（防请求走私） |
+| 请求体 | 按 Content-Length / chunked 流式转发；两者并存时以 chunked 为准并丢弃 Content-Length（防请求走私） |
 | 响应体 | 原始字节流式转发，chunked / gzip / br 原样保留 |
 | 逐跳头 | `Connection`、`Keep-Alive`、`Proxy-*`、`Upgrade`、`TE`、`Trailer`、`Expect` 不转发；`Connection` 里点名的自定义字段（如 `Connection: X-Foo`）同样不转发；`Host` 重写为上游主机 |
 | 认证 | 复用 `[[auth]]`，接受 `Authorization` 或 `Proxy-Authorization`，质询返回 401 |
@@ -252,8 +254,9 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭（装配入口） |
 | `config/mod.rs` / `config/schema.rs` | 配置加载、运行时派生与校验 / 声明层字段表（统一生成 CLI、TOML、服务参数） |
-| `protocol/proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发（`Host` 按绝对 URL 重写 / 补写） |
-| `protocol/path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
+| `protocol/proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发 |
+| `protocol/forward.rs` | 转发目标解析（IPv6 双表示）与上游建头（经典 / 路径前缀共用同一份） |
+| `protocol/path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、流式回传、Location 重写 |
 | `protocol/auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
 | `protocol/http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
 | `protocol/http_body.rs` | chunked 分帧状态机与流式转发 |

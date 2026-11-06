@@ -4,6 +4,7 @@
 //! 接入与装配由 `crate::server` 负责。
 
 pub mod auth;
+pub(crate) mod forward;
 pub mod http_body;
 pub mod http_response;
 pub mod http_util;

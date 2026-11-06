@@ -151,6 +151,11 @@ where
 /// 假上游：读完整请求头后，把请求头原文回显进响应体，便于断言 Host / 路径 / 头部过滤
 async fn spawn_origin() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    spawn_origin_on(listener).await
+}
+
+/// 在指定监听器上启动假上游（IPv6 用例需要绑定 `[::1]`，因此把监听器外置）
+async fn spawn_origin_on(listener: TcpListener) -> SocketAddr {
     let addr = listener.local_addr().expect("origin local_addr");
 
     tokio::spawn(async move {
@@ -1225,5 +1230,147 @@ async fn connection_named_headers_are_not_forwarded() {
     assert!(
         upstream_head.contains("x-keep: ok"),
         "路径前缀直连也必须保留未被点名的字段：{upstream_head}"
+    );
+}
+
+/// 链路 16：IPv6 字面量目标（经典 absolute-form）
+///
+/// `url::Url::host_str()` 对 IPv6 返回带方括号的 `[::1]`，而 socket/DNS 层需要裸地址。
+/// 若解析结果只保存一种形式，`GET http://[::1]:port/` 会稳定 502。本用例把上游绑在
+/// `[::1]`，直接验证“代理确实连到了 ::1”而不是碰巧连到 127.0.0.1。
+#[tokio::test]
+async fn ipv6_literal_absolute_form_forwards() {
+    let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+        eprintln!("当前环境不支持 IPv6 loopback，跳过 ipv6_literal_absolute_form_forwards");
+        return;
+    };
+    let origin = spawn_origin_on(listener).await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET http://{origin}/ipv6 HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(status_code(&resp), 200, "IPv6 字面量目标不得返回 502");
+    let upstream_head = body_of(&resp).to_lowercase();
+    assert!(
+        upstream_head.contains("get /ipv6 http/1.1"),
+        "请求行必须改写为 origin-form，实际：{upstream_head}"
+    );
+    assert!(
+        upstream_head.contains(&format!("host: {origin}")),
+        "Host 必须保留 IPv6 方括号形式，实际：{upstream_head}"
+    );
+}
+
+/// 链路 17：路径前缀模式的畸形分帧必须 fail-closed
+///
+/// 两类 Content-Length 在任何转发链路上都不能“挑一个”：非数字无法确定边界，
+/// 多个不一致值会让代理与上游对同一条请求的 body 边界理解不同——这正是请求走私
+/// 的入口。经典代理已返回 400，路径前缀模式也必须一致。
+#[tokio::test]
+async fn path_prefix_rejects_malformed_content_length() {
+    let origin = spawn_origin().await;
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let proxy = spawn_proxy(args).await;
+
+    // (a) 多个不一致的 Content-Length
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "POST /px/http://{origin}/dup HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello!",
+            proxy.addr
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 400, "冲突的 Content-Length 必须 400");
+
+    // (b) 非数字 Content-Length
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "POST /px/http://{origin}/nan HTTP/1.1\r\nHost: {}\r\nContent-Length: abc\r\nConnection: close\r\n\r\nhello",
+            proxy.addr
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 400, "非数字 Content-Length 必须 400");
+}
+
+/// 链路 18：`Transfer-Encoding` 必须整行原样转发
+///
+/// `Transfer-Encoding: gzip, chunked` 表示“先 gzip 再 chunked”两层编码。把声明折叠成
+/// 只有 `chunked` 会让上游在解完分帧后把仍是 gzip 的字节当明文，属于内容解码错误。
+/// 两条建头链路共用同一实现后，此处应看到完整原行。
+#[tokio::test]
+async fn path_prefix_preserves_full_transfer_encoding() {
+    let origin = spawn_chunked_origin().await;
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let proxy = spawn_proxy(args).await;
+
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "POST /px/http://{origin}/te HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            proxy.addr
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(status_code(&resp), 200, "上游应正常收下 chunked 请求");
+    let upstream = body_of(&resp).to_lowercase();
+    assert!(
+        upstream.contains("transfer-encoding: gzip, chunked"),
+        "Transfer-Encoding 必须整行保留，实际：{upstream}"
+    );
+}
+
+/// 链路 19：两条链路的建头结果必须逐字节一致
+///
+/// 同一语义的请求（去掉 absolute-form 与 `/px/` 前缀差异后完全相同）经过经典代理与
+/// 路径前缀直连，上游收到的头块不允许有任何差异——否则修一处漏一处只是时间问题。
+/// 这里特意让 `Connection` 出现在普通头之前，用来固定“改写位置”。
+#[tokio::test]
+async fn classic_and_path_prefix_build_identical_upstream_head() {
+    let origin = spawn_origin().await;
+
+    let classic = spawn_proxy(base_args()).await;
+    let classic_resp = request_raw(
+        classic.addr,
+        format!(
+            "GET http://{origin}/same HTTP/1.1\r\nConnection: close\r\nX-Test: 1\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let path_proxy = spawn_proxy(args).await;
+    let path_resp = request_raw(
+        path_proxy.addr,
+        format!(
+            "GET /px/http://{origin}/same HTTP/1.1\r\nConnection: close\r\nX-Test: 1\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(status_code(&classic_resp), 200);
+    assert_eq!(status_code(&path_resp), 200);
+    assert_eq!(
+        body_of(&classic_resp),
+        body_of(&path_resp),
+        "两条链路上游收到的头块必须逐字节一致"
     );
 }

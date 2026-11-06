@@ -23,12 +23,13 @@
 //!    body 按 Content-Length / chunked 流式转发，不缓冲整个请求体。
 //! 4. 响应按原始字节流式转发（chunked / gzip 保持原样），仅在 3xx 时按需把 `Location`
 //!    重写为 `/<prefix>/<绝对URL>`，使重定向后的请求继续走本代理。
+//! 5. 上游建头与经典代理共用 [`crate::protocol::forward`]：畸形/冲突 `Content-Length`
+//!    统一返回 400，`Transfer-Encoding` 整行原样转发（不折叠编码声明）。
 
+use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::protocol::http_response::write_response;
-use crate::protocol::http_util::{
-    authority_of, connection_named_headers, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES,
-};
+use crate::protocol::http_util::{find_header_end, MAX_HEAD_BYTES};
 use crate::support::net::{connect_host, is_benign_close_error, AsyncStream};
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use anyhow::{Context, Result};
@@ -179,6 +180,16 @@ pub(crate) async fn handle_path_proxy<S>(
         return;
     }
 
+    // 与经典代理共用同一份目标解析：authority（Host 头，IPv6 带方括号）与
+    // connect_host（socket/SNI，IPv6 去方括号）在这里一次算清。
+    let target = match ForwardTarget::from_url(method, target_url, &parsed) {
+        Some(t) => t,
+        None => {
+            send_error(&mut client, 400, "Bad Request", "target URL has no known port").await;
+            return;
+        }
+    };
+
     info!(
         "{} -> PATH {} {} (prefix /{}/)",
         client_addr,
@@ -188,7 +199,7 @@ pub(crate) async fn handle_path_proxy<S>(
     );
 
     // ── 2. 连接上游（http 明文 / https TLS）──
-    let mut upstream = match connect_upstream(&parsed, cfg, timeout).await {
+    let mut upstream = match connect_upstream(&target, cfg, timeout).await {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -200,17 +211,35 @@ pub(crate) async fn handle_path_proxy<S>(
         }
     };
 
-    // ── 3. 重写并发送请求头 ──
+    // ── 3. 重写并发送请求头（与经典代理共用同一份建头实现）──
     let request_head = String::from_utf8_lossy(&request_data[..head_end]).to_string();
-    let upstream_req = build_upstream_request(method, &parsed, &request_head, drop_header);
+    let head = match UpstreamHead::build_filtered(&target, &request_head, drop_header) {
+        Some(h) => h,
+        None => {
+            // 非数字或互相冲突的 Content-Length：代理与上游会对 body 边界产生不同
+            // 理解，只能 fail-closed。这是相对旧实现的**有意收紧**（旧实现静默丢 CL）。
+            warn!(
+                "Path-proxy: malformed framing headers from {} for '{}', rejecting",
+                client_addr, target_url
+            );
+            send_error(
+                &mut client,
+                400,
+                "Bad Request",
+                "conflicting or non-numeric Content-Length",
+            )
+            .await;
+            return;
+        }
+    };
 
-    if upstream.write_all(upstream_req.head.as_bytes()).await.is_err() {
+    if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
         return;
     }
 
     // 客户端声明 `Expect: 100-continue` 时先给临时响应，否则它会等上游的 100（已丢弃
     // 该头，上游不会发）而白等一个 RTT 甚至超时。`Expect` 本身不转发给上游。
-    if upstream_req.expect_continue
+    if head.expect_continue
         && client
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
             .await
@@ -225,8 +254,8 @@ pub(crate) async fn handle_path_proxy<S>(
         &mut client,
         &mut upstream,
         buffered_body,
-        upstream_req.content_length,
-        upstream_req.chunked,
+        head.content_length,
+        head.chunked,
         timeout,
         buffer_pool,
     )
@@ -234,12 +263,12 @@ pub(crate) async fn handle_path_proxy<S>(
     match body_result {
         Ok(sent) => {
             // 与经典代理保持一致：客户端提前关闭时不再往下走，但把差异记下来
-            if upstream_req.content_length.is_some_and(|cl| sent < cl) {
+            if head.content_length.is_some_and(|cl| sent < cl) {
                 warn!(
                     "Path-proxy: client {} closed before sending complete request body ({} of {} bytes)",
                     client_addr,
                     sent,
-                    upstream_req.content_length.unwrap_or(0)
+                    head.content_length.unwrap_or(0)
                 );
             }
         }
@@ -265,20 +294,15 @@ pub(crate) async fn handle_path_proxy<S>(
 }
 
 /// 连接上游：http 直连，https 在 TCP 之上做 TLS 握手。
+///
+/// `connect_host` 已在 [`ForwardTarget`] 里去掉 IPv6 方括号，DNS 与 SNI 直接可用。
 async fn connect_upstream(
-    parsed: &url::Url,
+    target: &ForwardTarget<'_>,
     cfg: &PathProxyConfig,
     timeout: Duration,
 ) -> Result<Box<dyn AsyncStream>> {
-    let host = parsed.host_str().context("target URL has no host")?;
-    // IPv6 字面量 `url` 返回带方括号形式（`[::1]`），DNS 解析与 SNI 需去掉方括号
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let port = parsed
-        .port_or_known_default()
-        .context("target URL has no known port")?;
+    let host = target.connect_host.as_str();
+    let port = target.port;
 
     let tcp = connect_host(host, port, timeout)
         .await
@@ -286,7 +310,7 @@ async fn connect_upstream(
     // 小包（HTTP 头）立即发出，降低下载类请求的首字节延迟
     let _ = tcp.set_nodelay(true);
 
-    if parsed.scheme() == "https" {
+    if target.scheme == "https" {
         // 客户端 TLS 统一走 rustls（见 tls_client 模块）：
         // 默认系统根证书严格校验，`path_proxy_insecure_tls` 才跳过链/主机名校验
         let tls = crate::transport::tls_client::connect_tls(tcp, host, cfg.insecure_tls, timeout)
@@ -296,121 +320,6 @@ async fn connect_upstream(
         Ok(Box::new(tls))
     } else {
         Ok(Box::new(tcp))
-    }
-}
-
-/// 发往上游的请求（头 + 分帧信息）
-struct UpstreamRequest {
-    /// 完整的请求头（已含结束空行）
-    head: String,
-    /// `Content-Length` 值（未声明则为 `None`）
-    content_length: Option<u64>,
-    /// body 是否以 chunked 分帧转发
-    chunked: bool,
-    /// 客户端是否发送了 `Expect: 100-continue`
-    expect_continue: bool,
-}
-
-/// 构造发往上游的请求：origin-form 请求行 + 重写后的 Host + 过滤逐跳头。
-///
-/// `drop_header` 是在代理侧用于认证的请求头名，必须从上游请求中移除。
-fn build_upstream_request(
-    method: &str,
-    parsed: &url::Url,
-    request_head: &str,
-    drop_header: Option<&'static str>,
-) -> UpstreamRequest {
-    let mut out = String::with_capacity(request_head.len() + 64);
-
-    // 请求行：origin-form（path + query），这是直连上游的标准形式
-    out.push_str(method);
-    out.push(' ');
-    out.push_str(parsed.path());
-    if let Some(q) = parsed.query() {
-        out.push('?');
-        out.push_str(q);
-    }
-    out.push_str(" HTTP/1.1\r\n");
-
-    // Host：以目标 URL 为准重写（客户端原本的 Host 是代理服务器地址）
-    out.push_str("Host: ");
-    out.push_str(&authority_of(parsed));
-    out.push_str("\r\n");
-
-    // `Connection: X-Foo` 点名的字段同样是逐跳头（RFC 7230 §6.1），先统一收集，
-    // 保证过滤结果与头出现位置无关；两条链路（经典代理 / 路径前缀）共用同一判定
-    let connection_named = connection_named_headers(request_head);
-
-    let mut content_length: Option<u64> = None;
-    let mut chunked = false;
-    let mut expect_continue = false;
-    let mut body_headers: Vec<&str> = Vec::new();
-
-    for line in request_head.split("\r\n").skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        let (name, value) = match line.split_once(':') {
-            Some(pair) => pair,
-            // 无冒号的非法行（含折行续行）直接丢弃，避免把上一请求的字节拼进头部
-            None => continue,
-        };
-        let name = name.trim();
-        let value = value.trim();
-
-        // Host 已重写；Connection 由代理统一为 close
-        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        // 分帧头单独处理：不能与逐跳头黑名单混在一起，且二者互斥（见下）
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            // 只要声明了 chunked 就按 chunked 转发；其它编码（如 gzip）不作请求体分帧依据
-            chunked = value
-                .split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("chunked"));
-            continue;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse::<u64>().ok();
-            continue;
-        }
-        if name.eq_ignore_ascii_case("expect") {
-            // 100-continue 由代理直接应答，不转发
-            expect_continue = value.eq_ignore_ascii_case("100-continue");
-            continue;
-        }
-        if is_hop_by_hop(name, &connection_named) {
-            continue;
-        }
-        if drop_header.is_some_and(|h| name.eq_ignore_ascii_case(h)) {
-            // 代理自身的认证凭据：绝不能转发给目标站点
-            continue;
-        }
-        body_headers.push(line);
-    }
-
-    // 分帧头二选一：chunked 优先并丢弃 Content-Length，避免上游收到互相矛盾的长度
-    // 而产生请求走私（RFC 7230 §3.3.3 要求代理这样做）。
-    if chunked {
-        content_length = None;
-        out.push_str("Transfer-Encoding: chunked\r\n");
-    } else if let Some(cl) = content_length {
-        out.push_str("Content-Length: ");
-        out.push_str(&cl.to_string());
-        out.push_str("\r\n");
-    }
-
-    for line in body_headers {
-        out.push_str(line);
-        out.push_str("\r\n");
-    }
-
-    out.push_str("Connection: close\r\n\r\n");
-    UpstreamRequest {
-        head: out,
-        content_length,
-        chunked,
-        expect_continue,
     }
 }
 
@@ -722,30 +631,36 @@ mod tests {
         }
     }
 
-    // ─── 请求头构造 ───
+    // ─── 请求头构造（与经典代理共用 protocol::forward） ───
+
+    fn target<'a>(method: &'a str, raw: &'a str) -> ForwardTarget<'a> {
+        let u = url::Url::parse(raw).unwrap();
+        ForwardTarget::from_url(method, raw, &u).unwrap()
+    }
 
     #[test]
-    fn test_build_upstream_request_rewrites_request_line_and_host() {
-        let u = url::Url::parse("https://example.com/a/b?q=1").unwrap();
+    fn test_upstream_head_rewrites_request_line_and_host() {
+        let t = target("POST", "https://example.com/a/b?q=1");
         let head = "POST /px/https://example.com/a/b?q=1 HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
                     User-Agent: curl\r\n\
+                    Connection: keep-alive\r\n\
                     Content-Length: 5\r\n\r\n";
-        let req = build_upstream_request("POST", &u, head, None);
-        let out = &req.head;
+        let req = UpstreamHead::build_filtered(&t, head, None).expect("valid framing headers");
+        let out = &req.bytes;
         assert!(out.starts_with("POST /a/b?q=1 HTTP/1.1\r\n"), "got: {}", out);
         assert!(out.contains("Host: example.com\r\n"));
         assert!(!out.contains("1.2.3.4"), "proxy host must be replaced");
         assert!(out.contains("User-Agent: curl\r\n"));
-        assert!(out.ends_with("Connection: close\r\n\r\n"));
+        assert_eq!(out.matches("Connection: close").count(), 1);
         assert_eq!(req.content_length, Some(5));
         assert!(!req.chunked);
         assert!(!req.expect_continue);
     }
 
     #[test]
-    fn test_build_upstream_request_drops_hop_by_hop_headers() {
-        let u = url::Url::parse("http://example.com/").unwrap();
+    fn test_upstream_head_drops_hop_by_hop_headers() {
+        let t = target("GET", "http://example.com/");
         let head = "GET /px/http://example.com/ HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
                     Proxy-Authorization: Basic xxxx\r\n\
@@ -754,78 +669,78 @@ mod tests {
                     Upgrade: websocket\r\n\
                     Expect: 100-continue\r\n\
                     Accept: */*\r\n\r\n";
-        let req = build_upstream_request("GET", &u, head, None);
-        let lower = req.head.to_ascii_lowercase();
+        let req = UpstreamHead::build_filtered(&t, head, None).expect("valid framing headers");
+        let lower = req.bytes.to_ascii_lowercase();
         assert!(!lower.contains("proxy-authorization"), "credentials must not leak");
         assert!(!lower.contains("proxy-connection"));
         assert!(!lower.contains("upgrade:"));
         assert!(!lower.contains("expect:"), "100-continue is answered by the proxy");
-        assert_eq!(lower.matches("connection:").count(), 1, "only the synthesized Connection header");
-        assert!(req.head.contains("Accept: */*"));
+        assert_eq!(lower.matches("connection:").count(), 1, "only the rewritten Connection header");
+        assert!(req.bytes.contains("Accept: */*"));
         assert!(req.expect_continue, "must remember to answer 100-continue");
     }
 
     /// `Connection` 里点名的自定义字段同样不得转发（RFC 7230 §6.1）
     #[test]
-    fn test_build_upstream_request_drops_connection_named_headers() {
-        let u = url::Url::parse("http://example.com/").unwrap();
+    fn test_upstream_head_drops_connection_named_headers() {
+        let t = target("GET", "http://example.com/");
         let head = "GET /px/http://example.com/ HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
                     Connection: close, X-Hop\r\n\
                     X-Hop: secret\r\n\
                     X-Keep: ok\r\n\r\n";
-        let req = build_upstream_request("GET", &u, head, None);
+        let req = UpstreamHead::build_filtered(&t, head, None).expect("valid framing headers");
 
-        let lower = req.head.to_ascii_lowercase();
-        assert!(!lower.contains("x-hop"), "Connection 点名的头必须丢弃：{}", req.head);
-        assert!(req.head.contains("X-Keep: ok"), "未点名的端到端头必须保留");
+        let lower = req.bytes.to_ascii_lowercase();
+        assert!(!lower.contains("x-hop"), "Connection 点名的头必须丢弃：{}", req.bytes);
+        assert!(req.bytes.contains("X-Keep: ok"), "未点名的端到端头必须保留");
     }
 
     /// 用于认证的 `Authorization` 头不得转发给目标站点（凭据泄漏）。
     #[test]
-    fn test_build_upstream_request_drops_authorization_used_for_auth() {
-        let u = url::Url::parse("http://example.com/").unwrap();
+    fn test_upstream_head_drops_authorization_used_for_auth() {
+        let t = target("GET", "http://example.com/");
         let head = "GET /px/http://example.com/ HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
                     Authorization: Basic dTpw\r\n\r\n";
-        // 认证用的是 Authorization → 必须剔除
-        let req = build_upstream_request("GET", &u, head, Some("authorization"));
+        let req = UpstreamHead::build_filtered(&t, head, Some("authorization")).expect("valid framing headers");
         assert!(
-            !req.head.to_ascii_lowercase().contains("authorization"),
+            !req.bytes.to_ascii_lowercase().contains("authorization"),
             "proxy credentials leaked: {}",
-            req.head
+            req.bytes
         );
-        // 认证走的是 Proxy-Authorization → 目标站点自己的 Authorization 应保留
-        let req2 = build_upstream_request("GET", &u, head, Some("proxy-authorization"));
-        assert!(req2.head.contains("Authorization: Basic dTpw\r\n"));
+        let req2 = UpstreamHead::build_filtered(&t, head, Some("proxy-authorization")).expect("valid framing headers");
+        assert!(req2.bytes.contains("Authorization: Basic dTpw\r\n"));
     }
 
     #[test]
-    fn test_build_upstream_request_chunked_drops_content_length() {
-        let u = url::Url::parse("http://example.com/up").unwrap();
+    fn test_upstream_head_chunked_drops_content_length() {
+        let t = target("POST", "http://example.com/up");
         let head = "POST /px/http://example.com/up HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
                     Content-Length: 3\r\n\
                     Transfer-Encoding: chunked\r\n\r\n";
-        let req = build_upstream_request("POST", &u, head, None);
+        let req = UpstreamHead::build_filtered(&t, head, None).expect("valid framing headers");
         assert!(req.chunked);
         assert_eq!(req.content_length, None);
-        assert!(req.head.contains("Transfer-Encoding: chunked\r\n"));
-        assert!(!req.head.contains("Content-Length"), "must not send both framings");
-        // 分帧头应出现在普通头之前，但仍是一个合法头块
-        assert!(req.head.ends_with("\r\n\r\n"));
+        assert!(req.bytes.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!req.bytes.contains("Content-Length"), "must not send both framings");
+        assert!(req.bytes.ends_with("\r\n\r\n"));
     }
 
     #[test]
-    fn test_build_upstream_request_non_chunked_te_is_dropped() {
-        let u = url::Url::parse("http://example.com/up").unwrap();
+    fn test_upstream_head_preserves_unsupported_te_line() {
+        // 行为变更：旧实现会丢弃非 chunked 的 Transfer-Encoding 行；
+        // 统一后整行原样保留，由上游按其声明的编码链处理 body。
+        let t = target("POST", "http://example.com/up");
         let head = "POST /px/http://example.com/up HTTP/1.1\r\n\
                     Host: 1.2.3.4\r\n\
-                    Transfer-Encoding: gzip\r\n\r\n";
-        let req = build_upstream_request("POST", &u, head, None);
+                    Transfer-Encoding: gzip\r\n\
+                    Content-Length: 3\r\n\r\n";
+        let req = UpstreamHead::build_filtered(&t, head, None).expect("valid framing headers");
         assert!(!req.chunked);
-        assert!(!req.head.contains("Transfer-Encoding"));
-        assert_eq!(req.content_length, None);
+        assert!(req.bytes.contains("Transfer-Encoding: gzip\r\n"));
+        assert_eq!(req.content_length, Some(3));
     }
 
     // ─── 错误响应 ───

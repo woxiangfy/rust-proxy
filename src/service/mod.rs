@@ -402,7 +402,7 @@ mod tests {
             port: Some(8081),
             log_file: Some(PathBuf::from("logs/proxy.log")),
             timeout: Some(9),
-            log_level: Some(crate::logging::LogLevel::Debug),
+            log_level: Some(crate::support::logging::LogLevel::Debug),
             multi_thread: true,
             https_port: Some(9443),
             tls_cert: Some(PathBuf::from("cert.pem")),
@@ -488,7 +488,7 @@ mod tests {
         ])
         .expect("valid argv must parse");
         assert_eq!(parsed.port, Some(9090));
-        assert_eq!(parsed.log_level, Some(crate::logging::LogLevel::Debug));
+        assert_eq!(parsed.log_level, Some(crate::support::logging::LogLevel::Debug));
     }
 
     /// 服务模式参数必须由 clap 统一解析（B11 / A4 的回归）
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(a.tls_cert.as_deref(), Some(std::path::Path::new("cert.pem")));
         assert_eq!(a.tls_key.as_deref(), Some(std::path::Path::new("key.pem")));
         assert_eq!(a.timeout, Some(7));
-        assert_eq!(a.log_level, Some(crate::logging::LogLevel::Debug));
+        assert_eq!(a.log_level, Some(crate::support::logging::LogLevel::Debug));
         assert_eq!(
             a.log_file.as_deref(),
             Some(std::path::Path::new("proxy.log"))
@@ -617,7 +617,7 @@ mod tests {
             port: Some(8081),
             log_file: Some(PathBuf::from("logs/proxy.log")),
             timeout: Some(9),
-            log_level: Some(crate::logging::LogLevel::Debug),
+            log_level: Some(crate::support::logging::LogLevel::Debug),
             multi_thread: true,
             https_port: Some(9443),
             tls_cert: Some(PathBuf::from("cert.pem")),

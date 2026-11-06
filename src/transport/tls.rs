@@ -319,7 +319,8 @@ mod tests {
 
     #[test]
     fn test_file_mtime_returns_mtime_for_existing_file() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tls.rs");
+        // 用 file!() 定位自身，避免文件再移动后测试路径失真。
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
         let mtime = file_mtime(&path);
         assert!(mtime.is_ok(), "file_mtime should succeed for existing file");
     }

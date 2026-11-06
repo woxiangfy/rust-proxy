@@ -2,13 +2,13 @@
 //!
 //! 与服务端转发逻辑无关：它扮演"客户端"，按代理协议访问目标 URL，
 //! 用于部署后自检（能否连上代理、认证是否生效、CONNECT 隧道是否通）。
-//! 与服务端只共享 [`crate::net::AsyncStream`] 这一层抽象。
+//! 与服务端只共享 [`crate::support::net::AsyncStream`] 这一层抽象。
 //!
 //! 因此它单独成模块：放在 `proxy.rs` 里会让"服务端转发"与"客户端自检"两套
 //! 完全不同的代码互相干扰（也各自拖着用不到的依赖）。
 
-use crate::net::AsyncStream;
-use crate::tls_client::connect_tls;
+use crate::support::net::AsyncStream;
+use crate::transport::tls_client::connect_tls;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::time::Duration;

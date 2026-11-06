@@ -24,13 +24,13 @@
 //! 4. 响应按原始字节流式转发（chunked / gzip 保持原样），仅在 3xx 时按需把 `Location`
 //!    重写为 `/<prefix>/<绝对URL>`，使重定向后的请求继续走本代理。
 
-use crate::buffer_pool::{AdaptiveBuffer, BufferPool};
-use crate::http_body::{forward_chunked_body, forward_content_length_body};
-use crate::http_response::write_response;
-use crate::http_util::{
+use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
+use crate::protocol::http_response::write_response;
+use crate::protocol::http_util::{
     authority_of, connection_named_headers, find_header_end, is_hop_by_hop, MAX_HEAD_BYTES,
 };
-use crate::net::{connect_host, is_benign_close_error, AsyncStream};
+use crate::support::net::{connect_host, is_benign_close_error, AsyncStream};
+use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
@@ -289,7 +289,7 @@ async fn connect_upstream(
     if parsed.scheme() == "https" {
         // 客户端 TLS 统一走 rustls（见 tls_client 模块）：
         // 默认系统根证书严格校验，`path_proxy_insecure_tls` 才跳过链/主机名校验
-        let tls = crate::tls_client::connect_tls(tcp, host, cfg.insecure_tls, timeout)
+        let tls = crate::transport::tls_client::connect_tls(tcp, host, cfg.insecure_tls, timeout)
             .await
             .with_context(|| format!("TLS handshake with {} failed", host))?;
         debug!("Path-proxy: TLS established with {}:{}", host, port);

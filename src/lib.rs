@@ -7,45 +7,41 @@
 //! - 模块可见性显式化（原先全部是 bin 私有的 `mod`，无法被任何外部测试引用）；
 //! - `main.rs` 收敛到个位数行，入口与编排（[`app`]）分离。
 //!
-//! 模块分层（自底向上，箭头方向即依赖方向，无反向引用）：
+//! 目录分层（自底向上，箭头方向即依赖方向，无反向引用）：
 //!
 //! ```text
-//! 叶子层（无内部依赖）：
-//!   buffer_pool  stream  net  http_util  http_body  http_response  logging
+//! 支撑层 support：buffer_pool  logging  net
 //!
-//! 中层：
-//!   config   → logging
-//!   auth     → config, http_response
-//!   tls      → buffer_pool
-//!   tls_client            （客户端 TLS：自检客户端 / 路径模式上游共用）
-//!   client   → net, tls_client        （`test-proxy` 自检客户端）
+//! 传输层 transport：tls（服务端证书）tls_client（客户端握手）proxy_protocol  stream
+//!   → support（TLS 热重载复用缓冲池）
 //!
-//! 处理层：
-//!   proxy        → auth, path_proxy, http_body, http_util, http_response, net, stream, buffer_pool
-//!   path_proxy   → net, http_body, http_util, http_response, buffer_pool, tls_client
-//!   proxy_protocol → stream
+//! 协议层 protocol：proxy（读头/分类/CONNECT/经典转发）path_proxy  auth
+//!                 http_util  http_body  http_response
+//!   → config, support, transport::stream, transport::tls_client
 //!
-//! 装配层：
-//!   server → tls, proxy_protocol, proxy, path_proxy, config, buffer_pool, stream
-//!   service → config, logging, server
-//!   app    → 以上全部 + clap 分派
+//! 配置层 config：mod（模型与运行时派生）schema（声明层唯一真源）
+//!   → support::logging
+//!
+//! 装配与外围：
+//!   server   → protocol, transport, support, config（监听、分派、优雅关闭）
+//!   service  → config, support::logging, server（系统服务安装与管理）
+//!   client   → support::net, transport::tls_client（`test-proxy` 自检客户端）
+//!   app      → 以上全部 + clap 分派
 //! ```
+//!
+//! 旧的平铺路径（如 `rust_proxy::http_util`）通过文末的 `pub use` 保留，避免
+//! 仅因目录调整破坏已有调用方；新代码请使用分层路径（`rust_proxy::protocol::...`）。
 
 pub mod app;
-pub mod auth;
-pub mod buffer_pool;
 pub mod client;
 pub mod config;
-pub mod http_body;
-pub mod http_response;
-pub mod http_util;
-pub mod logging;
-pub mod net;
-pub mod path_proxy;
-pub mod proxy;
-pub mod proxy_protocol;
+pub mod protocol;
 pub mod server;
 pub mod service;
-pub mod stream;
-pub mod tls;
-pub mod tls_client;
+pub mod support;
+pub mod transport;
+
+// 兼容旧路径：这些模块只是换了目录，类型与函数可见性未变。
+pub use protocol::{auth, http_body, http_response, http_util, path_proxy, proxy};
+pub use support::{buffer_pool, logging, net};
+pub use transport::{proxy_protocol, stream, tls, tls_client};

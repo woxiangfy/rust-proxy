@@ -25,7 +25,7 @@ use windows_service::{
 };
 
 use crate::config::Args;
-use crate::logging;
+use crate::support::logging;
 use crate::server;
 
 use super::{parse_service_args, DEFAULT_SERVICE_DESCRIPTION};

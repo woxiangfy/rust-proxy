@@ -244,28 +244,28 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 
 ## 架构
 
-代码已整理为库（`src/lib.rs`）+ 薄壳二进制（`src/main.rs`，11 行），因此集成测试可以起真实代理做端到端验证。`proxy.rs` 通过 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关（HTTP 明文 / TLS）的请求处理。
+代码已整理为库（`src/lib.rs`）+ 薄壳二进制（`src/main.rs`，11 行），因此集成测试可以起真实代理做端到端验证。`src/protocol/proxy.rs` 通过 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关（HTTP 明文 / TLS）的请求处理。
 
 | 模块 | 职责 |
 | --- | --- |
-| `lib.rs` / `main.rs` | 库入口（模块导出与分层）/ 薄壳二进制 |
+| `lib.rs` / `main.rs` | 库入口（分层导出、兼容旧路径）/ 薄壳二进制 |
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
-| `proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发（`Host` 按绝对 URL 重写 / 补写） |
-| `auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
+| `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭（装配入口） |
+| `config/mod.rs` / `config/schema.rs` | 配置加载、运行时派生与校验 / 声明层字段表（统一生成 CLI、TOML、服务参数） |
+| `protocol/proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发（`Host` 按绝对 URL 重写 / 补写） |
+| `protocol/path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
+| `protocol/auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
+| `protocol/http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
+| `protocol/http_body.rs` | chunked 分帧状态机与流式转发 |
+| `protocol/http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 / 400 共用骨架） |
+| `transport/tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
+| `transport/tls_client.rs` | 客户端 TLS 配置与握手：系统根证书 / `insecure` 跳过校验 |
+| `transport/proxy_protocol.rs` | PROXY Protocol v1/v2 解析、模式映射、真实地址解析（`PpPolicy`） |
+| `transport/stream.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
+| `support/net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
+| `support/buffer_pool.rs` | 自适应缓冲区池 |
+| `support/logging.rs` | 按大小滚动日志（10MB / 10 个文件） |
 | `client.rs` | `test-proxy` 自检客户端（CONNECT + TLS，证书校验由 `tls_client` 提供） |
-| `tls_client.rs` | 客户端 TLS 配置与握手：系统根证书 / `insecure` 跳过校验（自检客户端与路径模式上游共用） |
-| `path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、头过滤、流式回传、Location 重写 |
-| `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭 |
-| `tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
-| `proxy_protocol.rs` | PROXY Protocol v1/v2 解析、模式映射、真实地址解析（`PpPolicy`） |
-| `config.rs` / `config/schema.rs` | 配置声明与合并（声明层字段表统一生成 CLI/TOML/服务参数结构） |
-| `net.rs` | 上游连接（DNS/IPv4/IPv6）、`host:port` 解析、错误分级 |
-| `http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
-| `http_body.rs` | chunked 分帧状态机与流式转发 |
-| `http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 / 400 共用骨架） |
-| `stream.rs` | `PrefixedStream`（PROXY 前缀回填 / CONNECT 提前读） |
-| `buffer_pool.rs` | 自适应缓冲区池 |
-| `logging.rs` | 按大小滚动日志（10MB / 10 个文件） |
 | `service/`（`mod` + `args` + `windows` + `unix`） | 系统服务安装与管理：`args` 负责参数适配与 argv 序列化，状态查询跨平台共用；SCM 与 systemd 的差异各自成文件 |
 
 前台 `start` 也支持优雅关停：SIGINT/SIGTERM（Linux/macOS）与 Ctrl+C（Windows）后停止接受新连接、等待活跃连接处理完再退出。

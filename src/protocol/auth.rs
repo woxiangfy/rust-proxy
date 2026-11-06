@@ -7,7 +7,7 @@
 //! 凭据比较是等时的（[`constant_time_eq`]），避免通过响应时间推测用户名/密码前缀。
 
 use crate::config::AuthUser;
-use crate::http_response::write_response;
+use crate::protocol::http_response::write_response;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use tokio::io::AsyncWrite;
 

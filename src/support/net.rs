@@ -1,6 +1,6 @@
 //! 网络传输原语：异步连接、`host:port` 解析、IO 错误分类
 //!
-//! 这些原语同时被经典代理（[`crate::proxy`]）与路径前缀直连（[`crate::path_proxy`]）
+//! 这些原语同时被经典代理（[`crate::protocol::proxy`]）与路径前缀直连（[`crate::protocol::path_proxy`]）
 //! 复用。历史上它们定义在 `proxy.rs` 内，导致 `path_proxy` 必须反向依赖 `proxy`，
 //! 与 `proxy → path_proxy` 共同构成模块级循环依赖。独立成叶模块后依赖方向变为单向：
 //!

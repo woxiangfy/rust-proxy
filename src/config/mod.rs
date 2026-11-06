@@ -1,4 +1,4 @@
-//! Configuration module for loading and managing settings
+//! 配置层：模型定义、加载、CLI 合并与运行时派生
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 // `LogLevel` 属于日志域，定义在 `logging` 模块（见 B4）。
 // 这里重新导出，既保持 `config::LogLevel` 这个既有路径可用，又让依赖方向变成
-// `config → logging`（单向），避免 `logging` 为了一个枚举反查配置模块。
-pub use crate::logging::LogLevel;
+// `config → support::logging`（单向），避免 logging 为了一个枚举反查配置模块。
+pub use crate::support::logging::LogLevel;
 
 // 声明层：配置项的唯一真源。`ServerRunArgs` / `Config` / `ServiceArgs`
 // 均由 `src/config/schema.rs` 的字段表生成，这里重导出以保持既有路径
@@ -181,7 +181,7 @@ pub struct Args {
     /// 路径前缀直连模式的前缀（`None` 表示不启用该模式）
     ///
     /// 启用后 `/px/https://example.com/` 这类请求会由代理服务器直连上游并回传内容。
-    /// 前缀合法性在 `server` 层构造 [`crate::path_proxy::PathProxyConfig`] 时校验。
+    /// 前缀合法性在 `server` 层构造 [`crate::protocol::path_proxy::PathProxyConfig`] 时校验。
     pub path_proxy_prefix: Option<String>,
     /// 路径前缀直连模式是否跳过上游 TLS 证书校验
     pub path_proxy_insecure_tls: bool,

@@ -3,20 +3,20 @@
 //! 读头复用池化缓冲区（常见请求零拷贝），转发阶段不缓冲整个 body。
 //! 反扫描与请求走私两类安全约束集中在本模块的读头、分类与建头段。
 
-use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
-use crate::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};
+use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
+use crate::protocol::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};
 use crate::config::AuthUser;
-use crate::http_body::{forward_chunked_body, forward_content_length_body};
-use crate::http_response::write_response;
-use crate::http_util::{
+use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
+use crate::protocol::http_response::write_response;
+use crate::protocol::http_util::{
     authority_of, connection_named_headers, find_header_end, head_end_offset, is_hop_by_hop,
     MAX_HEAD_BYTES,
 };
-use crate::net::{connect_host, is_benign_close_error, parse_host_port};
-use crate::path_proxy::{
+use crate::support::net::{connect_host, is_benign_close_error, parse_host_port};
+use crate::protocol::path_proxy::{
     handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
 };
-use crate::stream::PrefixedStream;
+use crate::transport::stream::PrefixedStream;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use log::{debug, error, info, warn};
 /// 认证（`Proxy-Authorization` 头），否则返回 407 并关闭连接。
 ///
 /// `path_proxy` 为 `Some` 时额外启用路径前缀直连模式
-/// （`/px/https://example.com/` → 直连该站点，见 [`crate::path_proxy`]）。
+/// （`/px/https://example.com/` → 直连该站点，见 [`crate::protocol::path_proxy`]）。
 pub async fn handle_client(
     client: TcpStream,
     timeout: u64,
@@ -1051,7 +1051,7 @@ mod tests {
     }
 
     // ─── host:port 解析 / chunked 分帧 ───
-    // 这两组原语的实现与测试已迁至 `crate::net` 与 `crate::http_body`（消除模块循环依赖）。
+    // 这两组原语的实现与测试已迁至 `crate::support::net` 与 `crate::protocol::http_body`（消除模块循环依赖）。
 
     // ─── 转发目标解析（B3 拆分后的纯函数） ───
 

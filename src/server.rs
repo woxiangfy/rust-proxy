@@ -4,8 +4,8 @@
 //! 支持同时监听 HTTP 和 HTTPS (TLS) 两个端口。
 //!
 //! 本模块只保留"accept → 分派 → 处理"这条主干，两个子系统已拆为独立模块：
-//! - 证书体系与热重载：[`crate::tls`]
-//! - PROXY Protocol 解析：[`crate::proxy_protocol`]
+//! - 证书体系与热重载：[`crate::transport::tls`]
+//! - PROXY Protocol 解析：[`crate::transport::proxy_protocol`]
 //!
 //! TLS 启用语义（严格）：
 //! 1. 用户**显式指定了 `https_port`**（命令行 `--https-port` 或配置文件 `https_port`）
@@ -24,12 +24,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::buffer_pool::BufferPool;
 use crate::config::{Args, AuthUser, ProxyProtocolMode};
-use crate::path_proxy::PathProxyConfig;
-use crate::proxy::{handle_client, handle_client_with_addr};
-use crate::proxy_protocol::{resolve_real_addr, PpPolicy};
-use crate::tls::{
+use crate::protocol::path_proxy::PathProxyConfig;
+use crate::protocol::proxy::{handle_client, handle_client_with_addr};
+use crate::support::buffer_pool::BufferPool;
+use crate::transport::proxy_protocol::{resolve_real_addr, PpPolicy};
+use crate::transport::tls::{
     build_tls_reloader, generate_self_signed_reloader, handle_tls_reload, TlsReloader, TlsSource,
     SELF_SIGNED_VALIDITY_YEARS, TLS_RELOAD_CHECK_INTERVAL_SECS,
 };

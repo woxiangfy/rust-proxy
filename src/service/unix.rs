@@ -12,7 +12,7 @@ use log::{error, info};
 use service_manager::{ServiceInstallCtx, ServiceLabel, ServiceManager};
 
 use crate::config::Args;
-use crate::logging;
+use crate::support::logging;
 use crate::server;
 
 use super::parse_service_args;

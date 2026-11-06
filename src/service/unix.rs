@@ -9,13 +9,37 @@
 
 use anyhow::{Context, Result};
 use log::{error, info};
-use service_manager::{ServiceInstallCtx, ServiceManager};
+use service_manager::{ServiceInstallCtx, ServiceLabel, ServiceManager};
 
 use crate::config::Args;
 use crate::logging;
 use crate::server;
 
 use super::parse_service_args;
+
+/// 查询 systemd 单元的细分状态（`failed` / `activating` / `inactive` ...）
+///
+/// 只有 Linux 有意义；其他 Unix 没有 systemctl，返回 `None` 让上层按普通 stopped 处理。
+/// 用 `is-active` 而不是 `status`：前者直接输出状态词，不依赖退出码的含义。
+#[cfg(target_os = "linux")]
+pub(super) fn inactive_state(label: &ServiceLabel) -> Option<String> {
+    let output = std::process::Command::new("systemctl")
+        .arg("is-active")
+        .arg(label.to_script_name())
+        .output()
+        .ok()?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if state.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn inactive_state(_label: &ServiceLabel) -> Option<String> {
+    None
+}
 
 /// 安装服务（平台 manager 的选择见模块注释）
 pub(super) fn install(ctx: ServiceInstallCtx) -> Result<()> {

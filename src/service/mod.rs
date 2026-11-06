@@ -49,6 +49,10 @@ const DEFAULT_SERVICE_DESCRIPTION: &str = "Rust HTTP Proxy Server";
 /// 紧接着执行 start / uninstall 否则可能撞上 "service is marked for deletion"。
 const SERVICE_STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// start 后复检的短暂等待：Type=simple 的 unit 在 `systemctl start` 返回时可能
+/// 还没完成 active/failed 迁移，立刻查一次状态会有竞态。
+const SERVICE_START_VERIFY_GRACE: Duration = Duration::from_millis(300);
+
 /// 构造服务名对应的 [`ServiceLabel`]
 ///
 /// 常量非法只可能是代码写错（`ServiceLabel` 只拒绝空白与非法字符），
@@ -62,6 +66,64 @@ fn service_label() -> ServiceLabel {
 /// 平台原生 manager（uninstall / start / stop / status 共用）
 fn native_manager() -> Result<Box<dyn ServiceManager>> {
     <dyn ServiceManager>::native().context("Failed to detect service management platform")
+}
+
+/// 查询 stopped 单元的细分状态（仅 Linux systemd 有值）
+///
+/// `service-manager` 把 `systemctl status` 的退出码 3 统一映射成
+/// `Stopped(None)`，`failed` / `activating` 与普通 `inactive` 都落在这一类。
+/// 这里补一次 `systemctl is-active`，避免把 failed 误报成 stopped。
+#[cfg(not(windows))]
+fn platform_inactive_state(label: &ServiceLabel) -> Option<String> {
+    unix::inactive_state(label)
+}
+
+#[cfg(windows)]
+fn platform_inactive_state(_label: &ServiceLabel) -> Option<String> {
+    None
+}
+
+/// 状态展示文本（纯函数，便于不依赖 systemd 的字符串级测试）
+fn render_status(status: &ServiceStatus, inactive_state: Option<&str>) -> String {
+    match status {
+        ServiceStatus::Running => "Service is running".to_string(),
+        ServiceStatus::NotInstalled => "Service is not installed".to_string(),
+        ServiceStatus::Stopped(reason) => {
+            let suffix = reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(": {r}"))
+                .unwrap_or_default();
+            match inactive_state {
+                Some("failed") => {
+                    format!("Service is failed (unit entered failed state){suffix}")
+                }
+                Some("activating") | Some("reloading") => {
+                    format!("Service is starting (activating){suffix}")
+                }
+                Some("deactivating") => format!("Service is stopping (deactivating){suffix}"),
+                Some(state) if state != "inactive" && state != "unknown" => {
+                    format!("Service is stopped ({state}){suffix}")
+                }
+                _ => format!("Service is stopped{suffix}"),
+            }
+        }
+    }
+}
+
+/// 服务日志排查提示（Linux 给出 systemd 命令，其他平台只给通用建议）
+fn service_log_hints(label: &ServiceLabel) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let name = label.to_script_name();
+        format!(
+            "Next steps:\n  systemctl status {name}\n  journalctl -u {name} -n 50 --no-pager"
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("Check the service manager logs for '{}' for details.", label)
+    }
 }
 
 /// 解析服务模式下的运行参数
@@ -172,6 +234,46 @@ pub fn start_service() -> Result<()> {
         })
         .context("Failed to start service")?;
 
+    // Linux：`systemctl start` 对 Type=simple 的 unit 只保证"已 fork"，进程随后
+    // 立刻退出时它仍返回 0。必须复检状态，否则会把失败的服务报告成启动成功。
+    // 用 `cfg!` 而非 `#[cfg]`，让这段代码在所有平台都参与类型检查，运行时仅 Linux 生效。
+    if cfg!(target_os = "linux") {
+        let mut status = manager.status(ServiceStatusCtx {
+            label: label.clone(),
+        });
+        if !matches!(&status, Ok(ServiceStatus::Running)) {
+            std::thread::sleep(SERVICE_START_VERIFY_GRACE);
+            status = manager.status(ServiceStatusCtx {
+                label: label.clone(),
+            });
+        }
+
+        match status {
+            Ok(ServiceStatus::Running) => {}
+            Ok(status) => {
+                let inactive = platform_inactive_state(&label);
+                eprintln!(
+                    "Service did not stay running: {}\n{}",
+                    render_status(&status, inactive.as_deref()),
+                    service_log_hints(&label)
+                );
+                return Err(anyhow::anyhow!(
+                    "Service '{}' failed to stay running",
+                    label
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to verify service status after start: {e}\n{}",
+                    service_log_hints(&label)
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to verify service status after start: {e}"
+                ));
+            }
+        }
+    }
+
     println!("Service started successfully");
     Ok(())
 }
@@ -208,20 +310,15 @@ pub fn status_service() -> Result<()> {
         })
         .context("Failed to get service status")?;
 
-    match status {
-        ServiceStatus::Running => {
-            println!("Service is running");
-        }
-        ServiceStatus::Stopped(reason) => {
-            if let Some(r) = reason {
-                println!("Service is stopped: {}", r);
-            } else {
-                println!("Service is stopped");
-            }
-        }
-        ServiceStatus::NotInstalled => {
-            println!("Service is not installed");
-        }
+    let inactive = match &status {
+        ServiceStatus::Stopped(_) => platform_inactive_state(&label),
+        _ => None,
+    };
+    println!("{}", render_status(&status, inactive.as_deref()));
+
+    // failed 是启动失败后 systemd 留下的状态，普通 stopped（用户主动 stop）不需要提示。
+    if inactive.as_deref() == Some("failed") {
+        println!("{}", service_log_hints(&label));
     }
 
     Ok(())
@@ -550,5 +647,55 @@ mod tests {
         let parsed = RunAsServiceArgs::try_parse_from(argv).unwrap();
         assert!(parsed.run_as_service);
         assert_eq!(parsed.run_args, expected);
+    }
+
+    /// 风险：failed 单元必须显示为 failed，不能被 systemd 退出码 3 统一吞成 "stopped"。
+    #[test]
+    fn test_render_status_distinguishes_failed_and_activating() {
+        assert_eq!(
+            render_status(&ServiceStatus::Running, None),
+            "Service is running"
+        );
+        assert_eq!(
+            render_status(&ServiceStatus::NotInstalled, None),
+            "Service is not installed"
+        );
+
+        // 用户主动 stop 的普通状态保持原样
+        assert_eq!(
+            render_status(&ServiceStatus::Stopped(None), Some("inactive")),
+            "Service is stopped"
+        );
+
+        let failed = render_status(&ServiceStatus::Stopped(None), Some("failed"));
+        assert!(failed.starts_with("Service is failed"), "{failed}");
+
+        let activating = render_status(&ServiceStatus::Stopped(None), Some("activating"));
+        assert!(activating.contains("starting"), "{activating}");
+
+        // service-manager 若将来带上 reason，后缀不能被丢掉
+        let with_reason = render_status(
+            &ServiceStatus::Stopped(Some("exit code 1".into())),
+            Some("failed"),
+        );
+        assert!(with_reason.contains("exit code 1"), "{with_reason}");
+    }
+
+    /// 风险：start 复检失败时必须给出可直接执行的 systemd 排查命令，而不是只报一句错误。
+    #[test]
+    fn test_start_failure_hints_point_to_systemd_logs() {
+        let hints = service_log_hints(&service_label());
+        #[cfg(target_os = "linux")]
+        {
+            assert!(hints.contains("systemctl status rust-proxy"), "{hints}");
+            assert!(
+                hints.contains("journalctl -u rust-proxy -n 50 --no-pager"),
+                "{hints}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(hints.contains("service manager logs"), "{hints}");
+        }
     }
 }

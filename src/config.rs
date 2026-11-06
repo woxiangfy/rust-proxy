@@ -1066,6 +1066,22 @@ path_proxy_rewrite_location = false
     }
 
     #[test]
+    fn test_config_rejects_wrong_value_type() {
+        // 风险：类型错误（如把端口写成字符串）必须失败关闭，不能静默落回默认值——
+        // 静默降级会让用户以为改过了，实际仍监听旧端口。
+        let dir = std::env::temp_dir().join("rust_proxy_cfg_wrong_type");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        std::fs::write(&f, "port = \"8080\"\n").unwrap();
+        let err = load_config(&f).expect_err("类型错误必须报错");
+        assert!(
+            format!("{err:#}").contains("Failed to parse config"),
+            "错误信息应指出解析失败：{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_config_rejects_top_level_key_placed_after_auth_table() {
         // TOML 语义：开过 [[auth]] 之后写的键都属于该数组元素。
         // 把顶层键写在其后会被当成 AuthUser 的字段，必须报错，

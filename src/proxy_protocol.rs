@@ -80,15 +80,6 @@ impl TryFrom<ProxyProtocolMode> for PpParseMode {
     }
 }
 
-/// 判断字节开头是否为 PROXY Protocol v1/v2 签名候选。
-///
-/// `seen` 为连接首字节（至少 6 字节）：
-/// - v1：以 ASCII `PROXY ` 开头
-/// - v2：前 6 字节与 v2 签名头一致
-///
-/// 普通 HTTP 请求首行（如 `GET /`、`CONNECT h`）不会匹配，从而被当作直连流量处理。
-///
-/// 该函数当前仅由单元测试直接使用；运行时签名检测在 [`parse_proxy_protocol`] 内部完成。
 /// PROXY Protocol 策略：两个 listener 各自有独立模式，共享可信 IP 白名单
 pub(crate) struct PpPolicy {
     pub(crate) http_mode: ProxyProtocolMode,
@@ -173,6 +164,10 @@ pub(crate) async fn resolve_real_addr(
     }
 }
 
+/// 判断前 6 字节是否为 v1/v2 签名候选（**仅供单测**）
+///
+/// 运行时由 [`parse_proxy_protocol`] 内部直接比较，不经过本函数；
+/// 这里保留一份同构实现，便于单独验证"普通 HTTP 首行不匹配签名"。
 #[cfg(test)]
 fn is_proxy_signature(seen: &[u8]) -> bool {
     if seen.len() < 6 {
@@ -572,41 +567,42 @@ mod tests {
         assert!(parse_pp_v2_addr(fam, short_data).is_err());
     }
 
-    // ─── PROXY Protocol v2 安全校验测试 ───
+    /// 风险：半截 PROXY 头必须在上限时间内超时，不能永久占用连接。
+    ///
+    /// 用 `start_paused` 虚拟时钟，避免真实等待 `PP_HEADER_TIMEOUT_SECS` 秒；
+    /// 客户端保持连接不关闭，服务端只能靠超时退出。
+    #[tokio::test(start_paused = true)]
+    async fn test_pp_header_parse_times_out() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
 
-    #[test]
-    fn test_pp_v2_cmd_unspecified_returns_error() {
-        // cmd = 0x02 (未定义的命令) → 应返回错误
-        let ver_cmd = 0x22u8; // version=2, cmd=2 (未定义)
-        let cmd = ver_cmd & 0x0F;
-        assert_ne!(cmd, 0, "cmd should not be LOCAL");
-        assert_ne!(cmd, 1, "cmd should not be PROXY");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+
+        // 签名匹配但行不完整：解析会进入 v1 行读取并等待剩余的 CRLF。
+        client
+            .write_all(b"PROXY TCP4 1.2.3.4 5.6.7.8 12345 80")
+            .await
+            .expect("write partial header");
+
+        let started = tokio::time::Instant::now();
+        let err = match parse_proxy_protocol(server, PpParseMode::Auto).await {
+            Ok(_) => panic!("半截头必须超时失败"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_secs(PP_HEADER_TIMEOUT_SECS),
+            "超时应使用统一上限，而不是无限等待"
+        );
     }
 
-    #[test]
-    fn test_pp_max_header_len_constant_is_reasonable() {
-        const {
-            assert!(
-                PP_MAX_HEADER_LEN >= 512,
-                "max header len should be at least 512"
-            );
-            assert!(
-                PP_MAX_HEADER_LEN < 65535,
-                "max header len should be well below u16::MAX"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pp_header_timeout_constant_is_reasonable() {
-        const {
-            assert!(PP_HEADER_TIMEOUT_SECS >= 5, "timeout should be at least 5s");
-            assert!(
-                PP_HEADER_TIMEOUT_SECS <= 60,
-                "timeout should be at most 60s"
-            );
-        }
-    }
+    // ─── PROXY Protocol 安全校验测试 ───
+    // v2 未知命令 / 超长 len / 超长 v1 头 / 不可信来源不解析，均是对真实 socket
+    // 的端到端用例（tests/e2e.rs），这里不再复刻常量与位运算断言。
 
     #[test]
     fn test_is_proxy_signature_detects_v1_prefix() {

@@ -1,4 +1,7 @@
-//! Proxy module containing HTTP proxy request handling logic with zero-copy buffer reuse
+//! HTTP 代理请求处理：读头、分类、认证、分流到 CONNECT / 经典转发 / 路径前缀直连
+//!
+//! 读头复用池化缓冲区（常见请求零拷贝），转发阶段不缓冲整个 body。
+//! 反扫描与请求走私两类安全约束集中在本模块的读头、分类与建头段。
 
 use crate::buffer_pool::{AdaptiveBuffer, BufferPool, PooledBuffer, BUFFER_SIZE};
 use crate::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};

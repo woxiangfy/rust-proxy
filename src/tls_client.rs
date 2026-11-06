@@ -11,7 +11,7 @@
 //!
 //! **insecure 的安全边界**：自定义校验器只跳过"证书链与主机名校验"，握手签名仍由
 //! rustls 的密码学后端验证（对端必须持有证书对应的私钥），不是对整个 TLS 握手放行。
-//! 这条路径只应由用户显式开启（`--proxy-insecure` / `path_proxy_insecure_tls`）。
+//! 这条路径只应由用户显式开启（`--path-proxy-insecure` / `path_proxy_insecure_tls`）。
 
 use anyhow::{Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

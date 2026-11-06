@@ -21,6 +21,9 @@
 //! 13. 截断的请求头（客户端发完半截就关闭）直接丢弃，不转发给上游
 //! 14. 经典代理收到 `https://` absolute-form 直接回 400，不尝试连接（https 必须走 CONNECT）
 //! 15. `Connection` 头点名的自定义逐跳字段不转发给上游（RFC 7230 §6.1）
+//! 16. 配置认证后，非代理请求仍 404（407 只出现在合法代理请求上）
+//! 17. PROXY Protocol 畸形头（未知命令 / 超长 len / 超长 v1）直接断开；不可信来源不解析
+//! 18. 路径前缀直连：非法目标 400、上游不可达 502、前缀边界仍 404
 //!
 //! 全部走 loopback，不依赖外网，可在 CI 稳定运行。
 
@@ -994,6 +997,179 @@ async fn https_absolute_form_is_rejected_with_400() {
     )
     .await;
     assert_eq!(status_code(&resp), 200, "http absolute-form 仍应正常转发");
+}
+
+/// 断言非法 PROXY 头的连接被服务端直接丢弃（零字节或 RST），且不挂起。
+///
+/// Windows 上关闭仍有未读数据的 socket 会发 RST，客户端表现为 `ConnectionReset`；
+/// 语义与 EOF 相同（连接被拒），一并接受。
+async fn assert_connection_dropped(addr: SocketAddr, payload: &[u8]) {
+    let mut sock = TcpStream::connect(addr).await.expect("connect proxy");
+    sock.write_all(payload).await.expect("write pp payload");
+
+    let mut buf = Vec::new();
+    match tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut buf)).await {
+        Err(_) => panic!("非法 PROXY 头应被立即断开，不能挂在半开状态"),
+        Ok(Ok(n)) => assert_eq!(
+            n, 0,
+            "非法 PROXY 头不得得到任何响应字节：{:?}",
+            String::from_utf8_lossy(&buf)
+        ),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Ok(Err(e)) => panic!("unexpected io error while reading: {e}"),
+    }
+}
+
+/// 风险：配置认证后，非代理请求仍必须 404 且不带任何质询头。
+///
+/// 若把 407 放在请求分类之前，扫描器发一行 `GET /` 就能确认这是代理端口；
+/// 对照组同时确认 407 仍然只作用于合法代理请求，没有被"反扫描"误伤。
+#[tokio::test]
+async fn auth_challenge_is_only_for_valid_proxy_requests() {
+    let mut args = base_args();
+    args.auth = Some(vec![AuthUser {
+        username: "alice".into(),
+        password: "s3cret".into(),
+    }]);
+    let proxy = spawn_proxy(args).await;
+
+    let resp = request_raw(
+        proxy.addr,
+        b"GET / HTTP/1.1\r\nHost: whatever\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status_code(&resp), 404, "非代理请求不得得到 407");
+    let lower = String::from_utf8_lossy(&resp).to_lowercase();
+    assert!(
+        !lower.contains("proxy-authenticate") && !lower.contains("www-authenticate"),
+        "404 不得携带任何认证质询头：{lower}"
+    );
+
+    // 对照组：合法代理请求无凭据时必须是 407
+    let origin = spawn_origin().await;
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET http://{origin}/auth HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 407, "合法代理请求必须接受认证质询");
+}
+
+/// 风险：PROXY v2 的未知命令与超长 len 必须让连接直接失效。
+///
+/// 未知命令若被当作普通流量放行，等于绕过来源校验；len 不设上限则一个 4 字节字段
+/// 就能让服务端分配 64KB 级缓冲（`vec![0u8; len]`），是廉价的远程内存放大。
+#[tokio::test]
+async fn proxy_protocol_rejects_malformed_v2_headers() {
+    let mut args = base_args();
+    args.http_proxy_protocol = ProxyProtocolMode::Auto;
+    let proxy = spawn_proxy(args).await;
+    let signature = b"\r\n\r\n\x00\r\nQUIT\n";
+
+    // (a) cmd = 2（未定义命令）
+    let mut payload = signature.to_vec();
+    payload.extend_from_slice(&[0x22, 0x11, 0x00, 0x00]);
+    assert_connection_dropped(proxy.addr, &payload).await;
+
+    // (b) len = 513，超过 PP_MAX_HEADER_LEN（512）；服务端读到长度字段就必须拒绝，
+    //     不需要真的把 513 字节地址数据发完
+    let mut payload = signature.to_vec();
+    payload.extend_from_slice(&[0x21, 0x11, 0x02, 0x01]);
+    assert_connection_dropped(proxy.addr, &payload).await;
+}
+
+/// 风险：v1 头超过规范上限（107 字节）时必须停止读取并断开。
+///
+/// 不设上限会让攻击者用一条连接持续灌入文本行，占用连接名额与内存
+/// （`PP_HEADER_TIMEOUT_SECS` 只能限制时间，不能限制字节）。
+#[tokio::test]
+async fn proxy_protocol_rejects_oversized_v1_header() {
+    let mut args = base_args();
+    args.http_proxy_protocol = ProxyProtocolMode::Auto;
+    let proxy = spawn_proxy(args).await;
+
+    let mut payload = b"PROXY TCP4 ".to_vec();
+    payload.extend_from_slice(&[b'a'; 200]);
+    payload.extend_from_slice(b"\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_connection_dropped(proxy.addr, &payload).await;
+}
+
+/// 风险：来自不可信 IP 的 PROXY 头不得被解析（否则客户端可伪造真实 IP）。
+///
+/// 把可信列表设成另一个网段，让 loopback 成为不可信来源：伪造头应被当作普通数据，
+/// 请求行 `PROXY TCP4 ...` 无法分类而返回 404，而不是按正常代理请求转发。
+#[tokio::test]
+async fn proxy_protocol_untrusted_source_is_not_parsed() {
+    let origin = spawn_origin().await;
+    let mut args = base_args();
+    args.http_proxy_protocol = ProxyProtocolMode::Auto;
+    args.proxy_protocol_trusted_ips = vec!["10.0.0.1".parse().unwrap()];
+    let proxy = spawn_proxy(args).await;
+
+    let mut req = b"PROXY TCP4 203.0.113.9 127.0.0.1 40000 80\r\n".to_vec();
+    req.extend_from_slice(
+        format!("GET http://{origin}/forged HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    );
+    let resp = request_raw(proxy.addr, &req).await;
+
+    assert_eq!(
+        status_code(&resp),
+        404,
+        "不可信来源的 PROXY 头必须被忽略（否则会得到 200）"
+    );
+}
+
+/// 风险：路径前缀模式的错误分支与边界必须可区分。
+///
+/// 非法目标不能把任意 scheme 交给连接层；上游不可达要明确回 502；`/pxx/...`
+/// 不能被当成 `/px/...`，否则前缀口令可被同前缀路径绕过。
+#[tokio::test]
+async fn path_prefix_rejects_invalid_target_and_unreachable_upstream() {
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let proxy = spawn_proxy(args).await;
+
+    // (a) 非 http(s) scheme → 400
+    let resp = request_raw(
+        proxy.addr,
+        b"GET /px/ftp://example.com/a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status_code(&resp), 400, "只允许 http/https 目标");
+
+    // (b) 目标不是合法 URL → 400
+    let resp = request_raw(
+        proxy.addr,
+        b"GET /px/not-a-url HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status_code(&resp), 400, "非法目标 URL 不得进入连接层");
+
+    // (c) 上游不可达 → 502（与经典代理一致，不能静默 EOF）
+    let dead = dead_addr().await;
+    let resp = request_raw(
+        proxy.addr,
+        format!("GET /px/http://{dead}/x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 502, "路径前缀模式的上游不可达应回 502");
+
+    // (d) 前缀边界：`/pxx/...` 不得命中 `/px`
+    let origin = spawn_origin().await;
+    let resp = request_raw(
+        proxy.addr,
+        format!(
+            "GET /pxx/http://{origin}/boundary HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 404, "前缀边界必须精确匹配");
 }
 
 /// 链路 15：`Connection` 头点名的自定义逐跳字段不得转发给上游

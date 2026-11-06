@@ -306,6 +306,40 @@ mod tests {
     }
 
     #[test]
+    fn test_chunked_malformed_data_crlf_stops_forwarding() {
+        // 风险：chunk 数据后不是 CRLF 时必须立即停止，不能继续"重新同步"。
+        // 否则畸形分帧会被当成合法 body 转发，代理与上游对边界的理解随之分叉。
+        let data = b"1\r\naX\r\n0\r\n\r\n";
+        let mut r = ChunkedBodyReader::new();
+        for (i, &b) in data.iter().enumerate() {
+            r.push_byte(b);
+            if r.done() {
+                assert_eq!(i, 4, "数据后不是 CRLF 时应在该字节（索引 4）立即停止");
+                return;
+            }
+        }
+        panic!("畸形分帧必须触发 done，而不是读到终止块");
+    }
+
+    #[test]
+    fn test_chunked_size_line_is_bounded() {
+        // 风险：超长 chunk-size 行使行缓冲无限增长（内存放大）。
+        // 状态机必须在 64 字节处停止，且不把后续字节当作合法分帧。
+        let data = vec![b'a'; 80];
+        let mut r = ChunkedBodyReader::new();
+        let mut consumed = 0;
+        for &b in &data {
+            r.push_byte(b);
+            consumed += 1;
+            if r.done() {
+                break;
+            }
+        }
+        assert!(r.done(), "超长 size 行必须停止");
+        assert_eq!(consumed, 65, "行缓冲上限 64 字节，加上触发判断的一字节");
+    }
+
+    #[test]
     fn test_chunked_size_with_extension_parsed() {
         let line: &[u8] = b"1a;ext=value\r\n";
         assert_eq!(parse_chunk_size(line), Some(0x1a));

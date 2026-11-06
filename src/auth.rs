@@ -234,6 +234,38 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_rejects_malformed_credentials() {
+        // 风险：畸形 Basic 凭据必须失败关闭，且解析过程不能 panic。
+        // (a) base64 合法但解码后没有 "user:pass" 分隔符
+        let no_colon = BASE64_STANDARD.encode("alicesecret");
+        let req = format!(
+            "GET http://example.com/ HTTP/1.1\r\n\
+            Proxy-Authorization: Basic {}\r\n\r\n",
+            no_colon
+        );
+        assert!(!check_proxy_auth(&req, &make_users()));
+
+        // (b) base64 合法但解码结果不是 UTF-8
+        let non_utf8 = BASE64_STANDARD.encode([0xff, 0xfe, b':', b'x']);
+        let req = format!(
+            "GET http://example.com/ HTTP/1.1\r\n\
+            Proxy-Authorization: Basic {}\r\n\r\n",
+            non_utf8
+        );
+        assert!(!check_proxy_auth(&req, &make_users()));
+
+        // (c) 只有方案、没有凭据（含尾随空格）
+        assert!(!check_proxy_auth(
+            "GET http://example.com/ HTTP/1.1\r\nProxy-Authorization: Basic\r\n\r\n",
+            &make_users()
+        ));
+        assert!(!check_proxy_auth(
+            "GET http://example.com/ HTTP/1.1\r\nProxy-Authorization: Basic \r\n\r\n",
+            &make_users()
+        ));
+    }
+
+    #[test]
     fn test_auth_header_name_case_insensitive() {
         // 头名小写、方案小写
         let req = "CONNECT example.com:443 HTTP/1.1\r\n\

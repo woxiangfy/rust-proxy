@@ -26,8 +26,9 @@
 //! 5. 上游建头与经典代理共用 [`crate::protocol::forward`]：畸形/冲突 `Content-Length`
 //!    统一返回 400，`Transfer-Encoding` 整行原样转发（不折叠编码声明）。
 //!
-//! 文件布局：本文件保留配置、前缀匹配与请求编排；上游连接/请求体在
-//! [`upstream`]，响应头读取与重建在 [`response`]。
+//! 文件布局：本文件保留配置、前缀匹配与请求编排；上游连接在 [`upstream`]，
+//! 请求体转发与经典代理共用 [`crate::protocol::relay::forward_request_body`]，
+//! 响应头读取与重建在 [`response`]。
 
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_response::write_response;
@@ -42,8 +43,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 mod response;
 mod upstream;
 
+use crate::protocol::relay::{forward_request_body, RelayLink, RequestBodyForward};
 use response::forward_response;
-use upstream::{connect_upstream, forward_request_body};
+use upstream::connect_upstream;
 /// 路径前缀直连模式配置
 #[derive(Debug, Clone)]
 pub struct PathProxyConfig {
@@ -255,38 +257,25 @@ pub(crate) async fn handle_path_proxy<S>(
     }
 
     // ── 4. 转发请求体（已缓冲前缀 + 流式剩余部分）──
+    // 与经典代理共用 relay::forward_request_body，仅用 RelayLink 区分日志来源
     let buffered_body = &request_data[head_end..];
-    let body_result = forward_request_body(
+    if forward_request_body(
         &mut client,
         &mut upstream,
-        buffered_body,
-        head.content_length,
-        head.chunked,
-        timeout,
-        buffer_pool,
+        RequestBodyForward {
+            buffered: buffered_body,
+            content_length: head.content_length,
+            chunked: head.chunked,
+            timeout,
+            buffer_pool,
+            link: RelayLink::PathPrefix,
+            client_addr,
+        },
     )
-    .await;
-    match body_result {
-        Ok(sent) => {
-            // 与经典代理保持一致：客户端提前关闭时不再往下走，但把差异记下来
-            if head.content_length.is_some_and(|cl| sent < cl) {
-                warn!(
-                    "Path-proxy: client {} closed before sending complete request body ({} of {} bytes)",
-                    client_addr,
-                    sent,
-                    head.content_length.unwrap_or(0)
-                );
-            }
-        }
-        Err(e) => {
-            if !is_benign_close_error(&e) {
-                warn!(
-                    "Path-proxy: failed to forward request body from {}: {}",
-                    client_addr, e
-                );
-            }
-            return;
-        }
+    .await
+    .is_err()
+    {
+        return;
     }
 
     // ── 5. 回传响应（必要时重写 Location）──

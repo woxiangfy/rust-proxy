@@ -258,10 +258,10 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `protocol/dispatch.rs` | 请求编排：读头 → 分类 → 认证 → 分流；反扫描 404 与超限 431 |
 | `protocol/request.rs` | 请求头读取与完整性判定（`Complete` / `Incomplete` / `Overflow`） |
 | `protocol/connect.rs` | CONNECT 隧道：建连、200 应答、双向转发、502 |
-| `protocol/relay.rs` | 经典转发流水线（建头 → 请求体 → 响应回传）；与路径前缀共用响应拷贝循环 |
+| `protocol/relay.rs` | 经典转发流水线（建头 → 请求体 → 响应回传）；与路径前缀共用请求体转发与响应拷贝循环（`RelayLink` 区分日志来源） |
 | `protocol/forward.rs` | 转发目标解析（IPv6 双表示）与上游建头（经典 / 路径前缀共用同一份） |
 | `protocol/path_proxy.rs` | 路径前缀模式：前缀匹配、配置校验与请求编排（门面） |
-| `protocol/path_proxy/upstream.rs` | 路径前缀模式：上游连接建立（http / https TLS）与请求体转发 |
+| `protocol/path_proxy/upstream.rs` | 路径前缀模式：上游连接建立（http / https TLS） |
 | `protocol/path_proxy/response.rs` | 路径前缀模式：响应头读取/重建、Location 重写与响应流回传 |
 | `protocol/auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
 | `protocol/http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |

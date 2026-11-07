@@ -1,7 +1,8 @@
 //! 响应回传与经典转发流水线
 //!
-//! 经典代理与路径前缀直连共用同一段「读上游 → 写客户端」循环（自适应缓冲、
-//! 单次读单次写、不解析响应语义），也共用同一种结束契约 [`RelayOutcome`]。
+//! 经典代理与路径前缀直连共用同一份请求体转发 [`forward_request_body`]（差异只有
+//! 日志标签 [`RelayLink`]），以及同一段「读上游 → 写客户端」循环（自适应缓冲、
+//! 单次读单次写、不解析响应语义）与结束契约 [`RelayOutcome`]。
 //! 各调用点只负责把 outcome 映射成日志级别与自身返回类型，映射规则统一为：
 //!
 //! | outcome | 日志 | 说明 |
@@ -104,147 +105,188 @@ async fn send_bad_request<W: AsyncWrite + Unpin>(client: &mut W) {
     .await;
 }
 
-/// 一次转发中各阶段共用的进程级参数
-struct RelayCtx<'a> {
-    client_addr: SocketAddr,
-    timeout: Duration,
-    buffer_pool: &'a BufferPool,
+/// 请求体转发所属链路（日志里用于区分经典代理与路径前缀）
+#[derive(Clone, Copy)]
+pub(super) enum RelayLink {
+    Classic,
+    PathPrefix,
 }
 
-impl RelayCtx<'_> {
-    /// 转发请求体：已缓冲字节 + 尚未读取的部分
-    ///
-    /// 分帧决策以 [`UpstreamHead`] 为准：
-    /// - chunked：交给分帧状态机（已缓冲字节必须先过状态机，终止块可能就在缓冲区里）
-    /// - Content-Length：先发已缓冲部分（截断到 CL，超出的属于管道化的下一个请求），
-    ///   再按剩余长度流式读转
-    /// - 两者皆无：只转发已缓冲字节（历史行为）
-    async fn forward_request_body<S>(
-        &self,
-        client: &mut S,
-        upstream: &mut TcpStream,
-        buffered: &[u8],
-        head: &UpstreamHead,
-    ) -> Result<()>
-    where
-        S: AsyncRead + Unpin,
-    {
-        if head.chunked {
-            let result = forward_chunked_body(
-                client,
-                upstream,
-                buffered,
-                self.timeout,
-                self.buffer_pool,
-            )
-            .await;
-            if let Err(e) = result {
-                if !is_benign_close_error(&e) {
-                    warn!(
-                        "Failed to forward chunked request body from {}: {}",
-                        self.client_addr, e
-                    );
-                }
-                return Err(e.into());
-            }
-            return Ok(());
-        }
-
-        let Some(cl) = head.content_length else {
-            // 无 Content-Length 且非 chunked：仅转发已缓冲字节
-            if !buffered.is_empty() && upstream.write_all(buffered).await.is_err() {
-                return Err(anyhow::anyhow!("failed to write buffered body upstream"));
-            }
-            return Ok(());
-        };
-
-        match forward_content_length_body(
-            client,
-            upstream,
-            buffered,
-            cl,
-            self.timeout,
-            self.buffer_pool,
-        )
-        .await
-        {
-            Ok(sent) if sent < cl => {
-                // 客户端提前关闭：body 不完整，但请求头已送达，仍可尝试读响应
-                warn!(
-                    "Client {} closed before sending complete request body ({} / {} bytes)",
-                    self.client_addr, sent, cl
-                );
-                Ok(())
-            }
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if is_benign_close_error(&e) {
-                    debug!("Request body from {} ended: {}", self.client_addr, e);
-                } else {
-                    warn!("Error forwarding request body from {}: {}", self.client_addr, e);
-                }
-                Err(e.into())
-            }
+impl RelayLink {
+    fn label(self) -> &'static str {
+        match self {
+            RelayLink::Classic => "classic",
+            RelayLink::PathPrefix => "path-proxy",
         }
     }
+}
 
-    /// 读上游响应并原样转发给客户端
-    ///
-    /// 拷贝缓冲自适应（8KB 起步，长传输 / 大 body 翻倍到 256KB）：一次读 + 一次写，
-    /// 中间不做额外分配，也不解析响应语义（代理不关心内容）。
-    async fn relay_response<S>(
-        &self,
-        client: &mut S,
-        upstream: &mut TcpStream,
-        target: &ForwardTarget<'_>,
-    ) -> Result<()>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        let (outcome, copy_bytes) =
-            copy_upstream_to_client(client, upstream, self.timeout).await;
-
-        match outcome {
-            // 正常收尾：完成日志在下方统一输出
-            RelayOutcome::Completed => {}
-            // 客户端断开：不记 error，避免正常下载中断刷屏
-            RelayOutcome::ClientGone => {}
-            RelayOutcome::UpstreamClosed => {
-                debug!(
-                    "Upstream {}:{} closed before sending response body",
-                    target.connect_host, target.port
-                );
-            }
-            RelayOutcome::TimedOut => {
-                warn!("Response from {}:{} timed out", target.connect_host, target.port);
-            }
-            RelayOutcome::UpstreamError(e) => {
-                if is_benign_close_error(&e) {
-                    debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
-                } else {
-                    warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
-                }
-            }
-        }
-
+/// 请求体读/写失败时的统一日志：benign 关闭记 debug，其余记 warn
+fn log_body_error(link: RelayLink, client_addr: SocketAddr, framing: &str, e: &std::io::Error) {
+    if is_benign_close_error(e) {
         debug!(
-            "Response copy buffer for {}:{} ended at {} KB",
-            target.connect_host,
-            target.port,
-            copy_bytes / 1024
+            "[{}] request body ({} framing) from {} ended: {}",
+            link.label(),
+            framing,
+            client_addr,
+            e
         );
-
-        Ok(())
+    } else {
+        warn!(
+            "[{}] failed to forward request body ({} framing) from {}: {}",
+            link.label(),
+            framing,
+            client_addr,
+            e
+        );
     }
 }
 
+/// 一次请求体转发的输入参数
+///
+/// 字段与 [`UpstreamHead`] 的产出一一对应，外加调用方上下文（超时、缓冲池、
+/// 链路标签、客户端地址）；打包成结构体避免共享实现出现 9 个位置参数。
+pub(super) struct RequestBodyForward<'a> {
+    /// 已从 socket 读入的 body 前缀（可能已包含完整 body）
+    pub buffered: &'a [u8],
+    /// 请求头声明的 `Content-Length`（与 `chunked` 互斥）
+    pub content_length: Option<u64>,
+    /// 请求头声明了 `Transfer-Encoding: chunked`
+    pub chunked: bool,
+    /// 单次读/写的超时
+    pub timeout: Duration,
+    /// 流式读取时复用的缓冲池
+    pub buffer_pool: &'a BufferPool,
+    /// 发起本次转发的链路（仅影响日志标签）
+    pub link: RelayLink,
+    /// 客户端地址（仅用于日志）
+    pub client_addr: SocketAddr,
+}
+
+/// 转发请求体：已缓冲字节 + 尚未读取的部分（经典代理与路径前缀共用）
+///
+/// 分帧决策以 [`UpstreamHead`] 为准：
+/// - chunked：交给分帧状态机（已缓冲字节必须先过状态机，终止块可能就在缓冲区里）
+/// - Content-Length：先发已缓冲部分（截断到 CL，超出的属于管道化的下一个请求），
+///   再按剩余长度流式读转
+/// - 两者皆无：只转发已缓冲字节（历史行为）
+///
+/// 返回已向上游写出的 body 字节数（`Content-Length` 路径下可用于判断客户端是否
+/// 提前关闭；chunked 路径恒返回 0）。`link` 只影响日志标签，两条链路行为一致。
+pub(super) async fn forward_request_body<S, T>(
+    client: &mut S,
+    upstream: &mut T,
+    body: RequestBodyForward<'_>,
+) -> std::io::Result<u64>
+where
+    S: AsyncRead + Unpin,
+    T: AsyncWrite + Unpin,
+{
+    let RequestBodyForward {
+        buffered,
+        content_length,
+        chunked,
+        timeout,
+        buffer_pool,
+        link,
+        client_addr,
+    } = body;
+
+    if chunked {
+        return match forward_chunked_body(client, upstream, buffered, timeout, buffer_pool).await {
+            Ok(()) => Ok(0),
+            Err(e) => {
+                log_body_error(link, client_addr, "chunked", &e);
+                Err(e)
+            }
+        };
+    }
+
+    let Some(cl) = content_length else {
+        // 无 Content-Length 且非 chunked：仅转发已缓冲字节
+        if !buffered.is_empty() {
+            if let Err(e) = upstream.write_all(buffered).await {
+                log_body_error(link, client_addr, "buffered-only", &e);
+                return Err(e);
+            }
+        }
+        return Ok(buffered.len() as u64);
+    };
+
+    match forward_content_length_body(client, upstream, buffered, cl, timeout, buffer_pool).await {
+        Ok(sent) if sent < cl => {
+            // 客户端提前关闭：body 不完整，但请求头已送达，仍可尝试读响应
+            warn!(
+                "[{}] client {} closed before sending complete request body ({} / {} bytes)",
+                link.label(),
+                client_addr,
+                sent,
+                cl
+            );
+            Ok(sent)
+        }
+        Ok(sent) => Ok(sent),
+        Err(e) => {
+            log_body_error(link, client_addr, "content-length", &e);
+            Err(e)
+        }
+    }
+}
+
+/// 读上游响应并原样转发给客户端
+///
+/// 拷贝缓冲自适应（8KB 起步，长传输 / 大 body 翻倍到 256KB）：一次读 + 一次写，
+/// 中间不做额外分配，也不解析响应语义（代理不关心内容）。
+async fn relay_response<S>(
+    client: &mut S,
+    upstream: &mut TcpStream,
+    target: &ForwardTarget<'_>,
+    timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let (outcome, copy_bytes) = copy_upstream_to_client(client, upstream, timeout).await;
+
+    match outcome {
+        // 正常收尾：完成日志在下方统一输出
+        RelayOutcome::Completed => {}
+        // 客户端断开：不记 error，避免正常下载中断刷屏
+        RelayOutcome::ClientGone => {}
+        RelayOutcome::UpstreamClosed => {
+            debug!(
+                "Upstream {}:{} closed before sending response body",
+                target.connect_host, target.port
+            );
+        }
+        RelayOutcome::TimedOut => {
+            warn!("Response from {}:{} timed out", target.connect_host, target.port);
+        }
+        RelayOutcome::UpstreamError(e) => {
+            if is_benign_close_error(&e) {
+                debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
+            } else {
+                warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
+            }
+        }
+    }
+
+    debug!(
+        "Response copy buffer for {}:{} ended at {} KB",
+        target.connect_host,
+        target.port,
+        copy_bytes / 1024
+    );
+
+    Ok(())
+}
 /// 转发一次普通代理请求（认证已在调用前完成）
 ///
 /// 四段流水线，每段可独立阅读与测试：
 /// 1. [`ForwardTarget::parse`] —— 请求行 → 目标 host / port / origin-form
 /// 2. 连接上游（`connect_host` 统一处理 IPv4 / IPv6 / DNS）
-/// 3. [`UpstreamHead::build`] + [`RelayCtx::forward_request_body`] —— 建头、转发 body
-/// 4. [`RelayCtx::relay_response`] —— 回传响应
+/// 3. [`UpstreamHead::build`] + [`forward_request_body`] —— 建头、转发 body
+/// 4. [`relay_response`] —— 回传响应
 pub(crate) async fn handle_http_request_generic<S>(
     mut client: S,
     request_data: &[u8],
@@ -316,20 +358,26 @@ pub(crate) async fn handle_http_request_generic<S>(
         return;
     }
 
-    let relay = RelayCtx {
-        client_addr,
-        timeout: timeout_duration,
-        buffer_pool: &buffer_pool,
-    };
-    if relay
-        .forward_request_body(&mut client, &mut upstream, &request_data[head_end..], &head)
-        .await
-        .is_err()
+    if forward_request_body(
+        &mut client,
+        &mut upstream,
+        RequestBodyForward {
+            buffered: &request_data[head_end..],
+            content_length: head.content_length,
+            chunked: head.chunked,
+            timeout: timeout_duration,
+            buffer_pool: &buffer_pool,
+            link: RelayLink::Classic,
+            client_addr,
+        },
+    )
+    .await
+    .is_err()
     {
         return;
     }
 
-    let _ = relay.relay_response(&mut client, &mut upstream, &target).await;
+    let _ = relay_response(&mut client, &mut upstream, &target, timeout_duration).await;
 
     info!("Request completed: {} {}", target.method, target.url);
 }
@@ -381,5 +429,42 @@ mod tests {
             !String::from_utf8_lossy(&resp).contains("Server:"),
             "错误响应不得暴露指纹头"
         );
+    }
+
+    /// 客户端在 `Content-Length` 声明完成前关闭：已转发字节数必须如实返回
+    ///
+    /// 两条链路共用同一实现，`RelayLink` 只影响日志标签，因此这里对两个标签各跑一遍：
+    /// 行为（返回 `Ok(已发送字节)`、不报错、上游收到已发部分）必须完全一致。
+    #[tokio::test]
+    async fn test_forward_request_body_reports_short_body_on_early_disconnect() {
+        use tokio::io::AsyncWriteExt;
+
+        for link in [RelayLink::Classic, RelayLink::PathPrefix] {
+            let (mut client, mut peer) = tokio::io::duplex(64);
+            let mut upstream: Vec<u8> = Vec::new();
+            let pool = BufferPool::new();
+
+            peer.write_all(b"abc").await.unwrap();
+            drop(peer);
+
+            let sent = forward_request_body(
+                &mut client,
+                &mut upstream,
+                RequestBodyForward {
+                    buffered: &[],
+                    content_length: Some(5),
+                    chunked: false,
+                    timeout: Duration::from_millis(500),
+                    buffer_pool: &pool,
+                    link,
+                    client_addr: addr(),
+                },
+            )
+            .await
+            .expect("客户端提前关闭不是 io 错误，由调用方决定是否继续读响应");
+
+            assert_eq!(sent, 3, "只应报告实际写出的 3 字节（{:?}）", link.label());
+            assert_eq!(upstream, b"abc", "已收到的部分必须转发给上游");
+        }
     }
 }

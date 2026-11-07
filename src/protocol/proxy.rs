@@ -3,7 +3,7 @@
 //! 读头复用池化缓冲区（常见请求零拷贝），转发阶段不缓冲整个 body。
 //! 反扫描与请求走私两类安全约束集中在本模块的读头、分类与建头段。
 
-use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
+use crate::support::buffer_pool::BufferPool;
 use crate::protocol::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};
 use crate::config::AuthUser;
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
@@ -11,6 +11,7 @@ use crate::protocol::http_response::write_response;
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_util::{head_end_offset, MAX_HEAD_BYTES};
 use crate::protocol::request::{read_request_head, HeadStatus};
+use crate::protocol::relay::{copy_upstream_to_client, CopyOutcome};
 use crate::protocol::connect::{handle_connect_generic, send_bad_gateway};
 use crate::support::net::{connect_host, is_benign_close_error};
 use crate::protocol::path_proxy::{
@@ -20,7 +21,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use log::{debug, error, info, warn};
 
@@ -414,35 +415,20 @@ impl RelayCtx<'_> {
     where
         S: AsyncWrite + Unpin,
     {
-        let mut response_buf = AdaptiveBuffer::new();
+        let (outcome, copy_bytes) =
+            copy_upstream_to_client(client, upstream, self.timeout).await;
 
-        loop {
-            response_buf.prepare();
-            match tokio::time::timeout(self.timeout, upstream.read(response_buf.as_mut_slice())).await
-            {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    response_buf.note_copied(n);
-                    if client
-                        .write_all(&response_buf.as_mut_slice()[..n])
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+        match outcome {
+            CopyOutcome::Eof | CopyOutcome::ClientClosed => {}
+            CopyOutcome::ReadError(e) => {
+                if is_benign_close_error(&e) {
+                    debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
+                } else {
+                    warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
                 }
-                Ok(Err(e)) => {
-                    if is_benign_close_error(&e) {
-                        debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
-                    } else {
-                        warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
-                    }
-                    break;
-                }
-                Err(_) => {
-                    warn!("Response from {}:{} timed out", target.connect_host, target.port);
-                    break;
-                }
+            }
+            CopyOutcome::TimedOut => {
+                warn!("Response from {}:{} timed out", target.connect_host, target.port);
             }
         }
 
@@ -450,7 +436,7 @@ impl RelayCtx<'_> {
             "Response copy buffer for {}:{} ended at {} KB",
             target.connect_host,
             target.port,
-            response_buf.current_size() / 1024
+            copy_bytes / 1024
         );
 
         Ok(())
@@ -556,6 +542,7 @@ async fn handle_http_request_generic<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     // ─── classify_proxy_request 反扫描测试 ───
 

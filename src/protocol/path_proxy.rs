@@ -31,7 +31,8 @@ use crate::protocol::http_body::{forward_chunked_body, forward_content_length_bo
 use crate::protocol::http_response::write_response;
 use crate::protocol::http_util::{find_header_end, MAX_HEAD_BYTES};
 use crate::support::net::{connect_host, is_benign_close_error, AsyncStream};
-use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
+use crate::support::buffer_pool::BufferPool;
+use crate::protocol::relay::{copy_upstream_to_client, CopyOutcome};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
@@ -432,32 +433,23 @@ where
     }
 
     // ── 流式转发 body：保持 chunked / gzip 等原始编码不变 ──
-    // 头部读完即归还池化缓冲区，body 阶段改用自适应缓冲
+    // 头部读完即归还池化缓冲区，body 阶段改用自适应缓冲（与经典代理共用同一循环）
     drop(buf);
-    let mut copy = AdaptiveBuffer::new();
-    loop {
-        copy.prepare();
-        let n = match tokio::time::timeout(timeout, upstream.read(copy.as_mut_slice())).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timeout reading upstream response body",
-                ))
-            }
-        };
-        if n == 0 {
+    let (outcome, copy_bytes) = copy_upstream_to_client(client, upstream, timeout).await;
+    match outcome {
+        CopyOutcome::Eof => {
             debug!(
                 "Path-proxy: response done, copy buffer {} KB",
-                copy.current_size() / 1024
+                copy_bytes / 1024
             );
-            return Ok(());
+            Ok(())
         }
-        copy.note_copied(n);
-        if client.write_all(&copy.as_mut_slice()[..n]).await.is_err() {
-            return Ok(()); // 客户端已断开，正常结束
-        }
+        CopyOutcome::ClientClosed => Ok(()), // 客户端已断开，正常结束
+        CopyOutcome::ReadError(e) => Err(e),
+        CopyOutcome::TimedOut => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout reading upstream response body",
+        )),
     }
 }
 

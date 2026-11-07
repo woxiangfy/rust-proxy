@@ -87,10 +87,7 @@ pub async fn connect_tls<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let normalized = server_name
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(server_name);
+    let normalized = crate::support::net::strip_brackets(server_name);
     let name = ServerName::try_from(normalized.to_string())
         .map_err(|_| anyhow::anyhow!("Invalid TLS server name: {}", server_name))?;
 

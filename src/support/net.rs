@@ -121,6 +121,16 @@ fn parse_bracketed_ipv6(host_port: &str) -> Result<(&str, u16), String> {
     Ok((host, port))
 }
 
+/// 去掉 IPv6 字面量的方括号：URL / `host:port` 里是 `[::1]`，socket/DNS/SNI 只接受 `::1`
+///
+/// 全项目唯一的方括号处理点：经典代理目标解析、CONNECT 隧道与 TLS SNI 都调用它，
+/// 避免三处实现漂移（漏一处就表现为 IPv6 目标 502 或 SNI 非法）。
+pub(crate) fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

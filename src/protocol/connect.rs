@@ -5,7 +5,7 @@
 //! 后续读取写出，否则会被丢掉。
 
 use crate::protocol::http_response::write_response;
-use crate::support::net::{connect_host, is_benign_close_error, parse_host_port};
+use crate::support::net::{connect_host, is_benign_close_error, parse_host_port, strip_brackets};
 use crate::transport::stream::PrefixedStream;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
@@ -51,12 +51,10 @@ pub(crate) async fn handle_connect_generic<S>(
         }
     };
 
-    // CONNECT 目标主机字符串，供 DNS/连接使用。若为方括号 IPv6，去掉方括号
-    // （`[a:b::1]` 需转换为 `a:b::1` 才能通过 tokio lookup_host 解析）。
-    let connect_host_str = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    // CONNECT 目标主机字符串，供 DNS/连接使用。`parse_host_port` 对 IPv6 保留
+    // 方括号形式（`[a:b::1]`），而 socket/DNS 只接受裸地址，剥离逻辑统一在
+    // [`crate::support::net::strip_brackets`]。
+    let connect_host_str = strip_brackets(host);
 
     let mut target = match connect_host(connect_host_str, port, timeout_duration).await {
         Ok(t) => t,

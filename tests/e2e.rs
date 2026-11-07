@@ -293,6 +293,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// 回声上游：用于 CONNECT 隧道，收到什么原样吐回
 async fn spawn_echo_origin() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    spawn_echo_origin_on(listener).await
+}
+
+/// 在指定监听器上启动回声上游（IPv6 用例需要绑定 `[::1]`）
+async fn spawn_echo_origin_on(listener: TcpListener) -> SocketAddr {
     let addr = listener.local_addr().expect("echo local_addr");
 
     tokio::spawn(async move {
@@ -496,6 +501,46 @@ async fn connect_tunnel_relays_bytes() {
 
     // 隧道内写什么就该读回什么
     let payload = b"ping-through-tunnel";
+    sock.write_all(payload).await.expect("tunnel write");
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(IO_TIMEOUT, sock.read_exact(&mut buf))
+        .await
+        .expect("tunnel read timed out")
+        .expect("tunnel read failed");
+    assert_eq!(buf, payload);
+}
+
+/// CONNECT 目标为 IPv6 字面量（`[::1]:port`）时必须能建隧道
+///
+/// `parse_host_port` 对带方括号的 IPv6 保留方括号形式（`[::1]`），而 socket/DNS
+/// 层只接受裸地址（`::1`）。若 CONNECT 路径漏掉剥离，会稳定 502 而不是 200。
+/// 本用例把回声上游绑在 `[::1]`，直接验证“确实连到了 IPv6 loopback”。
+#[tokio::test]
+async fn connect_tunnel_relays_bytes_over_ipv6() {
+    let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+        eprintln!("当前环境不支持 IPv6 loopback，跳过 connect_tunnel_relays_bytes_over_ipv6");
+        return;
+    };
+    let echo = spawn_echo_origin_on(listener).await;
+    let proxy = spawn_proxy(base_args()).await;
+
+    let mut sock = TcpStream::connect(proxy.addr).await.expect("connect proxy");
+    sock.write_all(format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n").as_bytes())
+        .await
+        .expect("write CONNECT");
+
+    let head = tokio::time::timeout(IO_TIMEOUT, read_head(&mut sock))
+        .await
+        .expect("CONNECT response timed out")
+        .expect("CONNECT response closed early");
+    assert_eq!(
+        status_code(&head),
+        200,
+        "IPv6 字面量 CONNECT 目标不得返回 502，实际响应：{:?}",
+        String::from_utf8_lossy(&head)
+    );
+
+    let payload = b"ping-through-ipv6-tunnel";
     sock.write_all(payload).await.expect("tunnel write");
     let mut buf = vec![0u8; payload.len()];
     tokio::time::timeout(IO_TIMEOUT, sock.read_exact(&mut buf))

@@ -8,6 +8,7 @@
 //! 本模块只做纯函数，不建立连接、不读写 socket；调用方负责 400/502 等响应。
 
 use crate::protocol::http_util::{authority_of, connection_named_headers, is_hop_by_hop};
+use crate::support::net::strip_brackets;
 use log::error;
 use std::net::SocketAddr;
 
@@ -101,13 +102,6 @@ impl<'a> ForwardTarget<'a> {
             origin_form,
         }
     }
-}
-
-/// IPv6 字面量在 URL 里是 `[::1]`，而 socket/DNS/SNI 只接受 `::1`
-fn strip_brackets(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
 }
 
 /// 发往上游的请求头（已过滤逐跳头、改写 `Connection`）及请求体分帧信息

@@ -246,7 +246,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 
 ## 架构
 
-代码已整理为库（`src/lib.rs`）+ 薄壳二进制（`src/main.rs`，11 行），因此集成测试可以起真实代理做端到端验证。`src/protocol/proxy.rs` 通过 `handle_client_generic<S: AsyncRead + AsyncWrite>` 实现传输层无关（HTTP 明文 / TLS）的请求处理。
+代码已整理为库（`src/lib.rs`）+ 薄壳二进制（`src/main.rs`，11 行），因此集成测试可以起真实代理做端到端验证。客户端入口位于 `src/protocol/dispatch.rs`（经 `src/protocol/proxy.rs` 门面 re-export），保持 `<S: AsyncRead + AsyncWrite>` 泛型，实现传输层无关（HTTP 明文 / TLS）的请求处理。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -254,7 +254,11 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭（装配入口） |
 | `config/mod.rs` / `config/schema.rs` | 配置加载、运行时派生与校验 / 声明层字段表（统一生成 CLI、TOML、服务参数） |
-| `protocol/proxy.rs` | 请求解析、分类、CONNECT 隧道、经典 HTTP 转发 |
+| `protocol/proxy.rs` | 兼容门面：仅 re-export `handle_client` / `handle_client_with_addr` |
+| `protocol/dispatch.rs` | 请求编排：读头 → 分类 → 认证 → 分流；反扫描 404 与超限 431 |
+| `protocol/request.rs` | 请求头读取与完整性判定（`Complete` / `Incomplete` / `Overflow`） |
+| `protocol/connect.rs` | CONNECT 隧道：建连、200 应答、双向转发、502 |
+| `protocol/relay.rs` | 经典转发流水线（建头 → 请求体 → 响应回传）；与路径前缀共用响应拷贝循环 |
 | `protocol/forward.rs` | 转发目标解析（IPv6 双表示）与上游建头（经典 / 路径前缀共用同一份） |
 | `protocol/path_proxy.rs` | 路径前缀模式：URL 解析、上游直连、流式回传、Location 重写 |
 | `protocol/auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |

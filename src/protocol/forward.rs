@@ -325,4 +325,272 @@ mod tests {
         assert!(!up.bytes.contains("secret"), "认证头不得上游化：{}", up.bytes);
         assert!(up.bytes.contains("X-Keep: ok\r\n"));
     }
+
+    // ─── host:port 解析 / chunked 分帧 ───
+    // 这两组原语的实现与测试已迁至 `crate::support::net` 与 `crate::protocol::http_body`（消除模块循环依赖）。
+
+    // ─── 转发目标解析（B3 拆分后的纯函数） ───
+
+    #[test]
+    fn test_forward_target_parses_absolute_url() {
+        let head = "GET http://example.com/a/b?x=1 HTTP/1.1
+Host: example.com
+
+";
+        let t = ForwardTarget::parse(head, addr()).expect("absolute URL must parse");
+        assert_eq!(t.method, "GET");
+        assert_eq!(t.connect_host, "example.com");
+        assert_eq!(t.port, 80, "缺省端口应为 80");
+        assert_eq!(t.origin_form, "/a/b?x=1", "query 必须保留");
+        assert_eq!(t.authority, "example.com", "缺省端口不应写进 Host");
+    }
+
+    #[test]
+    fn test_forward_target_keeps_explicit_port() {
+        let head = "POST http://127.0.0.1:8080/p HTTP/1.1
+
+";
+        let t = ForwardTarget::parse(head, addr()).expect("parse");
+        assert_eq!(t.port, 8080);
+        assert_eq!(t.connect_host, "127.0.0.1");
+        assert_eq!(t.origin_form, "/p");
+    }
+
+    #[test]
+    fn test_forward_target_marks_https_scheme_with_known_default_port() {
+        // URL 解析层仍按 scheme 求默认端口（https → 443），但经典代理入口据 `scheme`
+        // 拒绝 https absolute-form（见 `handle_http_request_generic` 与
+        // `https_absolute_form_is_rejected_with_400`）
+        let head = "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let t = ForwardTarget::parse(head, addr()).expect("https absolute URL must parse");
+        assert_eq!(t.scheme, "https");
+        assert_eq!(t.port, 443);
+    }
+
+    #[test]
+    fn test_forward_target_rejects_non_absolute_target() {
+        // 相对 URL（非代理请求）与残缺请求行都必须返回 None，由上层走 404 反扫描
+        assert!(ForwardTarget::parse("GET / HTTP/1.1\r\n\r\n", addr()).is_none());
+        assert!(ForwardTarget::parse("GARBAGE\r\n\r\n", addr()).is_none());
+        assert!(ForwardTarget::parse("", addr()).is_none());
+    }
+
+    // ─── 上游请求头构造（含逐跳头与凭据过滤） ───
+
+    #[test]
+    fn test_upstream_head_rewrites_connection_and_drops_proxy_headers() {
+        let head = "GET http://example.com/x HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Proxy-Connection: keep-alive\r\n\
+                    Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+                    Connection: keep-alive\r\n\
+                    User-Agent: test\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.bytes.starts_with("GET /x HTTP/1.1\r\n"), "请求行应改写为 origin-form");
+        assert_eq!(
+            up.bytes.matches("Host: ").count(),
+            1,
+            "客户端 Host 必须被替换而不是重复输出：{}",
+            up.bytes
+        );
+        assert!(up.bytes.contains("Host: example.com\r\n"), "Host 由绝对 URL 决定");
+        assert!(up.bytes.contains("Connection: close\r\n"), "Connection 必须改写为 close");
+        assert!(!up.bytes.to_ascii_lowercase().contains("proxy-authorization"), "凭据不得上游化");
+        assert!(!up.bytes.to_ascii_lowercase().contains("proxy-connection"), "代理专用头应丢弃");
+        assert!(up.bytes.contains("User-Agent: test\r\n"), "普通头必须保留");
+        assert!(up.bytes.ends_with("\r\n\r\n"), "头部必须以空行结束");
+        assert!(!up.chunked);
+        assert_eq!(up.content_length, None);
+    }
+
+    // ─── Host 头（RFC 7230 §5.4：absolute-form 必须以请求目标的 host 为准） ───
+
+    #[test]
+    fn test_upstream_head_rewrites_host_from_absolute_url() {
+        // 客户端 Host 与 URL 不一致（如把代理地址写进 Host）：一律以 URL 为准
+        let head = "GET http://example.com:8080/p HTTP/1.1\r\nHost: 10.0.0.1:3128\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.bytes.contains("Host: example.com:8080\r\n"), "显式端口必须保留");
+        assert!(!up.bytes.contains("10.0.0.1"), "客户端的 Host 不得转发：{}", up.bytes);
+    }
+
+    #[test]
+    fn test_upstream_head_inserts_host_when_client_omits_it() {
+        // HTTP/1.1 上游要求 Host；客户端漏发时由代理补写，否则上游直接 400
+        let head = "GET http://example.com/p HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.bytes.contains("Host: example.com\r\n"), "缺失 Host 必须补写");
+        assert!(up.bytes.contains("Accept: */*\r\n"));
+    }
+
+    #[test]
+    fn test_upstream_head_host_brackets_ipv6() {
+        let head = "GET http://[::1]:8080/p HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(up.bytes.contains("Host: [::1]:8080\r\n"), "IPv6 authority 必须带方括号");
+    }
+
+    /// `Connection` 里点名的自定义字段同样是逐跳头（RFC 7230 §6.1）
+    #[test]
+    fn test_upstream_head_drops_connection_named_headers() {
+        let head = "GET http://example.com/x HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Connection: close, X-Hop\r\n\
+                    X-Hop: secret\r\n\
+                    X-Keep: ok\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        let lower = up.bytes.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-hop"),
+            "Connection 点名的头必须丢弃：{}",
+            up.bytes
+        );
+        assert!(up.bytes.contains("X-Keep: ok\r\n"), "未点名的端到端头必须保留");
+        assert_eq!(
+            lower.matches("connection:").count(),
+            1,
+            "只保留代理改写的 Connection: close"
+        );
+    }
+
+    #[test]
+    fn test_upstream_head_records_framing() {
+        // Content-Length
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 12\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert_eq!(up.content_length, Some(12));
+        assert!(!up.chunked);
+
+        // Transfer-Encoding: chunked（保留原头，同时置位）
+        let head = "POST http://h/p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(up.chunked);
+        assert_eq!(up.content_length, None);
+        assert!(up.bytes.contains("Transfer-Encoding: chunked"));
+    }
+
+    #[test]
+    fn test_upstream_head_does_not_match_header_substrings() {
+        // 头名必须精确匹配：X-Forwarded-For 不能被当作 connection 类头处理
+        let head = "GET http://h/p HTTP/1.1\r\nX-Connection-Info: keep\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(up.bytes.contains("X-Connection-Info: keep\r\n"));
+        assert!(!up.bytes.contains("Connection: close"), "不含 Connection 头时不应凭空追加");
+    }
+
+    #[test]
+    fn test_upstream_head_drops_expect_and_flags_100_continue() {
+        // `Expect: 100-continue` 不能转发给上游：上游会先回 100，而代理此刻正在收
+        // body，客户端收不到临时响应就会白等一个 RTT（curl 默认等 1s）。
+        let head = "POST http://h/p HTTP/1.1\r\n\
+                    Content-Length: 4\r\n\
+                    Expect: 100-continue\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(up.expect_continue, "必须置位，供调用方回 100 Continue");
+        assert!(
+            !up.bytes.to_ascii_lowercase().contains("expect:"),
+            "Expect 头不得出现在上游请求中"
+        );
+        assert_eq!(up.content_length, Some(4));
+    }
+
+    #[test]
+    fn test_upstream_head_does_not_flag_expect_without_continue() {
+        // 其它 Expect 值无从满足，同样丢弃，但不应误触发 100 Continue
+        let head = "POST http://h/p HTTP/1.1\r\nExpect: 42-continue\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        assert!(!up.expect_continue);
+        assert!(!up.bytes.to_ascii_lowercase().contains("expect:"));
+    }
+
+    #[test]
+    fn test_upstream_head_drops_content_length_when_chunked() {
+        // RFC 7230 §3.3.3：存在 Transfer-Encoding 时 Content-Length **必须**丢弃。
+        // 两者一起转发时，若上游按 CL 解析，分帧字节会被当成 body 内容，
+        // 后续管道化的请求就被拼进同一个请求——请求走私。
+        let head = "POST http://h/p HTTP/1.1\r\n\
+                    Host: h\r\n\
+                    Content-Length: 5\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert!(up.chunked);
+        assert_eq!(up.content_length, None, "chunked 时 CL 必须清零");
+        let lower = up.bytes.to_ascii_lowercase();
+        assert!(
+            lower.contains("transfer-encoding: chunked"),
+            "分帧头必须保留：{}",
+            up.bytes
+        );
+        assert!(
+            !lower.contains("content-length"),
+            "CL 不得与 TE 一起转发：{}",
+            up.bytes
+        );
+    }
+
+    #[test]
+    fn test_upstream_head_rejects_conflicting_content_length() {
+        // 多个不一致的 CL：代理与上游对 body 边界的理解必然不同 → 拒绝而不是挑一个
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        assert!(UpstreamHead::build(&target, head).is_none());
+    }
+
+    #[test]
+    fn test_upstream_head_rejects_non_numeric_content_length() {
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5x\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        assert!(UpstreamHead::build(&target, head).is_none());
+    }
+
+    #[test]
+    fn test_upstream_head_collapses_duplicate_content_length() {
+        // 重复但一致：合并成一条，不给上游留多值歧义
+        let head = "POST http://h/p HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+
+        assert_eq!(up.content_length, Some(5));
+        let count = up
+            .bytes
+            .to_ascii_lowercase()
+            .matches("content-length:")
+            .count();
+        assert_eq!(count, 1, "重复 CL 必须合并：{}", up.bytes);
+    }
+
+    #[test]
+    fn test_upstream_head_drops_all_hop_by_hop_headers() {
+        // RFC 7230 §6.1 的逐跳头一律不得转发；普通头必须保留
+        let head = "GET http://h/p HTTP/1.1\r\n\
+                    Keep-Alive: timeout=5\r\n\
+                    TE: trailers\r\n\
+                    Trailer: X-Sum\r\n\
+                    Upgrade: websocket\r\n\
+                    Proxy-Authenticate: Basic\r\n\
+                    Accept: */*\r\n\r\n";
+        let target = ForwardTarget::parse(head, addr()).unwrap();
+        let up = UpstreamHead::build(&target, head).unwrap();
+        let lower = up.bytes.to_ascii_lowercase();
+        for hop in ["keep-alive:", "te:", "trailer:", "upgrade:", "proxy-authenticate:"] {
+            assert!(!lower.contains(hop), "逐跳头 {hop} 不应转发: {}", up.bytes);
+        }
+        assert!(up.bytes.contains("Accept: */*\r\n"), "端到端头必须保留");
+    }
 }

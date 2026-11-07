@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub(crate) mod connect;
+pub(crate) mod dispatch;
 pub(crate) mod forward;
 pub mod http_body;
 pub mod http_response;

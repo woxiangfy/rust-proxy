@@ -32,7 +32,7 @@ use crate::protocol::http_response::write_response;
 use crate::protocol::http_util::{find_header_end, MAX_HEAD_BYTES};
 use crate::support::net::{connect_host, is_benign_close_error, AsyncStream};
 use crate::support::buffer_pool::BufferPool;
-use crate::protocol::relay::{copy_upstream_to_client, CopyOutcome};
+use crate::protocol::relay::{copy_upstream_to_client, RelayOutcome};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
@@ -437,19 +437,24 @@ where
     drop(buf);
     let (outcome, copy_bytes) = copy_upstream_to_client(client, upstream, timeout).await;
     match outcome {
-        CopyOutcome::Eof => {
+        RelayOutcome::Completed => {
             debug!(
                 "Path-proxy: response done, copy buffer {} KB",
                 copy_bytes / 1024
             );
             Ok(())
         }
-        CopyOutcome::ClientClosed => Ok(()), // 客户端已断开，正常结束
-        CopyOutcome::ReadError(e) => Err(e),
-        CopyOutcome::TimedOut => Err(std::io::Error::new(
+        // 客户端断开：不记 error，正常下载中断不得刷屏
+        RelayOutcome::ClientGone => Ok(()),
+        RelayOutcome::UpstreamClosed => {
+            debug!("Path-proxy: upstream closed before sending response body");
+            Ok(())
+        }
+        RelayOutcome::TimedOut => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timeout reading upstream response body",
         )),
+        RelayOutcome::UpstreamError(e) => Err(e),
     }
 }
 

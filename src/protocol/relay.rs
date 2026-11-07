@@ -1,9 +1,16 @@
 //! 响应回传与经典转发流水线
 //!
 //! 经典代理与路径前缀直连共用同一段「读上游 → 写客户端」循环（自适应缓冲、
-//! 单次读单次写、不解析响应语义），差异只在**如何解释结束原因**：
-//! 经典代理把所有结束都视为正常收尾，路径前缀直连需要把读错误/超时上抛给调用方。
-//! 因此拷贝循环只返回中性的 [`CopyOutcome`]，由各调用点自行映射回原有契约与日志。
+//! 单次读单次写、不解析响应语义），也共用同一种结束契约 [`RelayOutcome`]。
+//! 各调用点只负责把 outcome 映射成日志级别与自身返回类型，映射规则统一为：
+//!
+//! | outcome | 日志 | 说明 |
+//! | --- | --- | --- |
+//! | `Completed` | 调用方的完成日志（debug，含缓冲大小） | 正常收尾 |
+//! | `ClientGone` | **不记 error** | 客户端断开，正常下载中断不得刷屏 |
+//! | `UpstreamClosed` | debug | 上游未产生数据即关闭 |
+//! | `TimedOut` | warn | 读上游超时 |
+//! | `UpstreamError` | benign → debug / 其余 → warn | 是否影响响应由调用方决定 |
 //!
 //! 经典代理的转发流水线（建头 → 转发请求体 → 回传响应）也在这里，
 //! 请求编排由 [`crate::protocol::dispatch`] 负责。
@@ -20,37 +27,51 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-/// 响应拷贝循环的结束原因（中性描述，不含任何日志或返回类型决策）
+
+/// 响应拷贝结束原因（两条链路共用的统一契约）
 #[derive(Debug)]
-pub(crate) enum CopyOutcome {
-    /// 上游正常关闭（读到 EOF）
-    Eof,
-    /// 读上游出错；原始错误保留给调用方判断是否等价于正常关闭
-    ReadError(std::io::Error),
+pub(crate) enum RelayOutcome {
+    /// 上游 EOF，且已向客户端写出至少一段数据：响应正常收尾
+    Completed,
+    /// 写客户端失败：客户端已断开（调度方不得记 error，避免正常中断刷屏）
+    ClientGone,
+    /// 上游在写出任何数据前 EOF
+    UpstreamClosed,
     /// 读上游超时
     TimedOut,
-    /// 写客户端失败：客户端已断开
-    ClientClosed,
+    /// 读上游出错；原始错误保留，调用方按 benign 与否决定日志级别
+    UpstreamError(std::io::Error),
 }
 
 /// 流式转发响应体：一次读上游、一次写客户端，直到上游 EOF 或任一端断开。
 ///
 /// 拷贝缓冲自适应（8KB 起步，长传输 / 大 body 翻倍到 256KB），中间不做额外分配。
 /// 返回值附带循环结束时的缓冲大小（字节），供调用方沿用原有日志格式。
+///
+/// `Completed` 与 `UpstreamClosed` 的区分依据是"是否已向客户端写出过数据"：
+/// 前者表示响应体正常收尾，后者表示上游在这次响应里一个字节都没给出。
 pub(crate) async fn copy_upstream_to_client<S, T>(
     client: &mut S,
     upstream: &mut T,
     timeout: Duration,
-) -> (CopyOutcome, usize)
+) -> (RelayOutcome, usize)
 where
     S: AsyncWrite + Unpin,
     T: AsyncRead + Unpin,
 {
     let mut copy = AdaptiveBuffer::new();
+    let mut wrote = false;
     loop {
         copy.prepare();
         match tokio::time::timeout(timeout, upstream.read(copy.as_mut_slice())).await {
-            Ok(Ok(0)) => return (CopyOutcome::Eof, copy.current_size()),
+            Ok(Ok(0)) => {
+                let outcome = if wrote {
+                    RelayOutcome::Completed
+                } else {
+                    RelayOutcome::UpstreamClosed
+                };
+                return (outcome, copy.current_size());
+            }
             Ok(Ok(n)) => {
                 copy.note_copied(n);
                 if client
@@ -58,11 +79,12 @@ where
                     .await
                     .is_err()
                 {
-                    return (CopyOutcome::ClientClosed, copy.current_size());
+                    return (RelayOutcome::ClientGone, copy.current_size());
                 }
+                wrote = true;
             }
-            Ok(Err(e)) => return (CopyOutcome::ReadError(e), copy.current_size()),
-            Err(_) => return (CopyOutcome::TimedOut, copy.current_size()),
+            Ok(Err(e)) => return (RelayOutcome::UpstreamError(e), copy.current_size()),
+            Err(_) => return (RelayOutcome::TimedOut, copy.current_size()),
         }
     }
 }
@@ -183,16 +205,25 @@ impl RelayCtx<'_> {
             copy_upstream_to_client(client, upstream, self.timeout).await;
 
         match outcome {
-            CopyOutcome::Eof | CopyOutcome::ClientClosed => {}
-            CopyOutcome::ReadError(e) => {
+            // 正常收尾：完成日志在下方统一输出
+            RelayOutcome::Completed => {}
+            // 客户端断开：不记 error，避免正常下载中断刷屏
+            RelayOutcome::ClientGone => {}
+            RelayOutcome::UpstreamClosed => {
+                debug!(
+                    "Upstream {}:{} closed before sending response body",
+                    target.connect_host, target.port
+                );
+            }
+            RelayOutcome::TimedOut => {
+                warn!("Response from {}:{} timed out", target.connect_host, target.port);
+            }
+            RelayOutcome::UpstreamError(e) => {
                 if is_benign_close_error(&e) {
                     debug!("Read from {}:{} ended: {}", target.connect_host, target.port, e);
                 } else {
                     warn!("Error reading from {}:{}: {}", target.connect_host, target.port, e);
                 }
-            }
-            CopyOutcome::TimedOut => {
-                warn!("Response from {}:{} timed out", target.connect_host, target.port);
             }
         }
 

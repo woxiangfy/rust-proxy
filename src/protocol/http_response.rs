@@ -1,6 +1,7 @@
 //! HTTP 响应报文构造
 //!
-//! 代理自己产生的响应：反扫描 404、代理认证 407、路径前缀直连 400/401/431/502。
+//! 代理自己产生的响应：反扫描 404/431、代理认证 401/407、经典代理 400/502、
+//! 路径前缀直连 400/502。
 //! 它们的骨架完全一致（状态行 → 附加头 → `Content-Length` → `Connection: close` → body），
 //! 差别只在状态行、质询头与 body，因此收敛成一个写入函数；经典代理与路径代理的
 //! 错误响应都走这里，不再各自手写字符串。
@@ -49,6 +50,24 @@ pub(crate) async fn write_response<W>(
     if !body.is_empty() {
         let _ = stream.write_all(body).await;
     }
+}
+
+/// 上游不可达时的最小化 502 响应
+///
+/// 历史实现在这里直接 `return`，客户端只看到 EOF（curl 报
+/// `Empty reply from server`），既无法区分"代理到目标的路由断了"还是"目标自己拒绝"，
+/// 也无从判断是否值得重试。同端口的路径前缀直连模式早已回 502，两条链路对同一种
+/// 失败给出完全不同的反馈属于实现漂移，这里统一。
+///
+/// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
+pub(crate) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
+    write_response(
+        client,
+        "502 Bad Gateway",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        b"502 Bad Gateway",
+    )
+    .await;
 }
 
 #[cfg(test)]

@@ -16,10 +16,9 @@
 //! 经典代理的转发流水线（建头 → 转发请求体 → 回传响应）也在这里，
 //! 请求编排由 [`crate::protocol::dispatch`] 负责。
 
-use crate::protocol::connect::send_bad_gateway;
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
-use crate::protocol::http_response::write_response;
+use crate::protocol::http_response::{send_bad_gateway, write_response};
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::support::net::{connect_host, is_benign_close_error};
 use anyhow::Result;

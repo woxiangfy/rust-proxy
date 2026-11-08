@@ -4,31 +4,13 @@
 //! 连接成为纯字节管道。请求头之后已读入的字节（如 TLS ClientHello）必须先于
 //! 后续读取写出，否则会被丢掉。
 
-use crate::protocol::http_response::write_response;
+use crate::protocol::http_response::send_bad_gateway;
 use crate::support::net::{connect_host, is_benign_close_error, parse_host_port, strip_brackets};
 use crate::transport::stream::PrefixedStream;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-
-/// 上游不可达时的最小化 502 响应
-///
-/// 历史实现在这里直接 `return`，客户端只看到 EOF（curl 报
-/// `Empty reply from server`），既无法区分"代理到目标的路由断了"还是"目标自己拒绝"，
-/// 也无从判断是否值得重试。同端口的路径前缀直连模式早已回 502，两条链路对同一种
-/// 失败给出完全不同的反馈属于实现漂移，这里统一。
-///
-/// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
-pub(crate) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
-    write_response(
-        client,
-        "502 Bad Gateway",
-        &[("Content-Type", "text/plain; charset=utf-8")],
-        b"502 Bad Gateway",
-    )
-    .await;
-}
 
 /// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）
 ///

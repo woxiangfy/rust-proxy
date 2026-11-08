@@ -13,6 +13,7 @@
 //! 支撑层 support：buffer_pool  logging  net
 //!
 //! 传输层 transport：tls（服务端证书）tls_client（客户端握手）proxy_protocol  stream
+//!   → config（tls 取 `TlsConfig`，proxy_protocol 取 `ProxyProtocolMode`）, support
 //!
 //! 协议层 protocol：request（读客户端请求头）dispatch（分类与编排）connect（CONNECT 隧道）
 //!                 forward（上游目标与请求头构造）relay（请求体转发与响应回传）

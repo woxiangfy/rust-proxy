@@ -12,7 +12,7 @@
 //! ```text
 //! (
 //!     Type,
-//!     cli { 字段名, help 文案, 服务参数序列化方式, clap 属性... }?,   // 无 CLI 入口则省略
+//!     cli { 字段名, [ doc = help 文案 ]?, [ clap 属性... ] }?,        // 无 CLI 入口则省略
 //!     cfg { TOML 字段名, 字段文档 }?,                                // 无 TOML 键则省略
 //!     merge { CLI 字段名, TOML 字段名, 合并规则 }?                     // CLI 可覆盖 TOML 时给出
 //! )
@@ -80,11 +80,13 @@ macro_rules! merge_field {
     };
 }
 
-/// CLI 字段：字段名 + help 文案 + 服务 argv 序列化方式 + `clap` 属性
+/// CLI 字段：字段名 + help 文案 + `clap` 属性
 ///
-/// `svc` 的取值决定 [`ServiceArgs::to_argv`] 如何处理该字段：
-/// `scalar_opt` / `bool_flag` / `path_opt` / `canonical_path_opt` / `list_join` /
-/// `pp_mode` / `legacy_pp`。
+/// 本宏只生成 `clap` 适配层（[`ServerRunArgs`]）与服务参数的**类型化视图**
+/// （[`ServiceArgs`]）；服务命令行的逐字段序列化在 `ServiceArgs::to_argv` 中手写，
+/// 顺序由服务命令格式决定，不由此声明生成。新增 CLI 字段时必须同步修改
+/// `ServiceArgs::from_run_args` 与 `to_argv`，遗漏会被 `service` 模块的逐字段
+/// round-trip 测试拦住。
 macro_rules! config_schema {
     (
         server_doc = $server_doc:literal,
@@ -93,7 +95,7 @@ macro_rules! config_schema {
             $(
                 (
                     $ty:ty,
-                    $( cli { $cli:ident, $( [ $cli_doc:literal ], )? $svc:ident, $($cli_arg:tt)* }, )?
+                    $( cli { $cli:ident, $( doc = $cli_doc:literal, )? [ $($cli_arg:tt)* ] }, )?
                     $( cfg { $cfg:ident, $cfg_doc:literal }, )?
                     $( merge { $mcli:ident, $mcfg:ident, $merge:ident } )?
                 ),
@@ -173,36 +175,36 @@ config_schema! {
         // ── 仅 CLI：加载器参数 ──
         (
             Option<PathBuf>,
-            cli { config, canonical_path_opt, long },
+            cli { config, [ long ] },
         ),
         // ── 双源：标量 ──
         (
             Option<u16>,
-            cli { port, scalar_opt, long },
+            cli { port, [ long ] },
             cfg { port, "Port to bind" },
             merge { port, port, copy_opt }
         ),
         (
             Option<PathBuf>,
-            cli { log_file, path_opt, long },
+            cli { log_file, [ long ] },
             cfg { log_file, "Log file path" },
             merge { log_file, log_file, log_file_path }
         ),
         (
             Option<u64>,
-            cli { timeout, scalar_opt, long },
+            cli { timeout, [ long ] },
             cfg { timeout, "Request timeout in seconds" },
             merge { timeout, timeout, copy_opt }
         ),
         (
             Option<LogLevel>,
-            cli { log_level, scalar_opt, long },
+            cli { log_level, [ long ] },
             cfg { log_level, "Log level" },
             merge { log_level, log_level, copy_opt }
         ),
         (
             bool,
-            cli { multi_thread, [ "启用多线程运行时（默认使用单线程）" ], bool_flag, long },
+            cli { multi_thread, doc = "启用多线程运行时（默认使用单线程）", [ long ] },
             cfg { multi_thread, "Use multi-threaded runtime" },
             merge { multi_thread, multi_thread, bool_union }
         ),
@@ -214,26 +216,26 @@ config_schema! {
         // ── 双源：HTTPS/TLS ──
         (
             Option<u16>,
-            cli { https_port, [ "HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）" ], scalar_opt, long },
+            cli { https_port, doc = "HTTPS 代理监听端口（启用 TLS 时需同时指定 --tls-cert 和 --tls-key）", [ long ] },
             cfg { https_port, "HTTPS 代理监听端口（需同时配置 tls_cert 和 tls_key）" },
             merge { https_port, https_port, copy_opt }
         ),
         (
             Option<PathBuf>,
-            cli { tls_cert, [ "TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供" ], path_opt, long },
+            cli { tls_cert, doc = "TLS 证书文件路径（PEM 格式），需与 --tls-key 同时提供", [ long ] },
             cfg { tls_cert, "TLS 证书文件路径（PEM 格式），需与 tls_key 同时配置" },
             merge { tls_cert, tls_cert, clone_opt }
         ),
         (
             Option<PathBuf>,
-            cli { tls_key, [ "TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供" ], path_opt, long },
+            cli { tls_key, doc = "TLS 私钥文件路径（PEM 格式），需与 --tls-cert 同时提供", [ long ] },
             cfg { tls_key, "TLS 私钥文件路径（PEM 格式），需与 tls_cert 同时配置" },
             merge { tls_key, tls_key, clone_opt }
         ),
         // ── 双源：PROXY Protocol ──
         (
             Option<ProxyProtocolMode>,
-            cli { proxy_protocol_mode, [ r#"PROXY Protocol 模式（disable / auto / require）
+            cli { proxy_protocol_mode, doc = r#"PROXY Protocol 模式（disable / auto / require）
 
 - `disable`：完全禁用 PROXY Protocol
 - `auto`：自动检测（默认），连接开头匹配 PROXY v1/v2 签名时解析真实 IP，
@@ -241,7 +243,7 @@ config_schema! {
 - `require`：强制要求所有连接必须以 PROXY Protocol 头开头，否则断开连接
 
 注意：该模式同时作为 HTTP/HTTPS 端口的缺省值；如需分别控制可在配置文件中
-使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。"# ], pp_mode, long, value_name = "MODE" },
+使用 `http_proxy_protocol` / `https_proxy_protocol` 覆盖。"#, [ long, value_name = "MODE" ] },
             cfg { proxy_protocol_mode, r#"PROXY Protocol 全局默认模式（disable / auto / require）
 
 均作为 HTTP/HTTPS 端口的缺省模式；若同时配置了
@@ -251,9 +253,9 @@ config_schema! {
         // 旧参数：不写 TOML，等价于 mode auto；优先级低于显式 mode
         (
             bool,
-            cli { proxy_protocol, [ r#"启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
+            cli { proxy_protocol, doc = r#"启用 PROXY Protocol 自动识别（等价于 `--proxy-protocol-mode auto`）
 
-旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。"# ], legacy_pp, long },
+旧参数，为了 CLI 兼容保留。不会强制任何端口，连接仍全自动检测。"#, [ long ] },
             merge { proxy_protocol, proxy_protocol_mode, legacy_pp }
         ),
         // ── 仅 TOML：分端口 PROXY Protocol 覆盖 ──
@@ -272,22 +274,22 @@ config_schema! {
         ),
         (
             Vec<std::net::IpAddr>,
-            cli { proxy_protocol_trusted_ips, [ r#"PROXY Protocol 可信代理 IP 列表
+            cli { proxy_protocol_trusted_ips, doc = r#"PROXY Protocol 可信代理 IP 列表
 
 仅当 `proxy_protocol_mode` 为 auto/require 时生效。
 仅接受来自这些 IP 的连接发送的 PROXY Protocol 头，防止客户端伪造 IP。
-示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2"# ], list_join, long, value_delimiter = ',' },
+示例：--proxy-protocol-trusted-ips 10.0.0.1,10.0.0.2"#, [ long, value_delimiter = ',' ] },
             cfg { proxy_protocol_trusted_ips, "PROXY Protocol 可信代理 IP 列表（空列表表示不限制）" },
             merge { proxy_protocol_trusted_ips, proxy_protocol_trusted_ips, list_clone }
         ),
         // ── 双源：路径前缀直连模式（CLI/TOML 名称不同，显式映射） ──
         (
             Option<String>,
-            cli { path_proxy_prefix, [ r#"启用路径前缀直连模式并指定前缀（如 px）
+            cli { path_proxy_prefix, doc = r#"启用路径前缀直连模式并指定前缀（如 px）
 
 启用后，请求 `http://代理地址/px/https://example.com/` 会被代理服务器
 直连到 `https://example.com/`，客户端无需配置代理即可使用（类似 gh-proxy）。
-前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。"# ], scalar_opt, long, value_name = "PREFIX" },
+前缀本身相当于一个路径口令，未命中前缀的请求仍返回 404。"#, [ long, value_name = "PREFIX" ] },
             cfg { path_proxy_prefix, r#"路径前缀直连模式前缀（如 "px"）。省略即不启用该模式。
 
 启用后：`http://代理地址/px/https://example.com/` → 直连 `https://example.com/`。"# },
@@ -295,9 +297,9 @@ config_schema! {
         ),
         (
             bool,
-            cli { path_proxy_insecure, [ r#"路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
+            cli { path_proxy_insecure, doc = r#"路径前缀直连模式下跳过上游 TLS 证书校验（默认校验）
 
-仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。"# ], bool_flag, long },
+仅对 https 上游生效，用于自签证书/证书链不完整的内网站点。"#, [ long ] },
             cfg { path_proxy_insecure_tls, "路径前缀直连模式下跳过上游 TLS 证书校验（默认 false）" },
             merge { path_proxy_insecure, path_proxy_insecure_tls, bool_union }
         ),

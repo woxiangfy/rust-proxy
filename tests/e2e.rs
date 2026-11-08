@@ -1419,3 +1419,47 @@ async fn classic_and_path_prefix_build_identical_upstream_head() {
         "两条链路上游收到的头块必须逐字节一致"
     );
 }
+
+/// 链路 20：路径前缀模式同样必须自己应答 `Expect: 100-continue`
+///
+/// 经典链路已有覆盖（链路 7）。路径前缀链路此前只验证了「Expect 头被丢弃、标志位置位」
+/// 这个纯函数契约，没有验证代理真的在等 body 之前回了 100。两条链路收敛到同一段
+/// 发送逻辑后，这里用真实连接把该行为固定下来。
+#[tokio::test]
+async fn path_prefix_expect_100_continue_answered_by_proxy() {
+    let origin = spawn_body_origin().await;
+    let mut args = base_args();
+    args.path_proxy_prefix = Some("px".into());
+    let proxy = spawn_proxy(args).await;
+
+    let mut sock = TcpStream::connect(proxy.addr).await.expect("connect proxy");
+    let head = format!(
+        "POST /px/http://{origin}/upload HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+        proxy.addr
+    );
+    sock.write_all(head.as_bytes()).await.expect("write head");
+
+    // 只发头、不发 body：临时响应必须在一个很短的等待内到达
+    let mut interim = [0u8; 25];
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut interim))
+        .await
+        .expect("path-proxy must answer 100-continue immediately")
+        .expect("read interim response");
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
+    sock.write_all(b"hello").await.expect("write body");
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(IO_TIMEOUT, sock.read_to_end(&mut rest))
+        .await
+        .expect("final response timed out")
+        .expect("read final response");
+
+    assert_eq!(status_code(&rest), 200, "body: {:?}", body_of(&rest));
+    let echoed = body_of(&rest).to_ascii_lowercase();
+    assert!(
+        !echoed.contains("expect:"),
+        "Expect 不得转发给上游：{echoed}"
+    );
+    assert!(!echoed.contains("/px/"), "前缀不得泄漏给上游：{echoed}");
+}

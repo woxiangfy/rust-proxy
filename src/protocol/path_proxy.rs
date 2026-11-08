@@ -44,7 +44,7 @@ mod response;
 mod upstream;
 
 use crate::protocol::relay::{send_upstream_request, RelayLink, RequestBodyForward};
-use response::forward_response;
+use response::{forward_response, ResponseDelivery};
 use upstream::connect_upstream;
 /// 路径前缀直连模式配置
 #[derive(Debug, Clone)]
@@ -266,7 +266,13 @@ pub(super) async fn handle_path_proxy<S>(
 
     // ── 5. 回传响应（必要时重写 Location）──
     match forward_response(&mut client, &mut upstream, cfg, &parsed, timeout, buffer_pool).await {
-        Ok(()) => info!("[path-proxy] completed: {} {}", method, target_url),
+        Ok(ResponseDelivery::Completed) => {
+            info!("[path-proxy] completed: {} {}", method, target_url)
+        }
+        Ok(ResponseDelivery::ClientGone) => debug!(
+            "[path-proxy] client {} closed while forwarding response",
+            client_addr
+        ),
         Err(e) if is_benign_close_error(&e) => {
             debug!("[path-proxy] response ended early: {}", e)
         }

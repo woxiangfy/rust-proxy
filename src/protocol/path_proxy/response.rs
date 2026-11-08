@@ -11,6 +11,17 @@ use crate::support::buffer_pool::BufferPool;
 use log::{debug, warn};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+/// 响应回传的收尾状态
+///
+/// 只用于让调用方区分「正常完成」与「客户端已断开」，不改变错误传播：
+/// 上游错误仍走 `Err`，客户端断开仍按正常收尾关闭连接。
+pub(super) enum ResponseDelivery {
+    /// 响应头与 body 都已交给客户端（含上游提前 EOF）
+    Completed,
+    /// 客户端在写响应头或 body 时断开
+    ClientGone,
+}
+
 /// 读取上游响应头（可能连带读到 body 前缀），可选重写 Location，随后流式转发 body。
 pub(super) async fn forward_response<S, T>(
     client: &mut S,
@@ -19,7 +30,7 @@ pub(super) async fn forward_response<S, T>(
     base: &url::Url,
     timeout: Duration,
     buffer_pool: &BufferPool,
-) -> std::io::Result<()>
+) -> std::io::Result<ResponseDelivery>
 where
     S: AsyncWrite + Unpin,
     T: AsyncRead + Unpin,
@@ -68,16 +79,16 @@ where
             let status = parse_status_code(&head_data[..p]);
             let new_head = rebuild_response_head(&head_data[..p], status, cfg, base);
             if client.write_all(new_head.as_bytes()).await.is_err() {
-                return Ok(());
+                return Ok(ResponseDelivery::ClientGone);
             }
             if p < head_data.len() && client.write_all(&head_data[p..]).await.is_err() {
-                return Ok(());
+                return Ok(ResponseDelivery::ClientGone);
             }
         }
         None => {
             // 头不完整（超限或上游提前关闭）：原样写出，避免破坏字节流
             if client.write_all(&head_data).await.is_err() {
-                return Ok(());
+                return Ok(ResponseDelivery::ClientGone);
             }
         }
     }
@@ -92,13 +103,13 @@ where
                 "[path-proxy] response done, copy buffer {} KB",
                 copy_bytes / 1024
             );
-            Ok(())
+            Ok(ResponseDelivery::Completed)
         }
         // 客户端断开：不记 error，正常下载中断不得刷屏
-        RelayOutcome::ClientGone => Ok(()),
+        RelayOutcome::ClientGone => Ok(ResponseDelivery::ClientGone),
         RelayOutcome::UpstreamClosed => {
             debug!("[path-proxy] upstream closed before sending response body");
-            Ok(())
+            Ok(ResponseDelivery::Completed)
         }
         RelayOutcome::TimedOut => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

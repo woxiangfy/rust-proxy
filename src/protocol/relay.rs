@@ -20,7 +20,7 @@
 
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
-use crate::protocol::http_response::{send_bad_gateway, write_response};
+use crate::protocol::http_response::send_error;
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::support::net::{connect_host, is_benign_close_error, write_all_with_timeout};
 use log::{debug, error, info, warn};
@@ -44,6 +44,21 @@ pub(super) enum RelayOutcome {
     TimedOut,
     /// 读上游出错；原始错误保留，调用方按 benign 与否决定日志级别
     UpstreamError(std::io::Error),
+}
+
+/// 写客户端失败归类：超时（对端不读）与普通断开（对端已关）含义不同，日志级别也不同
+///
+/// 非超时且非良性关闭（如 `WriteZero`、TLS 内部错误）**不是**客户端正常断开，
+/// 记 warn 后才按 `ClientGone` 收尾，避免本地写缺陷被 debug 静默吞掉。
+fn outcome_for_client_write_error(e: &std::io::Error) -> RelayOutcome {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        RelayOutcome::ClientStalled
+    } else {
+        if !is_benign_close_error(e) {
+            warn!("Unexpected error writing response to client: {}", e);
+        }
+        RelayOutcome::ClientGone
+    }
 }
 
 /// 流式转发响应体：一次读上游、一次写客户端，直到上游 EOF 或任一端断开。
@@ -86,12 +101,7 @@ where
                 )
                 .await
                 {
-                    let outcome = if e.kind() == std::io::ErrorKind::TimedOut {
-                        RelayOutcome::ClientStalled
-                    } else {
-                        RelayOutcome::ClientGone
-                    };
-                    return (outcome, copy.current_size());
+                    return (outcome_for_client_write_error(&e), copy.current_size());
                 }
                 wrote = true;
             }
@@ -99,22 +109,6 @@ where
             Err(_) => return (RelayOutcome::TimedOut, copy.current_size()),
         }
     }
-}
-
-/// 分帧头自相矛盾（多个不一致的 `Content-Length` / 非数字值）时的 400 响应
-///
-/// 只能拒绝、不能"挑一个用"：代理与上游对 body 边界的理解一旦不同，
-/// 后续字节就会被解释成另一个请求（请求走私）。此处已确认是代理请求，
-/// 返回 400 不会暴露代理特征。
-async fn send_bad_request<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
-    write_response(
-        client,
-        "400 Bad Request",
-        &[("Content-Type", "text/plain; charset=utf-8")],
-        b"400 Bad Request",
-        timeout,
-    )
-    .await;
 }
 
 /// 请求体转发所属链路（日志里用于区分经典代理与路径前缀）
@@ -154,17 +148,36 @@ fn log_body_error(link: RelayLink, client_addr: SocketAddr, framing: &str, e: &s
     }
 }
 
+/// 写上游请求头 / 应答 `100 Continue` 失败时的统一日志
+///
+/// body 阶段失败已由 [`log_body_error`] 记录，这里只覆盖它没管的两个写点，
+/// 避免同一错误被记两遍。写失败（尤其写超时）意味着该连接已不可用：
+/// benign 关闭记 debug，其余记 warn，级别口径与 [`log_body_error`] 一致。
+fn log_send_error(link: RelayLink, client_addr: SocketAddr, stage: &str, e: &std::io::Error) {
+    if is_benign_close_error(e) {
+        debug!("[{}] {} for {} ended: {}", link.label(), stage, client_addr, e);
+    } else {
+        warn!(
+            "[{}] failed to send {} for {}: {}",
+            link.label(),
+            stage,
+            client_addr,
+            e
+        );
+    }
+}
+
 /// 一次请求体转发的输入参数
 ///
-/// 字段与 [`UpstreamHead`] 的产出一一对应，外加调用方上下文（超时、缓冲池、
-/// 链路标签、客户端地址）；打包成结构体避免共享实现出现 9 个位置参数。
+/// 分帧方式只以 [`UpstreamHead`] 为准，这里不再复制 `content_length` / `chunked`：
+/// 同一份事实存两处时，头里声明 chunked、转发却按 CL 处理（或反之）就是请求走私面。
+/// 其余字段是调用方上下文（超时、缓冲池、链路标签、客户端地址）；打包成结构体
+/// 避免共享实现出现 9 个位置参数。
 pub(super) struct RequestBodyForward<'a> {
+    /// 已建好的上游请求头（分帧、`Expect` 判断的唯一来源）
+    pub head: &'a UpstreamHead,
     /// 已从 socket 读入的 body 前缀（可能已包含完整 body）
     pub buffered: &'a [u8],
-    /// 请求头声明的 `Content-Length`（与 `chunked` 互斥）
-    pub content_length: Option<u64>,
-    /// 请求头声明了 `Transfer-Encoding: chunked`
-    pub chunked: bool,
     /// 单次读/写的超时
     pub timeout: Duration,
     /// 流式读取时复用的缓冲池
@@ -195,16 +208,15 @@ where
     T: AsyncWrite + Unpin,
 {
     let RequestBodyForward {
+        head,
         buffered,
-        content_length,
-        chunked,
         timeout,
         buffer_pool,
         link,
         client_addr,
     } = body;
 
-    if chunked {
+    if head.chunked {
         return match forward_chunked_body(client, upstream, buffered, timeout, buffer_pool).await {
             Ok(()) => Ok(0),
             Err(e) => {
@@ -214,7 +226,7 @@ where
         };
     }
 
-    let Some(cl) = content_length else {
+    let Some(cl) = head.content_length else {
         // 无 Content-Length 且非 chunked：仅转发已缓冲字节
         if !buffered.is_empty() {
             if let Err(e) = write_all_with_timeout(
@@ -262,7 +274,6 @@ where
 pub(super) async fn send_upstream_request<S, T>(
     client: &mut S,
     upstream: &mut T,
-    head: &UpstreamHead,
     body: RequestBodyForward<'_>,
 ) -> std::io::Result<u64>
 where
@@ -270,18 +281,28 @@ where
     T: AsyncWrite + Unpin,
 {
     let timeout = body.timeout;
+    let head = body.head;
 
-    write_all_with_timeout(upstream, head.bytes.as_bytes(), timeout, "request head to upstream")
-        .await?;
+    if let Err(e) =
+        write_all_with_timeout(upstream, head.bytes.as_bytes(), timeout, "request head to upstream")
+            .await
+    {
+        log_send_error(body.link, body.client_addr, "request head to upstream", &e);
+        return Err(e);
+    }
 
     if head.expect_continue {
-        write_all_with_timeout(
+        if let Err(e) = write_all_with_timeout(
             client,
             b"HTTP/1.1 100 Continue\r\n\r\n",
             timeout,
             "100-continue response",
         )
-        .await?;
+        .await
+        {
+            log_send_error(body.link, body.client_addr, "100-continue to client", &e);
+            return Err(e);
+        }
     }
 
     forward_request_body(client, upstream, body).await
@@ -369,7 +390,7 @@ pub(super) async fn handle_http_request_generic<S>(
             "{} -> unsupported scheme '{}' in absolute-form (use CONNECT for https)",
             client_addr, target.scheme
         );
-        send_bad_request(&mut client, timeout_duration).await;
+        send_error(&mut client, 400, "Bad Request", "400 Bad Request", timeout_duration).await;
         return;
     }
 
@@ -385,7 +406,7 @@ pub(super) async fn handle_http_request_generic<S>(
             "{} -> malformed framing headers (conflicting or non-numeric Content-Length)",
             client_addr
         );
-        send_bad_request(&mut client, timeout_duration).await;
+        send_error(&mut client, 400, "Bad Request", "400 Bad Request", timeout_duration).await;
         return;
     };
 
@@ -396,7 +417,7 @@ pub(super) async fn handle_http_request_generic<S>(
                 "Failed to connect to {}:{} from {}: {}",
                 target.connect_host, target.port, client_addr, e
             );
-            send_bad_gateway(&mut client, timeout_duration).await;
+            send_error(&mut client, 502, "Bad Gateway", "502 Bad Gateway", timeout_duration).await;
             return;
         }
     };
@@ -404,11 +425,9 @@ pub(super) async fn handle_http_request_generic<S>(
     if send_upstream_request(
         &mut client,
         &mut upstream,
-        &head,
         RequestBodyForward {
+            head: &head,
             buffered: &request_data[head_end..],
-            content_length: head.content_length,
-            chunked: head.chunked,
             timeout: timeout_duration,
             buffer_pool: &buffer_pool,
             link: RelayLink::Classic,
@@ -524,6 +543,12 @@ mod tests {
             let (mut client, mut peer) = tokio::io::duplex(64);
             let mut upstream: Vec<u8> = Vec::new();
             let pool = BufferPool::new();
+            let head = UpstreamHead {
+                bytes: String::new(),
+                content_length: Some(5),
+                chunked: false,
+                expect_continue: false,
+            };
 
             peer.write_all(b"abc").await.unwrap();
             drop(peer);
@@ -532,9 +557,8 @@ mod tests {
                 &mut client,
                 &mut upstream,
                 RequestBodyForward {
+                    head: &head,
                     buffered: &[],
-                    content_length: Some(5),
-                    chunked: false,
                     timeout: Duration::from_millis(500),
                     buffer_pool: &pool,
                     link,

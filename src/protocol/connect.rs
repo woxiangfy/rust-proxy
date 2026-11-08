@@ -4,7 +4,7 @@
 //! 连接成为纯字节管道。请求头之后已读入的字节（如 TLS ClientHello）必须先于
 //! 后续读取写出，否则会被丢掉。
 
-use crate::protocol::http_response::send_bad_gateway;
+use crate::protocol::http_response::send_error;
 use crate::support::net::{
     connect_host, is_benign_close_error, parse_host_port, strip_brackets, write_all_with_timeout,
 };
@@ -48,7 +48,8 @@ pub(super) async fn handle_connect_generic<S>(
                 connect_host_str, port, client_addr, e
             );
             // 隧道未建立：必须在断开前明确告知 502，否则客户端把 EOF 当作隧道异常
-            send_bad_gateway(&mut client, timeout_duration).await;
+            send_error(&mut client, 502, "Bad Gateway", "502 Bad Gateway", timeout_duration)
+                .await;
             return;
         }
     };

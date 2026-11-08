@@ -8,7 +8,7 @@ use super::PathProxyConfig;
 use crate::protocol::http_util::{find_header_end, MAX_HEAD_BYTES};
 use crate::protocol::relay::{copy_upstream_to_client, RelayOutcome};
 use crate::support::buffer_pool::BufferPool;
-use crate::support::net::write_all_with_timeout;
+use crate::support::net::{is_benign_close_error, write_all_with_timeout};
 use log::{debug, warn};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -26,10 +26,16 @@ pub(super) enum ResponseDelivery {
 }
 
 /// 写客户端失败时归类：超时（对端不读）与普通断开（对端已关）含义不同，日志级别也不同
+///
+/// 非超时且非良性关闭（如 `WriteZero`、TLS 内部错误）不是客户端正常断开，
+/// 记 warn 后才按 `ClientGone` 收尾，避免本地写缺陷被 debug 静默吞掉。
 fn delivery_for_write_error(e: &std::io::Error) -> ResponseDelivery {
     if e.kind() == std::io::ErrorKind::TimedOut {
         ResponseDelivery::ClientStalled
     } else {
+        if !is_benign_close_error(e) {
+            warn!("[path-proxy] unexpected error writing response to client: {}", e);
+        }
         ResponseDelivery::ClientGone
     }
 }

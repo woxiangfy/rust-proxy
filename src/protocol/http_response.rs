@@ -62,23 +62,23 @@ pub(super) async fn write_response<W>(
     }
 }
 
-/// 上游不可达时的最小化 502 响应
+/// 发送最小化错误响应（状态行 + 纯文本 body）
 ///
-/// 历史实现在这里直接 `return`，客户端只看到 EOF（curl 报
-/// `Empty reply from server`），既无法区分"代理到目标的路由断了"还是"目标自己拒绝"，
-/// 也无从判断是否值得重试。同端口的路径前缀直连模式早已回 502，两条链路对同一种
-/// 失败给出完全不同的反馈属于实现漂移，这里统一。
-///
-/// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
-pub(super) async fn send_bad_gateway<W: AsyncWrite + Unpin>(
+/// 报文骨架统一由 [`write_response`] 构造，调用方只给状态码、原因短语与 body。
+/// 用数值状态码而不是整条状态行，避免调用点在字符串里写错状态码与原因短语的搭配；
+/// 经典代理、CONNECT 与路径前缀直连的 400/502 都走这一个入口。
+pub(super) async fn send_error<W: AsyncWrite + Unpin>(
     client: &mut W,
+    code: u16,
+    reason: &str,
+    msg: &str,
     timeout: Duration,
 ) {
     write_response(
         client,
-        "502 Bad Gateway",
+        &format!("{} {}", code, reason),
         &[("Content-Type", "text/plain; charset=utf-8")],
-        b"502 Bad Gateway",
+        msg.as_bytes(),
         timeout,
     )
     .await;

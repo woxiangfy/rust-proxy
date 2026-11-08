@@ -31,7 +31,7 @@
 //! （写头 → 应答 100-continue → 转发请求体），响应头读取与重建在 [`response`]。
 
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
-use crate::protocol::http_response::write_response;
+use crate::protocol::http_response::send_error;
 use crate::support::buffer_pool::BufferPool;
 use crate::support::net::is_benign_close_error;
 use anyhow::Result;
@@ -264,11 +264,9 @@ pub(super) async fn handle_path_proxy<S>(
     if send_upstream_request(
         &mut client,
         &mut upstream,
-        &head,
         RequestBodyForward {
+            head: &head,
             buffered: buffered_body,
-            content_length: head.content_length,
-            chunked: head.chunked,
             timeout,
             buffer_pool,
             link: RelayLink::PathPrefix,
@@ -301,31 +299,10 @@ pub(super) async fn handle_path_proxy<S>(
     }
 }
 
-/// 发送最小化错误响应（用于 400 / 502，不暴露运行时细节）
-///
-/// 报文骨架统一交给 [`write_response`] 构造（`Content-Type` → `Content-Length` →
-/// `Connection: close`），本模块不再手写字符串：这类响应是机器可读的协议输出，
-/// 漏写 `Content-Length` 或 `Connection: close` 都会让客户端挂起。
-async fn send_error<W: AsyncWrite + Unpin>(
-    client: &mut W,
-    code: u16,
-    reason: &str,
-    msg: &str,
-    timeout: Duration,
-) {
-    write_response(
-        client,
-        &format!("{} {}", code, reason),
-        &[("Content-Type", "text/plain; charset=utf-8")],
-        msg.as_bytes(),
-        timeout,
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::http_response::write_response;
 
     fn cfg() -> PathProxyConfig {
         PathProxyConfig::new("px", false, true).unwrap()

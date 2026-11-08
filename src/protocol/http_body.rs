@@ -5,11 +5,12 @@
 //!
 //! 经典代理与路径前缀直连都经 `crate::protocol::relay::forward_request_body` 调用本模块
 //! （两条链路只在日志标签上不同），因此不依赖任何上层模块（仅依赖
-//! [`crate::support::buffer_pool`]），是纯叶模块。
+//! [`crate::support::buffer_pool`] 与 [`crate::support::net`] 的写超时原语），是纯叶模块。
 
 use crate::support::buffer_pool::{BufferPool, BUFFER_SIZE};
+use crate::support::net::write_all_with_timeout;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// RFC 7230 chunked 请求体分帧状态机
 ///
@@ -156,11 +157,11 @@ where
             out.push(b);
             if reader.done() {
                 // 整个 body 都在前缀里结束：立即收尾，不再等 socket
-                target.write_all(&out).await?;
+                write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
                 return Ok(());
             }
         }
-        target.write_all(&out).await?;
+        write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
         out.clear();
     }
 
@@ -184,12 +185,12 @@ where
             reader.push_byte(b);
             out.push(b);
             if out.len() >= BUFFER_SIZE {
-                target.write_all(&out).await?;
+                write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
                 out.clear();
             }
             if reader.done() {
                 if !out.is_empty() {
-                    target.write_all(&out).await?;
+                    write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
                 }
                 return Ok(());
             }
@@ -224,7 +225,7 @@ where
     };
 
     if !buffered.is_empty() {
-        target.write_all(buffered).await?;
+        write_all_with_timeout(target, buffered, timeout, "request body (content-length)").await?;
     }
     let mut sent = buffered.len() as u64;
     if sent >= content_length {
@@ -249,7 +250,8 @@ where
             // 客户端提前关闭：body 不完整，交由调用方决定后续动作
             break;
         }
-        target.write_all(&tmp_slice[..n]).await?;
+        write_all_with_timeout(target, &tmp_slice[..n], timeout, "request body (content-length)")
+            .await?;
         sent += n as u64;
     }
 
@@ -259,6 +261,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     /// 用给定数据驱动 `ChunkedBodyReader`，返回其是否在正确位置判定结束。
     fn drive_chunked(data: &[u8]) -> bool {

@@ -107,7 +107,7 @@ async fn handle_client_generic<S>(
                 "Request head from {} exceeds {} bytes, rejecting",
                 client_addr, MAX_HEAD_BYTES
             );
-            send_head_too_large(&mut client).await;
+            send_head_too_large(&mut client, timeout_duration).await;
             return;
         }
         // 客户端在头结束前断开：同样不能当完整头解析。转发时 `UpstreamHead::build`
@@ -158,7 +158,7 @@ async fn handle_client_generic<S>(
                 match check_path_auth(&head_str, users) {
                     Some(source) => auth_header = Some(source.header_name()),
                     None => {
-                        send_path_auth_required(&mut client).await;
+                        send_path_auth_required(&mut client, timeout_duration).await;
                         warn!("[path-proxy] authentication failed from {}", client_addr);
                         return;
                     }
@@ -195,7 +195,7 @@ async fn handle_client_generic<S>(
         ProxyRequestKind::Invalid => {
             // 不是代理请求（如 GET /、GET /admin、格式非法）→ 伪装成普通网站的 404
             debug!("Non-proxy request from {} ({} {}): returning 404", client_addr, method, url);
-            send_404_not_found(&mut client).await;
+            send_404_not_found(&mut client, timeout_duration).await;
             return;
         }
         ProxyRequestKind::Connect => {} // 继续流程
@@ -206,7 +206,7 @@ async fn handle_client_generic<S>(
     // 只有确认是代理请求后才会可能返回 407，降低"被扫描识别为代理"的风险。
     if let Some(users) = auth.as_deref() {
         if !check_proxy_auth(&head_str, users) {
-            send_auth_required(&mut client).await;
+            send_auth_required(&mut client, timeout_duration).await;
             warn!("Proxy authentication failed from {}", client_addr);
             return;
         }
@@ -276,12 +276,13 @@ fn classify_proxy_request(method: &str, url: &str) -> ProxyRequestKind {
 /// - **不返回 X-Powered-By 等**
 /// - 简短，最小化攻击面与指纹
 /// - Connection: close，避免占着连接
-async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
+async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
     write_response(
         client,
         "404 Not Found",
         &[("Content-Type", "text/plain; charset=utf-8")],
         b"404 Not Found",
+        timeout,
     )
     .await;
 }
@@ -290,12 +291,13 @@ async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W) {
 ///
 /// 用 431 而不是 400：语义精确（RFC 6585 §5 专为"头部过大"定义），且只会在客户端
 /// 已经发出超长头时出现——扫描器通常只发一行 `GET /`，因此不构成代理特征泄漏。
-async fn send_head_too_large<W: AsyncWrite + Unpin>(client: &mut W) {
+async fn send_head_too_large<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
     write_response(
         client,
         "431 Request Header Fields Too Large",
         &[("Content-Type", "text/plain; charset=utf-8")],
         b"431 Request Header Fields Too Large",
+        timeout,
     )
     .await;
 }

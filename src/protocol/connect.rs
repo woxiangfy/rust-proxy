@@ -5,12 +5,14 @@
 //! 后续读取写出，否则会被丢掉。
 
 use crate::protocol::http_response::send_bad_gateway;
-use crate::support::net::{connect_host, is_benign_close_error, parse_host_port, strip_brackets};
+use crate::support::net::{
+    connect_host, is_benign_close_error, parse_host_port, strip_brackets, write_all_with_timeout,
+};
 use crate::transport::stream::PrefixedStream;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Handle CONNECT method for HTTPS tunneling（泛型版本，支持 TCP/TLS 客户端流）
 ///
@@ -46,7 +48,7 @@ pub(super) async fn handle_connect_generic<S>(
                 connect_host_str, port, client_addr, e
             );
             // 隧道未建立：必须在断开前明确告知 502，否则客户端把 EOF 当作隧道异常
-            send_bad_gateway(&mut client).await;
+            send_bad_gateway(&mut client, timeout_duration).await;
             return;
         }
     };
@@ -55,10 +57,14 @@ pub(super) async fn handle_connect_generic<S>(
     let mut client = PrefixedStream::new(leftover.to_vec(), client);
 
     // Send 200 Connection Established
-    if client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await
-        .is_err()
+    if write_all_with_timeout(
+        &mut client,
+        b"HTTP/1.1 200 Connection Established\r\n\r\n",
+        timeout_duration,
+        "CONNECT 200 response",
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -66,6 +72,11 @@ pub(super) async fn handle_connect_generic<S>(
     // 双向隧道：`copy_bidirectional` 正确处理半关闭（一侧 EOF 时关闭另一侧写端），
     // 且不对隧道总时长设限——长连接 HTTPS 会话可无限期保持（旧实现的总超时会断开长会话）。
     // 返回值为 `(client→target 字节数, target→client 字节数)`。
+    //
+    // 写方向超时不覆盖这里：隧道是不透明字节管道，"多久没写出去字节"无法区分
+    // 「客户端卡住」与「会话本来就长时间静默」（如 WebSocket 长连接、SSE 心跳间隔长的
+    // 协议）。`copy_bidirectional` 还承担半关闭语义，换成手写循环需要重写这部分行为，
+    // 超出本次范围；用一个 `timeout` 值去切隧道会误杀合法的长会话。
     match tokio::io::copy_bidirectional(&mut client, &mut target).await {
         Ok((c2t, t2c)) => info!(
             "CONNECT tunnel closed: {}:{} ({} bytes client→target, {} bytes target→client)",

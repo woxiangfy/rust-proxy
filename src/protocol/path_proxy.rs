@@ -168,6 +168,7 @@ pub(super) async fn handle_path_proxy<S>(
                 400,
                 "Bad Request",
                 &format!("invalid target URL, expected /{}/http://host/path", cfg.prefix()),
+                timeout,
             )
             .await;
             return;
@@ -179,12 +180,13 @@ pub(super) async fn handle_path_proxy<S>(
             400,
             "Bad Request",
             "only http and https targets are supported",
+            timeout,
         )
         .await;
         return;
     }
     if parsed.host_str().is_none() {
-        send_error(&mut client, 400, "Bad Request", "target URL has no host").await;
+        send_error(&mut client, 400, "Bad Request", "target URL has no host", timeout).await;
         return;
     }
 
@@ -193,7 +195,14 @@ pub(super) async fn handle_path_proxy<S>(
     let target = match ForwardTarget::from_url(method, target_url, &parsed) {
         Some(t) => t,
         None => {
-            send_error(&mut client, 400, "Bad Request", "target URL has no known port").await;
+            send_error(
+                &mut client,
+                400,
+                "Bad Request",
+                "target URL has no known port",
+                timeout,
+            )
+            .await;
             return;
         }
     };
@@ -214,7 +223,14 @@ pub(super) async fn handle_path_proxy<S>(
                 "[path-proxy] failed to connect upstream '{}' for {}: {:#}",
                 target_url, client_addr, e
             );
-            send_error(&mut client, 502, "Bad Gateway", "upstream connection failed").await;
+            send_error(
+                &mut client,
+                502,
+                "Bad Gateway",
+                "upstream connection failed",
+                timeout,
+            )
+            .await;
             return;
         }
     };
@@ -235,6 +251,7 @@ pub(super) async fn handle_path_proxy<S>(
                 400,
                 "Bad Request",
                 "conflicting or non-numeric Content-Length",
+                timeout,
             )
             .await;
             return;
@@ -273,6 +290,10 @@ pub(super) async fn handle_path_proxy<S>(
             "[path-proxy] client {} closed while forwarding response",
             client_addr
         ),
+        Ok(ResponseDelivery::ClientStalled) => warn!(
+            "[path-proxy] client {} stopped reading response, closing after timeout",
+            client_addr
+        ),
         Err(e) if is_benign_close_error(&e) => {
             debug!("[path-proxy] response ended early: {}", e)
         }
@@ -285,12 +306,19 @@ pub(super) async fn handle_path_proxy<S>(
 /// 报文骨架统一交给 [`write_response`] 构造（`Content-Type` → `Content-Length` →
 /// `Connection: close`），本模块不再手写字符串：这类响应是机器可读的协议输出，
 /// 漏写 `Content-Length` 或 `Connection: close` 都会让客户端挂起。
-async fn send_error<W: AsyncWrite + Unpin>(client: &mut W, code: u16, reason: &str, msg: &str) {
+async fn send_error<W: AsyncWrite + Unpin>(
+    client: &mut W,
+    code: u16,
+    reason: &str,
+    msg: &str,
+    timeout: Duration,
+) {
     write_response(
         client,
         &format!("{} {}", code, reason),
         &[("Content-Type", "text/plain; charset=utf-8")],
         msg.as_bytes(),
+        timeout,
     )
     .await;
 }
@@ -487,7 +515,7 @@ mod tests {
         // 错误响应必须与 http_response::write_response 完全一致（含 CL 与 Connection: close），
         // 否则客户端可能因为缺少分帧信息而挂起
         let mut out = Vec::new();
-        send_error(&mut out, 400, "Bad Request", "bad path").await;
+        send_error(&mut out, 400, "Bad Request", "bad path", Duration::from_millis(500)).await;
 
         let mut expected = Vec::new();
         write_response(
@@ -495,6 +523,7 @@ mod tests {
             "400 Bad Request",
             &[("Content-Type", "text/plain; charset=utf-8")],
             b"bad path",
+            Duration::from_millis(500),
         )
         .await;
 

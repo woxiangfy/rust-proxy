@@ -10,6 +10,7 @@
 //! | --- | --- | --- |
 //! | `Completed` | 调用方的完成日志（debug，含缓冲大小） | 正常收尾 |
 //! | `ClientGone` | **不记 error** | 客户端断开，正常下载中断不得刷屏 |
+//! | `ClientStalled` | warn | 写客户端在 `timeout` 内毫无进展：对端已不可用 |
 //! | `UpstreamClosed` | debug | 上游未产生数据即关闭 |
 //! | `TimedOut` | warn | 读上游超时 |
 //! | `UpstreamError` | benign → debug / 其余 → warn | 是否影响响应由调用方决定 |
@@ -21,11 +22,11 @@ use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
 use crate::protocol::http_response::{send_bad_gateway, write_response};
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
-use crate::support::net::{connect_host, is_benign_close_error};
+use crate::support::net::{connect_host, is_benign_close_error, write_all_with_timeout};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 
 /// 响应拷贝结束原因（两条链路共用的统一契约）
@@ -35,6 +36,8 @@ pub(super) enum RelayOutcome {
     Completed,
     /// 写客户端失败：客户端已断开（调度方不得记 error，避免正常中断刷屏）
     ClientGone,
+    /// 写客户端超时：对端在 `timeout` 内一个字节都没接受，已不再可用
+    ClientStalled,
     /// 上游在写出任何数据前 EOF
     UpstreamClosed,
     /// 读上游超时
@@ -74,12 +77,21 @@ where
             }
             Ok(Ok(n)) => {
                 copy.note_copied(n);
-                if client
-                    .write_all(&copy.as_mut_slice()[..n])
-                    .await
-                    .is_err()
+                // 写方向同样受 `timeout` 约束：对端只连不读时，写阻塞不能无限期占住连接
+                if let Err(e) = write_all_with_timeout(
+                    client,
+                    &copy.as_mut_slice()[..n],
+                    timeout,
+                    "response to client",
+                )
+                .await
                 {
-                    return (RelayOutcome::ClientGone, copy.current_size());
+                    let outcome = if e.kind() == std::io::ErrorKind::TimedOut {
+                        RelayOutcome::ClientStalled
+                    } else {
+                        RelayOutcome::ClientGone
+                    };
+                    return (outcome, copy.current_size());
                 }
                 wrote = true;
             }
@@ -94,12 +106,13 @@ where
 /// 只能拒绝、不能"挑一个用"：代理与上游对 body 边界的理解一旦不同，
 /// 后续字节就会被解释成另一个请求（请求走私）。此处已确认是代理请求，
 /// 返回 400 不会暴露代理特征。
-async fn send_bad_request<W: AsyncWrite + Unpin>(client: &mut W) {
+async fn send_bad_request<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
     write_response(
         client,
         "400 Bad Request",
         &[("Content-Type", "text/plain; charset=utf-8")],
         b"400 Bad Request",
+        timeout,
     )
     .await;
 }
@@ -204,7 +217,14 @@ where
     let Some(cl) = content_length else {
         // 无 Content-Length 且非 chunked：仅转发已缓冲字节
         if !buffered.is_empty() {
-            if let Err(e) = upstream.write_all(buffered).await {
+            if let Err(e) = write_all_with_timeout(
+                upstream,
+                buffered,
+                timeout,
+                "request body (buffered-only)",
+            )
+            .await
+            {
                 log_body_error(link, client_addr, "buffered-only", &e);
                 return Err(e);
             }
@@ -249,10 +269,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncWrite + Unpin,
 {
-    upstream.write_all(head.bytes.as_bytes()).await?;
+    let timeout = body.timeout;
+
+    write_all_with_timeout(upstream, head.bytes.as_bytes(), timeout, "request head to upstream")
+        .await?;
 
     if head.expect_continue {
-        client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        write_all_with_timeout(
+            client,
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            timeout,
+            "100-continue response",
+        )
+        .await?;
     }
 
     forward_request_body(client, upstream, body).await
@@ -277,6 +306,13 @@ async fn relay_response<S>(
         RelayOutcome::Completed => {}
         // 客户端断开：不记 error，避免正常下载中断刷屏
         RelayOutcome::ClientGone => {}
+        // 客户端只连不读：连接已按超时结束，但对端仍是"异常"状态，记 warn 便于定位
+        RelayOutcome::ClientStalled => {
+            warn!(
+                "Client stopped reading response from {}:{}, closing connection after timeout",
+                target.connect_host, target.port
+            );
+        }
         RelayOutcome::UpstreamClosed => {
             debug!(
                 "Upstream {}:{} closed before sending response body",
@@ -333,7 +369,7 @@ pub(super) async fn handle_http_request_generic<S>(
             "{} -> unsupported scheme '{}' in absolute-form (use CONNECT for https)",
             client_addr, target.scheme
         );
-        send_bad_request(&mut client).await;
+        send_bad_request(&mut client, timeout_duration).await;
         return;
     }
 
@@ -349,7 +385,7 @@ pub(super) async fn handle_http_request_generic<S>(
             "{} -> malformed framing headers (conflicting or non-numeric Content-Length)",
             client_addr
         );
-        send_bad_request(&mut client).await;
+        send_bad_request(&mut client, timeout_duration).await;
         return;
     };
 
@@ -360,7 +396,7 @@ pub(super) async fn handle_http_request_generic<S>(
                 "Failed to connect to {}:{} from {}: {}",
                 target.connect_host, target.port, client_addr, e
             );
-            send_bad_gateway(&mut client).await;
+            send_bad_gateway(&mut client, timeout_duration).await;
             return;
         }
     };
@@ -436,6 +472,43 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&resp).contains("Server:"),
             "错误响应不得暴露指纹头"
+        );
+    }
+
+    /// 客户端只连不读：写方向的阻塞必须被超时打断，不能永久占住连接
+    ///
+    /// 客户端侧的管道容量只有 8 字节且对端永不读取，上游则持续产出数据：
+    /// 拷贝循环的 `write_all` 会永久阻塞在"管道已满"上，函数永不返回，
+    /// 服务器端由此一直占着一条连接的并发许可。
+    ///
+    /// 用例在外层套一个 2 秒的观察窗口：若实现没有给写方向加超时，
+    /// 这里会得到 `Err(Elapsed)` 而失败（先红）；加了超时后应很快返回（后绿）。
+    #[tokio::test]
+    async fn test_copy_upstream_to_client_gives_up_when_client_stops_reading() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, client_peer) = tokio::io::duplex(8);
+        let (mut upstream_writer, mut upstream) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let chunk = vec![b'x'; 1024];
+            while upstream_writer.write_all(&chunk).await.is_ok() {}
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(100)),
+        )
+        .await;
+
+        // 客户端侧永远不读，保持连接直到用例结束，确保"只连不读"的前提成立
+        drop(client_peer);
+        let (outcome, _) = result.expect(
+            "客户端停止读取时，写方向的阻塞必须被超时打断，否则该连接会永久占住并发许可",
+        );
+        assert!(
+            !matches!(outcome, RelayOutcome::Completed),
+            "客户端没读完响应，不得报告正常完成：{:?}",
+            outcome
         );
     }
 

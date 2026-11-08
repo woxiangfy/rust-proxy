@@ -9,6 +9,7 @@
 use crate::config::AuthUser;
 use crate::protocol::http_response::write_response;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use std::time::Duration;
 use tokio::io::AsyncWrite;
 
 /// 校验请求中的 `Proxy-Authorization` 头是否符合配置的用户列表。
@@ -147,13 +148,17 @@ fn extract_basic_credentials<'a>(request_data: &'a str, header_name: &str) -> Op
 /// 向客户端发送 407 Proxy Authentication Required 响应，要求 Basic 认证。
 ///
 /// 泛型版本兼容 TCP 和 TLS 流。
-pub(super) async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_auth_required<W: AsyncWrite + Unpin>(
+    client: &mut W,
+    timeout: Duration,
+) {
     // Connection: close 使客户端重连时携带认证头重试
     write_response(
         client,
         "407 Proxy Authentication Required",
         &[("Proxy-Authenticate", "Basic realm=\"rust-proxy\"")],
         b"",
+        timeout,
     )
     .await;
 }
@@ -163,12 +168,16 @@ pub(super) async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
 /// 该模式下客户端并未「配置代理」，407 + `Proxy-Authenticate` 不会被浏览器处理
 /// （只会渲染 407 错误页且不弹登录框）；因此改用 401 + `WWW-Authenticate`，
 /// 浏览器会正常弹出 Basic 登录框。
-pub(super) async fn send_path_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_path_auth_required<W: AsyncWrite + Unpin>(
+    client: &mut W,
+    timeout: Duration,
+) {
     write_response(
         client,
         "401 Unauthorized",
         &[("WWW-Authenticate", "Basic realm=\"rust-proxy\"")],
         b"",
+        timeout,
     )
     .await;
 }

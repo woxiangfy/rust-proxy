@@ -8,18 +8,30 @@ use super::PathProxyConfig;
 use crate::protocol::http_util::{find_header_end, MAX_HEAD_BYTES};
 use crate::protocol::relay::{copy_upstream_to_client, RelayOutcome};
 use crate::support::buffer_pool::BufferPool;
+use crate::support::net::write_all_with_timeout;
 use log::{debug, warn};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 /// 响应回传的收尾状态
 ///
-/// 只用于让调用方区分「正常完成」与「客户端已断开」，不改变错误传播：
-/// 上游错误仍走 `Err`，客户端断开仍按正常收尾关闭连接。
+/// 只用于让调用方区分「正常完成」与「客户端已断开 / 不再读取」，不改变错误传播：
+/// 上游错误仍走 `Err`，客户端侧结束仍按正常收尾关闭连接。
 pub(super) enum ResponseDelivery {
     /// 响应头与 body 都已交给客户端（含上游提前 EOF）
     Completed,
     /// 客户端在写响应头或 body 时断开
     ClientGone,
+    /// 写客户端在 `timeout` 内毫无进展：对端已不再读取
+    ClientStalled,
+}
+
+/// 写客户端失败时归类：超时（对端不读）与普通断开（对端已关）含义不同，日志级别也不同
+fn delivery_for_write_error(e: &std::io::Error) -> ResponseDelivery {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        ResponseDelivery::ClientStalled
+    } else {
+        ResponseDelivery::ClientGone
+    }
 }
 
 /// 读取上游响应头（可能连带读到 body 前缀），可选重写 Location，随后流式转发 body。
@@ -78,17 +90,27 @@ where
         Some(p) => {
             let status = parse_status_code(&head_data[..p]);
             let new_head = rebuild_response_head(&head_data[..p], status, cfg, base);
-            if client.write_all(new_head.as_bytes()).await.is_err() {
-                return Ok(ResponseDelivery::ClientGone);
+            if let Err(e) =
+                write_all_with_timeout(client, new_head.as_bytes(), timeout, "response head")
+                    .await
+            {
+                return Ok(delivery_for_write_error(&e));
             }
-            if p < head_data.len() && client.write_all(&head_data[p..]).await.is_err() {
-                return Ok(ResponseDelivery::ClientGone);
+            if p < head_data.len() {
+                if let Err(e) =
+                    write_all_with_timeout(client, &head_data[p..], timeout, "response head")
+                        .await
+                {
+                    return Ok(delivery_for_write_error(&e));
+                }
             }
         }
         None => {
             // 头不完整（超限或上游提前关闭）：原样写出，避免破坏字节流
-            if client.write_all(&head_data).await.is_err() {
-                return Ok(ResponseDelivery::ClientGone);
+            if let Err(e) = write_all_with_timeout(client, &head_data, timeout, "response head")
+                .await
+            {
+                return Ok(delivery_for_write_error(&e));
             }
         }
     }
@@ -107,6 +129,8 @@ where
         }
         // 客户端断开：不记 error，正常下载中断不得刷屏
         RelayOutcome::ClientGone => Ok(ResponseDelivery::ClientGone),
+        // 客户端只连不读：写超时已结束连接，但这是对端异常，交由调用方记 warn
+        RelayOutcome::ClientStalled => Ok(ResponseDelivery::ClientStalled),
         RelayOutcome::UpstreamClosed => {
             debug!("[path-proxy] upstream closed before sending response body");
             Ok(ResponseDelivery::Completed)

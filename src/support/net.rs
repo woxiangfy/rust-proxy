@@ -13,7 +13,7 @@
 //! ```
 
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// 传输流的统一约束：可读、可写、可移动、可跨线程，用于 `Box<dyn AsyncStream>` 装箱。
@@ -56,6 +56,49 @@ pub(crate) async fn connect_host(host: &str, port: u16, timeout: Duration) -> st
             format!("No address resolved for {}", host),
         )
     }))
+}
+
+/// 写入全部数据，并给每个 `write()` 调用加超时
+///
+/// 读方向一直有 [`connect_host`] 那样的超时约束，写方向过去却是裸 `write_all`：
+/// 对端只连不读时，socket 发送缓冲填满后 `write` 会永久挂起，这条连接连同它的
+/// 并发许可就一直被占着。写超时意味着**对端已经不可用**，调用方应当结束该连接，
+/// 而不是重试。
+///
+/// 计时粒度是**单个 `write()` 调用**而不是整段数据：每次写出有进展就重新计时，
+/// 因此大 body / 慢速客户端（每 30 秒内总能写出去一些字节）不会被误杀；
+/// 只有"整整一个 `timeout` 内一个字节都写不出去"才判定失败，这与"对端不可用"
+/// 的语义一致。
+pub(crate) async fn write_all_with_timeout<W>(
+    writer: &mut W,
+    buf: &[u8],
+    timeout: Duration,
+    what: &str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let n = match tokio::time::timeout(timeout, writer.write(rest)).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("timeout writing {}", what),
+                ))
+            }
+        };
+        // `write` 返回 0 表示对端不可能再接受数据（如已关闭的写端），继续循环只会空转
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("peer accepted zero bytes while writing {}", what),
+            ));
+        }
+        rest = &rest[n..];
+    }
+    Ok(())
 }
 
 /// 判断 IO 错误是否为"对端正常/半正常关闭连接"类（不应记为 ERROR）
@@ -136,6 +179,34 @@ pub(crate) fn strip_brackets(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// 对端只连不读：每个 `write()` 的超时都必须触发，整体不能永久挂起
+    #[tokio::test]
+    async fn test_write_all_with_timeout_gives_up_when_peer_stops_reading() {
+        let (mut writer, _peer) = tokio::io::duplex(8);
+        let err = write_all_with_timeout(&mut writer, &[b'x'; 64], Duration::from_millis(50), "test")
+            .await
+            .expect_err("对端不读时写必须超时");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "写超时须映射为 TimedOut");
+    }
+
+    /// 慢但对端仍在消费：总耗时远超单个超时值，也不得判失败（超时按单次 `write()` 计）
+    #[tokio::test]
+    async fn test_write_all_with_timeout_allows_slow_but_progressing_peer() {
+        let (mut writer, mut peer) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4];
+            while peer.read_exact(&mut buf).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        // 64 字节、每 20ms 才被消费 4 字节 → 总耗时约 300ms，远大于 50ms 的单次超时
+        write_all_with_timeout(&mut writer, &[b'x'; 64], Duration::from_millis(50), "test")
+            .await
+            .expect("持续有进展的慢速对端不得被误杀");
+    }
 
     #[test]
     fn test_is_benign_close_error_classifies_tls_close_notify_as_benign() {

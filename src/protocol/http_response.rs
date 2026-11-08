@@ -10,23 +10,30 @@
 //! 任何一处漏写 `Content-Length` 或 `Connection: close` 都会造成客户端挂起，
 //! 而单点构造可以一次性保证形状，并用一个测试固定下来。
 //!
-//! 依赖方向：本模块是叶节点（仅依赖 tokio 的 AsyncWrite），不引用任何业务模块。
+//! 依赖方向：本模块只依赖 tokio 的 `AsyncWrite` 与写超时原语
+//! [`crate::support::net::write_all_with_timeout`]，不引用任何业务模块。
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::AsyncWrite;
+
+use crate::support::net::write_all_with_timeout;
 
 /// 写入一条完整响应
 ///
 /// - `status`：状态行中的状态码与原因短语（如 `"404 Not Found"`）
 /// - `extra_headers`：附加头（如认证质询、`Content-Type`），按给定顺序输出
 /// - `body`：响应体（空切片表示无 body，输出 `Content-Length: 0`）
+/// - `timeout`：写客户端超时（与读方向共用 `timeout` 配置，见
+///   [`crate::support::net::write_all_with_timeout`]）
 ///
-/// 写失败一律忽略：调用点都是"错误路径上顺手回一句"，连接可能已经断了，
-/// 此时再上报错误没有意义（与既有行为一致）。
+/// 写失败（含超时）一律忽略：调用点都是"错误路径上顺手回一句"，连接可能已经断了
+/// 或对端根本不读，此时再上报错误没有意义（与既有行为一致）。
 pub(super) async fn write_response<W>(
     stream: &mut W,
     status: &str,
     extra_headers: &[(&str, &str)],
     body: &[u8],
+    timeout: Duration,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -44,11 +51,14 @@ pub(super) async fn write_response<W>(
     head.push_str(&body.len().to_string());
     head.push_str("\r\nConnection: close\r\n\r\n");
 
-    if stream.write_all(head.as_bytes()).await.is_err() {
+    if write_all_with_timeout(stream, head.as_bytes(), timeout, "response head")
+        .await
+        .is_err()
+    {
         return;
     }
     if !body.is_empty() {
-        let _ = stream.write_all(body).await;
+        let _ = write_all_with_timeout(stream, body, timeout, "response body").await;
     }
 }
 
@@ -60,12 +70,16 @@ pub(super) async fn write_response<W>(
 /// 失败给出完全不同的反馈属于实现漂移，这里统一。
 ///
 /// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
-pub(super) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_bad_gateway<W: AsyncWrite + Unpin>(
+    client: &mut W,
+    timeout: Duration,
+) {
     write_response(
         client,
         "502 Bad Gateway",
         &[("Content-Type", "text/plain; charset=utf-8")],
         b"502 Bad Gateway",
+        timeout,
     )
     .await;
 }
@@ -73,6 +87,10 @@ pub(super) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeout() -> Duration {
+        Duration::from_millis(500)
+    }
 
     #[tokio::test]
     async fn test_write_response_with_body() {
@@ -82,6 +100,7 @@ mod tests {
             "404 Not Found",
             &[("Content-Type", "text/plain; charset=utf-8")],
             b"404 Not Found",
+            timeout(),
         )
         .await;
 
@@ -105,6 +124,7 @@ mod tests {
             "407 Proxy Authentication Required",
             &[("Proxy-Authenticate", "Basic realm=\"rust-proxy\"")],
             b"",
+            timeout(),
         )
         .await;
 

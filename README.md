@@ -258,7 +258,8 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `protocol/dispatch.rs` | 请求编排：读头 → 分类 → 认证 → 分流；反扫描 404 与超限 431 |
 | `protocol/request.rs` | 请求头读取与完整性判定（`Complete` / `Incomplete` / `Overflow`） |
 | `protocol/connect.rs` | CONNECT 隧道：建连、200 应答、双向转发、502 |
-| `protocol/relay.rs` | 经典转发流水线（建头 → 请求体 → 响应回传）；与路径前缀共用请求体转发与响应拷贝循环（`RelayLink` 区分日志来源） |
+| `protocol/classic.rs` | 经典代理转发流水线（建头 → 请求体 → 响应回传），编排取自 `relay` 的共享原语 |
+| `protocol/relay.rs` | 两条链路共用的转发原语：上游请求发送序列、请求体转发、响应拷贝循环与 `RelayOutcome`（`RelayLink` 区分日志来源） |
 | `protocol/forward.rs` | 转发目标解析（IPv6 双表示）与上游建头（经典 / 路径前缀共用同一份） |
 | `protocol/path_proxy.rs` | 路径前缀模式：前缀匹配、配置校验与请求编排（门面） |
 | `protocol/path_proxy/upstream.rs` | 路径前缀模式：上游连接建立（http / https TLS） |

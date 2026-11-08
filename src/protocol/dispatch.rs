@@ -1,17 +1,17 @@
 //! 请求编排：读头 → 分类 → 认证 → 分流到 CONNECT / 经典转发 / 路径前缀直连
 //!
 //! 本模块只决定"一条客户端连接上发生什么、按什么顺序"，具体转发实现在
-//! [`crate::protocol::connect`] 与 [`crate::protocol::relay`]。
+//! [`crate::protocol::connect`] 与 [`crate::protocol::classic`]。
 
 use crate::config::AuthUser;
 use crate::protocol::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};
+use crate::protocol::classic::handle_http_request_generic;
 use crate::protocol::connect::handle_connect_generic;
 use crate::protocol::http_response::write_response;
 use crate::protocol::http_util::{head_end_offset, MAX_HEAD_BYTES};
 use crate::protocol::path_proxy::{
     handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
 };
-use crate::protocol::relay::handle_http_request_generic;
 use crate::protocol::request::{read_request_head, HeadStatus};
 use crate::support::buffer_pool::BufferPool;
 use crate::support::net::is_benign_close_error;

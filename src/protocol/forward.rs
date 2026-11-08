@@ -353,8 +353,8 @@ Host: example.com
     #[test]
     fn test_forward_target_marks_https_scheme_with_known_default_port() {
         // URL 解析层仍按 scheme 求默认端口（https → 443），但经典代理入口据 `scheme`
-        // 拒绝 https absolute-form（见 `handle_http_request_generic` 与
-        // `https_absolute_form_is_rejected_with_400`）
+        // 拒绝 https absolute-form（见 `protocol::classic` 的
+        // `handle_http_request_generic` 与 400 用例）
         let head = "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let t = ForwardTarget::parse(head, addr()).expect("https absolute URL must parse");
         assert_eq!(t.scheme, "https");

@@ -4,6 +4,7 @@
 //! 接入与装配由 `crate::server` 负责。
 
 pub mod auth;
+pub(crate) mod classic;
 pub(crate) mod connect;
 pub(crate) mod dispatch;
 pub(crate) mod forward;

@@ -4,7 +4,8 @@
 //! - [`crate::protocol::request`]：请求头读取与完整性判定
 //! - [`crate::protocol::connect`]：CONNECT 隧道
 //! - [`crate::protocol::dispatch`]：请求编排、分类与 404/431 响应
-//! - [`crate::protocol::relay`]：经典转发流水线与响应回传
+//! - [`crate::protocol::classic`]：经典转发流水线
+//! - [`crate::protocol::relay`]：两条链路共用的转发原语与响应回传
 //!
 //! 保留本模块是为了让 `server.rs` 与 `lib.rs` 的既有引用保持可用。
 

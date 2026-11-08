@@ -16,8 +16,9 @@
 //!   → config（tls 取 `TlsConfig`，proxy_protocol 取 `ProxyProtocolMode`）, support
 //!
 //! 协议层 protocol：request（读客户端请求头）dispatch（分类与编排）connect（CONNECT 隧道）
-//!                 forward（上游目标与请求头构造）relay（请求体转发与响应回传）
-//!                 path_proxy（路径前缀直连）auth  http_util  http_body  http_response
+//!                 classic（经典转发流水线）forward（上游目标与请求头构造）
+//!                 relay（请求体转发与响应回传）path_proxy（路径前缀直连）
+//!                 auth  http_util  http_body  http_response
 //!   → config, support, transport::stream, transport::tls_client
 //!
 //! 配置层 config：mod（模型与运行时派生）schema（声明层唯一真源）

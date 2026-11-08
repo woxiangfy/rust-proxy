@@ -201,6 +201,10 @@ impl Args {
     /// 错误文案保持与 `server` 原先的实现逐字一致，调用方只需在绑定端口前
     /// 调一次。证书缺失/加载失败不在这里处理——那是自签回退路径，不是配置错误。
     pub fn validate(&self) -> Result<()> {
+        if self.timeout == 0 {
+            anyhow::bail!("timeout must be greater than 0 (got 0)");
+        }
+
         if self.port.is_none() && self.tls.is_none() {
             anyhow::bail!(
                 "Neither HTTP nor HTTPS proxy is enabled. Specify --port and/or --https-port."
@@ -451,6 +455,20 @@ password = "p@ss"
             err.to_string(),
             "HTTP port 18080 conflicts with HTTPS port 18080; please specify different ports"
         );
+    }
+
+    /// `timeout = 0` 会让每一次读/写都在零时限内失败（写方向接入超时后尤其明显：
+    /// 连错误响应都写不出去），必须在启动时拒绝而不是带着坏配置跑起来。
+    #[test]
+    fn test_validate_rejects_zero_timeout() {
+        let args = Args::from_run_args(&ServerRunArgs {
+            port: Some(8080),
+            timeout: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        let err = args.validate().expect_err("timeout=0 must fail");
+        assert_eq!(err.to_string(), "timeout must be greater than 0 (got 0)");
     }
 
     /// 仅 HTTPS（无 HTTP 端口）与双端口不冲突时校验通过

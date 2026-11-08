@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 
 /// 响应拷贝结束原因（两条链路共用的统一契约）
 #[derive(Debug)]
-pub(crate) enum RelayOutcome {
+pub(super) enum RelayOutcome {
     /// 上游 EOF，且已向客户端写出至少一段数据：响应正常收尾
     Completed,
     /// 写客户端失败：客户端已断开（调度方不得记 error，避免正常中断刷屏）
@@ -51,7 +51,7 @@ pub(crate) enum RelayOutcome {
 ///
 /// `Completed` 与 `UpstreamClosed` 的区分依据是"是否已向客户端写出过数据"：
 /// 前者表示响应体正常收尾，后者表示上游在这次响应里一个字节都没给出。
-pub(crate) async fn copy_upstream_to_client<S, T>(
+pub(super) async fn copy_upstream_to_client<S, T>(
     client: &mut S,
     upstream: &mut T,
     timeout: Duration,
@@ -313,7 +313,7 @@ where
 /// 2. 连接上游（`connect_host` 统一处理 IPv4 / IPv6 / DNS）
 /// 3. [`UpstreamHead::build`] + [`forward_request_body`] —— 建头、转发 body
 /// 4. [`relay_response`] —— 回传响应
-pub(crate) async fn handle_http_request_generic<S>(
+pub(super) async fn handle_http_request_generic<S>(
     mut client: S,
     request_data: &[u8],
     head_end: usize,

@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// RFC 7230 chunked 请求体分帧状态机
 ///
 /// 仅用于识别 body 结束位置（最终块 `0\r\n` 及随后的空行），所有字节原样转发。
-pub(crate) struct ChunkedBodyReader {
+struct ChunkedBodyReader {
     state: ChunkState,
     /// chunk-size 行 / trailer 行缓冲
     line: Vec<u8>,
@@ -38,7 +38,7 @@ enum ChunkState {
 }
 
 impl ChunkedBodyReader {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: ChunkState::SizeLine,
             line: Vec::with_capacity(16),
@@ -49,12 +49,12 @@ impl ChunkedBodyReader {
     }
 
     #[inline]
-    pub(crate) fn done(&self) -> bool {
+    fn done(&self) -> bool {
         self.done
     }
 
     /// 消费一个输入字节，推进分帧状态
-    pub(crate) fn push_byte(&mut self, b: u8) {
+    fn push_byte(&mut self, b: u8) {
         if self.done {
             return;
         }
@@ -133,7 +133,7 @@ fn parse_chunk_size(line: &[u8]) -> Option<u64> {
 ///
 /// 分帧状态机逐字节解析并原样转发，直到遇到终止块 `0\r\n` 及随后的空行（trailer 结束）。
 /// 输出按 BUFFER_SIZE 批量 flush，避免逐字节写。
-pub(crate) async fn forward_chunked_body<S, T>(
+pub(super) async fn forward_chunked_body<S, T>(
     client: &mut S,
     target: &mut T,
     prefix: &[u8],
@@ -205,7 +205,7 @@ where
 ///
 /// 已缓冲字节按 `content_length` 截断：超出的部分属于管道化的下一个请求，
 /// 一起发出去会污染本次请求体。
-pub(crate) async fn forward_content_length_body<S, T>(
+pub(super) async fn forward_content_length_body<S, T>(
     client: &mut S,
     target: &mut T,
     buffered: &[u8],

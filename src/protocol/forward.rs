@@ -19,23 +19,23 @@ use std::net::SocketAddr;
 /// - `connect_host`：交给 `lookup_host` / TLS SNI，IPv6 去掉方括号（`::1`）
 ///
 /// 把两种形式在同一次解析里分开保存，避免每个调用点各自处理方括号。
-pub(crate) struct ForwardTarget<'a> {
-    pub(crate) method: &'a str,
-    pub(crate) url: &'a str,
+pub(super) struct ForwardTarget<'a> {
+    pub(super) method: &'a str,
+    pub(super) url: &'a str,
     /// 请求目标协议（分类阶段只允许 http/https；经典转发只服务 http）
-    pub(crate) scheme: String,
+    pub(super) scheme: String,
     /// 上游 `Host` 头值：绝对 URL 的 authority（IPv6 带方括号，显式端口保留）
-    pub(crate) authority: String,
+    pub(super) authority: String,
     /// 用于 socket 连接 / DNS 解析 / TLS SNI 的主机名（IPv6 不带方括号）
-    pub(crate) connect_host: String,
-    pub(crate) port: u16,
+    pub(super) connect_host: String,
+    pub(super) port: u16,
     /// origin-form 请求目标：path + query，直连上游的标准形式
-    pub(crate) origin_form: String,
+    pub(super) origin_form: String,
 }
 
 impl<'a> ForwardTarget<'a> {
     /// 从请求头解析转发目标；格式非法时返回 `None`（调用方保持"静默丢弃"语义）
-    pub(crate) fn parse(head_str: &'a str, client_addr: SocketAddr) -> Option<Self> {
+    pub(super) fn parse(head_str: &'a str, client_addr: SocketAddr) -> Option<Self> {
         let request_line = head_str.lines().next()?;
         let mut parts = request_line.split_whitespace();
         let method = parts.next()?;
@@ -75,7 +75,7 @@ impl<'a> ForwardTarget<'a> {
     }
 
     /// 从已解析的 URL 构造（路径前缀直连在完成 scheme/host 校验后调用）
-    pub(crate) fn from_url(method: &'a str, raw_url: &'a str, parsed: &url::Url) -> Option<Self> {
+    pub(super) fn from_url(method: &'a str, raw_url: &'a str, parsed: &url::Url) -> Option<Self> {
         let host = parsed.host_str()?;
         let port = parsed.port_or_known_default()?;
         Some(Self::assemble(method, raw_url, parsed, host, port))
@@ -105,20 +105,20 @@ impl<'a> ForwardTarget<'a> {
 }
 
 /// 发往上游的请求头（已过滤逐跳头、改写 `Connection`）及请求体分帧信息
-pub(crate) struct UpstreamHead {
+pub(super) struct UpstreamHead {
     /// 请求行 + 过滤后的头部 + 结尾空行，可直接 `write_all`
-    pub(crate) bytes: String,
+    pub(super) bytes: String,
     /// 请求体长度（`None` 表示没有 `Content-Length`）
-    pub(crate) content_length: Option<u64>,
+    pub(super) content_length: Option<u64>,
     /// 请求体是否为 chunked 分帧
-    pub(crate) chunked: bool,
+    pub(super) chunked: bool,
     /// 客户端是否声明了 `Expect: 100-continue`（该头不转发上游，由代理直接应答）
-    pub(crate) expect_continue: bool,
+    pub(super) expect_continue: bool,
 }
 
 impl UpstreamHead {
     /// 构造上游请求头（不剔除额外的认证头）
-    pub(crate) fn build(target: &ForwardTarget<'_>, head_str: &str) -> Option<Self> {
+    pub(super) fn build(target: &ForwardTarget<'_>, head_str: &str) -> Option<Self> {
         Self::build_filtered(target, head_str, None)
     }
 
@@ -152,7 +152,7 @@ impl UpstreamHead {
     /// - 出现多个**不一致**的 `Content-Length`。
     ///
     /// 这两种情况下代理与上游对 body 边界必然有不同的理解，转发等于制造走私面。
-    pub(crate) fn build_filtered(
+    pub(super) fn build_filtered(
         target: &ForwardTarget<'_>,
         head_str: &str,
         drop_header: Option<&str>,

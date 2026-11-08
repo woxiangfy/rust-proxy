@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 ///
 /// 常见情况（请求头在第一次读取内完成）复用池化缓冲区，实现零拷贝；
 /// 大请求头则需要扩展堆缓冲。
-pub(crate) enum RequestStorage {
+pub(super) enum RequestStorage {
     /// 单次读取即包含完整请求头：直接持有池化缓冲区（零拷贝）
     Pooled(PooledBuffer, usize),
     /// 需要多次读取的大请求：持有堆缓冲
@@ -23,7 +23,7 @@ pub(crate) enum RequestStorage {
 impl RequestStorage {
     /// 获取已读数据的字节切片
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub(super) fn as_slice(&self) -> &[u8] {
         match self {
             RequestStorage::Pooled(b, n) => &b.as_slice()[..*n],
             RequestStorage::Heap(v) => v,
@@ -37,7 +37,7 @@ impl RequestStorage {
 /// 转发给上游时会补上结束空行，上游把它当作合法请求处理，而代理与客户端对
 /// "这条请求到底发了什么"理解不同（历史实现在超限时就是这样把截断头送出去的，见 D5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeadStatus {
+pub(super) enum HeadStatus {
     /// 已找到 `\r\n\r\n`，可以安全解析与转发
     Complete,
     /// 客户端在头结束前关闭连接（EOF）：内容不完整，只能丢弃
@@ -50,7 +50,7 @@ pub(crate) enum HeadStatus {
 ///
 /// 整个读取过程受一次 `timeout` 约束，防止慢速攻击（slowloris）逐次续期。
 /// 常见情况（一次读取即含完整头）复用池化缓冲区，零拷贝。
-pub(crate) async fn read_request_head<S>(
+pub(super) async fn read_request_head<S>(
     client: &mut S,
     buffer_pool: &BufferPool,
     timeout: Duration,

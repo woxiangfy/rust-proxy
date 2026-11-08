@@ -22,7 +22,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 ///
 /// 写失败一律忽略：调用点都是"错误路径上顺手回一句"，连接可能已经断了，
 /// 此时再上报错误没有意义（与既有行为一致）。
-pub(crate) async fn write_response<W>(
+pub(super) async fn write_response<W>(
     stream: &mut W,
     status: &str,
     extra_headers: &[(&str, &str)],
@@ -60,7 +60,7 @@ pub(crate) async fn write_response<W>(
 /// 失败给出完全不同的反馈属于实现漂移，这里统一。
 ///
 /// 响应体刻意简短且不含目标地址，避免把内网拓扑回显给调用方。
-pub(crate) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_bad_gateway<W: AsyncWrite + Unpin>(client: &mut W) {
     write_response(
         client,
         "502 Bad Gateway",

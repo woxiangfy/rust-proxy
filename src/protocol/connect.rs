@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 ///
 /// `leftover` 是请求头之后已经读入的字节（如客户端与 CONNECT 一并发送的 TLS ClientHello），
 /// 会作为隧道前缀保留，避免数据丢失。
-pub(crate) async fn handle_connect_generic<S>(
+pub(super) async fn handle_connect_generic<S>(
     mut client: S,
     host_port: &str,
     client_addr: SocketAddr,

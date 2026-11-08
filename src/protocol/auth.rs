@@ -16,7 +16,7 @@ use tokio::io::AsyncWrite;
 /// 实现标准 HTTP Basic 认证（RFC 7617）：从请求头中提取
 /// `Proxy-Authorization: Basic <base64(user:pass)>`，解码后与 `users` 比对。
 /// 头缺失、方案不符、Base64 解码失败或凭据不匹配均返回 `false`。
-pub(crate) fn check_proxy_auth(request_data: &str, users: &[AuthUser]) -> bool {
+pub(super) fn check_proxy_auth(request_data: &str, users: &[AuthUser]) -> bool {
     match extract_basic_credentials(request_data, "proxy-authorization") {
         Some(creds) => verify_basic_credentials(creds, users),
         None => false,
@@ -27,7 +27,7 @@ pub(crate) fn check_proxy_auth(request_data: &str, users: &[AuthUser]) -> bool {
 ///
 /// 认证成功后需要把该头从转发给上游的请求中剔除，否则代理凭据会泄漏给目标站点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PathAuthSource {
+pub(super) enum PathAuthSource {
     /// `Authorization`：浏览器/普通客户端收到 401 质询后发送
     Authorization,
     /// `Proxy-Authorization`：脚本或 curl 以代理方式携带凭据
@@ -36,7 +36,7 @@ pub(crate) enum PathAuthSource {
 
 impl PathAuthSource {
     /// 该来源对应的请求头名（小写）
-    pub(crate) fn header_name(self) -> &'static str {
+    pub(super) fn header_name(self) -> &'static str {
         match self {
             PathAuthSource::Authorization => "authorization",
             PathAuthSource::ProxyAuthorization => "proxy-authorization",
@@ -52,7 +52,7 @@ impl PathAuthSource {
 ///
 /// 返回实际认证成功的头来源（`None` 表示认证失败），调用方据此把该头从
 /// 上游请求中移除——只移除"真正被用来认证"的那一个，另一个可留给目标站点使用。
-pub(crate) fn check_path_auth(
+pub(super) fn check_path_auth(
     request_data: &str,
     users: &[AuthUser],
 ) -> Option<PathAuthSource> {
@@ -147,7 +147,7 @@ fn extract_basic_credentials<'a>(request_data: &'a str, header_name: &str) -> Op
 /// 向客户端发送 407 Proxy Authentication Required 响应，要求 Basic 认证。
 ///
 /// 泛型版本兼容 TCP 和 TLS 流。
-pub(crate) async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     // Connection: close 使客户端重连时携带认证头重试
     write_response(
         client,
@@ -163,7 +163,7 @@ pub(crate) async fn send_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
 /// 该模式下客户端并未「配置代理」，407 + `Proxy-Authenticate` 不会被浏览器处理
 /// （只会渲染 407 错误页且不弹登录框）；因此改用 401 + `WWW-Authenticate`，
 /// 浏览器会正常弹出 Basic 登录框。
-pub(crate) async fn send_path_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
+pub(super) async fn send_path_auth_required<W: AsyncWrite + Unpin>(client: &mut W) {
     write_response(
         client,
         "401 Unauthorized",

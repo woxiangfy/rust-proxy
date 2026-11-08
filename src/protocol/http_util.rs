@@ -12,13 +12,13 @@
 /// 请求头 / 响应头最大字节数：超过即视为畸形或恶意（防御超大头攻击）
 ///
 /// 64KB 足够容纳任何正常浏览器的请求头（含超长 Cookie），同时限制单连接内存占用。
-pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
+pub(super) const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 /// 查找头部结束位置（首个 `\r\n\r\n` 之后的偏移），未找到返回 `None`
 ///
 /// 返回的是 **body 起始偏移**（已越过空行），因此可直接用作切片边界：
 /// `&data[..p]` 为头部，`&data[p..]` 为 body 前缀。
-pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
+pub(super) fn find_header_end(data: &[u8]) -> Option<usize> {
     data.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
@@ -26,7 +26,7 @@ pub(crate) fn find_header_end(data: &[u8]) -> Option<usize> {
 
 /// 头部结束位置；未找到结束符（头不完整 / 超限被截断）时退化为 `data.len()`，
 /// 即把全部已读字节视作头部。
-pub(crate) fn head_end_offset(data: &[u8]) -> usize {
+pub(super) fn head_end_offset(data: &[u8]) -> usize {
     find_header_end(data).unwrap_or(data.len())
 }
 
@@ -38,7 +38,7 @@ pub(crate) fn head_end_offset(data: &[u8]) -> usize {
 ///
 /// `connection_named` 是 [`connection_named_headers`] 的解析结果：RFC 7230 §6.1 要求
 /// 代理同时丢弃 `Connection: X-Foo` 里点名的字段，仅靠固定名单会漏掉自定义逐跳头。
-pub(crate) fn is_hop_by_hop(name: &str, connection_named: &[String]) -> bool {
+pub(super) fn is_hop_by_hop(name: &str, connection_named: &[String]) -> bool {
     const NAMES: [&str; 8] = [
         "keep-alive",
         "proxy-connection",
@@ -61,7 +61,7 @@ pub(crate) fn is_hop_by_hop(name: &str, connection_named: &[String]) -> bool {
 /// - `content-length` / `transfer-encoding`：分帧头，丢一条就会让代理与上游的
 ///   body 边界不一致（请求走私面），必须保留原生处理逻辑；
 /// - `host`：由代理按绝对 URL 重写 / 补写。
-pub(crate) fn connection_named_headers(head_str: &str) -> Vec<String> {
+pub(super) fn connection_named_headers(head_str: &str) -> Vec<String> {
     const PROTECTED: [&str; 4] = ["connection", "content-length", "transfer-encoding", "host"];
 
     let mut names: Vec<String> = Vec::new();
@@ -89,7 +89,7 @@ pub(crate) fn connection_named_headers(head_str: &str) -> Vec<String> {
 /// 上游 authority（Host 头值）：域名/裸 IP 直接拼端口，IPv6 需补方括号。
 ///
 /// `url` crate 对 IPv6 字面量已返回带方括号的 host（`[::1]`），需避免重复包裹。
-pub(crate) fn authority_of(u: &url::Url) -> String {
+pub(super) fn authority_of(u: &url::Url) -> String {
     let host = u.host_str().unwrap_or_default();
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{}]", host)

@@ -111,7 +111,7 @@ impl PathProxyConfig {
 ///
 /// 把这些字段打包，一是为了压住参数个数，二是让"哪些是逐请求的、哪些是进程级的"
 /// 在签名上显式可见（后者见 [`PathProxyRuntime`]）。
-pub(crate) struct PathProxyRequest<'a> {
+pub(super) struct PathProxyRequest<'a> {
     /// 请求方法（GET / POST / ...）
     pub method: &'a str,
     /// 目标 URL（含 scheme），由 [`PathProxyConfig::match_target`] 解析得到
@@ -126,14 +126,14 @@ pub(crate) struct PathProxyRequest<'a> {
 
 /// 路径前缀直连的运行期参数（与单次请求无关，整个进程共用）
 #[derive(Clone, Copy)]
-pub(crate) struct PathProxyRuntime<'a> {
+pub(super) struct PathProxyRuntime<'a> {
     pub cfg: &'a PathProxyConfig,
     pub timeout: Duration,
     pub buffer_pool: &'a BufferPool,
 }
 
 /// 处理一次路径前缀直连请求。
-pub(crate) async fn handle_path_proxy<S>(
+pub(super) async fn handle_path_proxy<S>(
     mut client: S,
     client_addr: SocketAddr,
     req: PathProxyRequest<'_>,

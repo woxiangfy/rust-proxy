@@ -27,8 +27,8 @@
 //!    统一返回 400，`Transfer-Encoding` 整行原样转发（不折叠编码声明）。
 //!
 //! 文件布局：本文件保留配置、前缀匹配与请求编排；上游连接在 [`upstream`]，
-//! 请求体转发与经典代理共用 [`crate::protocol::relay::forward_request_body`]，
-//! 响应头读取与重建在 [`response`]。
+//! 请求发送与经典代理共用 `crate::protocol::relay::send_upstream_request`
+//! （写头 → 应答 100-continue → 转发请求体），响应头读取与重建在 [`response`]。
 
 use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_response::write_response;
@@ -38,12 +38,12 @@ use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 mod response;
 mod upstream;
 
-use crate::protocol::relay::{forward_request_body, RelayLink, RequestBodyForward};
+use crate::protocol::relay::{send_upstream_request, RelayLink, RequestBodyForward};
 use response::forward_response;
 use upstream::connect_upstream;
 /// 路径前缀直连模式配置
@@ -241,27 +241,13 @@ pub(crate) async fn handle_path_proxy<S>(
         }
     };
 
-    if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
-        return;
-    }
-
-    // 客户端声明 `Expect: 100-continue` 时先给临时响应，否则它会等上游的 100（已丢弃
-    // 该头，上游不会发）而白等一个 RTT 甚至超时。`Expect` 本身不转发给上游。
-    if head.expect_continue
-        && client
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .await
-            .is_err()
-    {
-        return;
-    }
-
-    // ── 4. 转发请求体（已缓冲前缀 + 流式剩余部分）──
-    // 与经典代理共用 relay::forward_request_body，仅用 RelayLink 区分日志来源
+    // ── 4. 转发请求（写头 → 按需应答 100-continue → 转发 body）──
+    // 与经典代理共用 relay::send_upstream_request，仅用 RelayLink 区分日志来源
     let buffered_body = &request_data[head_end..];
-    if forward_request_body(
+    if send_upstream_request(
         &mut client,
         &mut upstream,
+        &head,
         RequestBodyForward {
             buffered: buffered_body,
             content_length: head.content_length,

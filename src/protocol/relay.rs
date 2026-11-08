@@ -1,8 +1,9 @@
 //! 响应回传与经典转发流水线
 //!
-//! 经典代理与路径前缀直连共用同一份请求体转发 [`forward_request_body`]（差异只有
-//! 日志标签 [`RelayLink`]），以及同一段「读上游 → 写客户端」循环（自适应缓冲、
-//! 单次读单次写、不解析响应语义）与结束契约 [`RelayOutcome`]。
+//! 经典代理与路径前缀直连共用同一份请求发送序列 [`send_upstream_request`]
+//! （写头 → 应答 `100 Continue` → 转发请求体，差异只有日志标签 [`RelayLink`]），
+//! 以及同一段「读上游 → 写客户端」循环（自适应缓冲、单次读单次写、不解析响应语义）
+//! 与结束契约 [`RelayOutcome`]。
 //! 各调用点只负责把 outcome 映射成日志级别与自身返回类型，映射规则统一为：
 //!
 //! | outcome | 日志 | 说明 |
@@ -232,6 +233,32 @@ where
     }
 }
 
+/// 把一次请求发到上游：写请求头 → 需要时自己应答 `100 Continue` → 转发请求体
+///
+/// 经典代理与路径前缀直连的发送顺序完全一致，差别只在调用方对失败的处理与日志，
+/// 因此收敛到这里。返回值是已写出的请求体字节数，含义与 [`forward_request_body`] 相同。
+///
+/// 100-continue 的时机：`Expect` 已从上游头中剔除，临时响应必须由代理自己给；
+/// 否则客户端会等一个永远不会来的 100，直到自己的等待超时才补发 body。
+pub(super) async fn send_upstream_request<S, T>(
+    client: &mut S,
+    upstream: &mut T,
+    head: &UpstreamHead,
+    body: RequestBodyForward<'_>,
+) -> std::io::Result<u64>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncWrite + Unpin,
+{
+    upstream.write_all(head.bytes.as_bytes()).await?;
+
+    if head.expect_continue {
+        client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
+
+    forward_request_body(client, upstream, body).await
+}
+
 /// 读上游响应并原样转发给客户端
 ///
 /// 拷贝缓冲自适应（8KB 起步，长传输 / 大 body 翻倍到 256KB）：一次读 + 一次写，
@@ -342,24 +369,10 @@ pub(crate) async fn handle_http_request_generic<S>(
         }
     };
 
-    if upstream.write_all(head.bytes.as_bytes()).await.is_err() {
-        return;
-    }
-
-    // `Expect: 100-continue` 已从上游请求里剔除，临时响应必须由代理自己给：
-    // 否则客户端会等一个永远不会来的 100，直到自己的等待超时才补发 body。
-    if head.expect_continue
-        && client
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .await
-            .is_err()
-    {
-        return;
-    }
-
-    if forward_request_body(
+    if send_upstream_request(
         &mut client,
         &mut upstream,
+        &head,
         RequestBodyForward {
             buffered: &request_data[head_end..],
             content_length: head.content_length,

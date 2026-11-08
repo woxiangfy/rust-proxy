@@ -80,3 +80,66 @@ pub(super) async fn handle_connect_generic<S>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn fake_client_addr() -> SocketAddr {
+        "127.0.0.1:54321".parse().expect("client addr")
+    }
+
+    /// 目标无法解析时，当前实现只记日志并静默关闭（不向客户端回任何字节）。
+    /// 用例钉住这一现状，避免后续重构无意中改变客户端的可观测行为。
+    #[tokio::test]
+    async fn test_connect_target_parse_failure_closes_without_response() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+
+        handle_connect_generic(
+            client,
+            "example.com:not-a-port",
+            fake_client_addr(),
+            Duration::from_secs(1),
+            &[],
+        )
+        .await;
+
+        let mut buf = Vec::new();
+        peer.read_to_end(&mut buf).await.expect("read client side");
+        assert!(
+            buf.is_empty(),
+            "解析失败应静默关闭（不写 200/502），实际收到：{:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    /// 上游不可达时必须在断开前回 502，否则客户端只能把 EOF 当作隧道异常。
+    #[tokio::test]
+    async fn test_connect_unreachable_upstream_returns_502() {
+        // 先绑定再释放：得到一个确定无人监听的本地端口
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe port");
+        let target_addr = listener.local_addr().expect("probe local_addr");
+        drop(listener);
+
+        let (client, mut peer) = tokio::io::duplex(2048);
+        handle_connect_generic(
+            client,
+            &target_addr.to_string(),
+            fake_client_addr(),
+            Duration::from_millis(500),
+            &[],
+        )
+        .await;
+
+        let mut buf = Vec::new();
+        peer.read_to_end(&mut buf).await.expect("read client side");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "上游不可达必须回 502，实际响应：{text}"
+        );
+    }
+}

@@ -34,7 +34,7 @@ pub(super) async fn connect_upstream(
         let tls = crate::transport::tls_client::connect_tls(tcp, host, cfg.insecure_tls, timeout)
             .await
             .with_context(|| format!("TLS handshake with {} failed", host))?;
-        debug!("Path-proxy: TLS established with {}:{}", host, port);
+        debug!("[path-proxy] TLS established with {}:{}", host, port);
         Ok(Box::new(tls))
     } else {
         Ok(Box::new(tcp))

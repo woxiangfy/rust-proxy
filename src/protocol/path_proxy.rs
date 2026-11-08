@@ -160,7 +160,7 @@ pub(super) async fn handle_path_proxy<S>(
         Ok(u) => u,
         Err(e) => {
             warn!(
-                "Path-proxy: invalid target URL '{}' from {}: {}",
+                "[path-proxy] invalid target URL '{}' from {}: {}",
                 target_url, client_addr, e
             );
             send_error(
@@ -211,7 +211,7 @@ pub(super) async fn handle_path_proxy<S>(
         Ok(s) => s,
         Err(e) => {
             error!(
-                "Path-proxy: failed to connect upstream '{}' for {}: {:#}",
+                "[path-proxy] failed to connect upstream '{}' for {}: {:#}",
                 target_url, client_addr, e
             );
             send_error(&mut client, 502, "Bad Gateway", "upstream connection failed").await;
@@ -227,7 +227,7 @@ pub(super) async fn handle_path_proxy<S>(
             // 非数字或互相冲突的 Content-Length：代理与上游会对 body 边界产生不同
             // 理解，只能 fail-closed。这是相对旧实现的**有意收紧**（旧实现静默丢 CL）。
             warn!(
-                "Path-proxy: malformed framing headers from {} for '{}', rejecting",
+                "[path-proxy] malformed framing headers from {} for '{}', rejecting",
                 client_addr, target_url
             );
             send_error(
@@ -266,11 +266,11 @@ pub(super) async fn handle_path_proxy<S>(
 
     // ── 5. 回传响应（必要时重写 Location）──
     match forward_response(&mut client, &mut upstream, cfg, &parsed, timeout, buffer_pool).await {
-        Ok(()) => info!("Path-proxy completed: {} {}", method, target_url),
+        Ok(()) => info!("[path-proxy] completed: {} {}", method, target_url),
         Err(e) if is_benign_close_error(&e) => {
-            debug!("Path-proxy response ended early: {}", e)
+            debug!("[path-proxy] response ended early: {}", e)
         }
-        Err(e) => warn!("Path-proxy response error for '{}': {}", target_url, e),
+        Err(e) => warn!("[path-proxy] response error for '{}': {}", target_url, e),
     }
 }
 

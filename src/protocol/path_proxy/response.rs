@@ -51,7 +51,7 @@ where
         }
         if head_data.len() >= MAX_HEAD_BYTES {
             // 响应头异常大：不改写，原样透传（此处 break 时 head_end 仍为 None）
-            warn!("Path-proxy: upstream response head exceeds {} bytes, passing through", MAX_HEAD_BYTES);
+            warn!("[path-proxy] upstream response head exceeds {} bytes, passing through", MAX_HEAD_BYTES);
             break;
         }
     }
@@ -89,7 +89,7 @@ where
     match outcome {
         RelayOutcome::Completed => {
             debug!(
-                "Path-proxy: response done, copy buffer {} KB",
+                "[path-proxy] response done, copy buffer {} KB",
                 copy_bytes / 1024
             );
             Ok(())
@@ -97,7 +97,7 @@ where
         // 客户端断开：不记 error，正常下载中断不得刷屏
         RelayOutcome::ClientGone => Ok(()),
         RelayOutcome::UpstreamClosed => {
-            debug!("Path-proxy: upstream closed before sending response body");
+            debug!("[path-proxy] upstream closed before sending response body");
             Ok(())
         }
         RelayOutcome::TimedOut => Err(std::io::Error::new(

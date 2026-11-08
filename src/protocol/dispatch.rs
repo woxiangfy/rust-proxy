@@ -159,7 +159,7 @@ async fn handle_client_generic<S>(
                     Some(source) => auth_header = Some(source.header_name()),
                     None => {
                         send_path_auth_required(&mut client).await;
-                        warn!("Path-proxy authentication failed from {}", client_addr);
+                        warn!("[path-proxy] authentication failed from {}", client_addr);
                         return;
                     }
                 }

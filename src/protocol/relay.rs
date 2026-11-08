@@ -22,7 +22,6 @@ use crate::protocol::http_body::{forward_chunked_body, forward_content_length_bo
 use crate::protocol::http_response::{send_bad_gateway, write_response};
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::support::net::{connect_host, is_benign_close_error};
-use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -268,8 +267,7 @@ async fn relay_response<S>(
     upstream: &mut TcpStream,
     target: &ForwardTarget<'_>,
     timeout: Duration,
-) -> Result<()>
-where
+) where
     S: AsyncWrite + Unpin,
 {
     let (outcome, copy_bytes) = copy_upstream_to_client(client, upstream, timeout).await;
@@ -303,8 +301,6 @@ where
         target.port,
         copy_bytes / 1024
     );
-
-    Ok(())
 }
 /// 转发一次普通代理请求（认证已在调用前完成）
 ///
@@ -389,7 +385,7 @@ pub(super) async fn handle_http_request_generic<S>(
         return;
     }
 
-    let _ = relay_response(&mut client, &mut upstream, &target, timeout_duration).await;
+    relay_response(&mut client, &mut upstream, &target, timeout_duration).await;
 
     info!("Request completed: {} {}", target.method, target.url);
 }

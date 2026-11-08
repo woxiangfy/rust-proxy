@@ -3,8 +3,9 @@
 //! 唯一职责：在不缓冲整个 body 的前提下，把客户端请求体按 RFC 7230 分帧边界
 //! 原样转发到上游（含 chunked 终止块识别、已缓冲前缀回灌、超时约束）。
 //!
-//! 该模块被经典代理（[`crate::protocol::proxy`]）与路径前缀直连（[`crate::protocol::path_proxy`]）复用，
-//! 因此不依赖任何上层模块（仅依赖 [`crate::support::buffer_pool`]），是纯叶模块。
+//! 经典代理与路径前缀直连都经 `crate::protocol::relay::forward_request_body` 调用本模块
+//! （两条链路只在日志标签上不同），因此不依赖任何上层模块（仅依赖
+//! [`crate::support::buffer_pool`]），是纯叶模块。
 
 use crate::support::buffer_pool::{BufferPool, BUFFER_SIZE};
 use std::time::Duration;

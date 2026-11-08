@@ -1,11 +1,13 @@
 //! HTTP 报文解析与改写原语
 //!
 //! 这里只放"与业务无关"的纯函数：头部结束位置查找、逐跳头判定、authority 构造。
-//! 它们同时被经典代理（[`crate::protocol::proxy`]）与路径前缀直连（[`crate::protocol::path_proxy`]）
-//! 使用。历史上这些函数在两处各写一份（`MAX_HEADER_BYTES` / `MAX_HEAD_BYTES`
+//! 它们同时被经典转发（`crate::protocol::request`、`crate::protocol::dispatch`、
+//! `crate::protocol::forward`）与路径前缀直连（[`crate::protocol::path_proxy`]）使用。
+//! 历史上这些函数在两处各写一份（`MAX_HEADER_BYTES` / `MAX_HEAD_BYTES`
 //! 名字不同但值相同），改动时容易只改一边，因此统一收敛到此叶模块。
 //!
-//! 依赖方向：`proxy → http_util`、`path_proxy → http_util`，本模块不依赖任何业务模块。
+//! 依赖方向：`request/dispatch/forward → http_util`、`path_proxy → http_util`，
+//! 本模块不依赖任何业务模块。
 
 /// 请求头 / 响应头最大字节数：超过即视为畸形或恶意（防御超大头攻击）
 ///

@@ -4,14 +4,14 @@
 //! 接入与装配由 `crate::server` 负责。
 
 pub mod auth;
-pub(crate) mod classic;
-pub(crate) mod connect;
-pub(crate) mod dispatch;
-pub(crate) mod forward;
+mod classic;
+mod connect;
+mod dispatch;
+mod forward;
 pub mod http_body;
 pub mod http_response;
 pub mod http_util;
 pub mod path_proxy;
 pub mod proxy;
-pub(crate) mod relay;
-pub(crate) mod request;
+mod relay;
+mod request;

@@ -255,7 +255,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭（装配入口） |
 | `config/mod.rs` / `config/schema.rs` | 配置加载、运行时派生与校验 / 声明层字段表（统一生成 CLI、TOML、服务参数） |
 | `protocol/proxy.rs` | 兼容门面：仅 re-export `handle_client` / `handle_client_with_addr` |
-| `protocol/dispatch.rs` | 请求编排：读头 → 分类 → 认证 → 分流；反扫描 404 与超限 431 |
+| `protocol/dispatch.rs` | 请求编排：读头 → 分类 → 认证 → 分流 |
 | `protocol/request.rs` | 请求头读取与完整性判定（`Complete` / `Incomplete` / `Overflow`） |
 | `protocol/connect.rs` | CONNECT 隧道：建连、200 应答、双向转发、502 |
 | `protocol/classic.rs` | 经典代理转发流水线（建头 → 请求体 → 响应回传），编排取自 `relay` 的共享原语 |
@@ -267,7 +267,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 | `protocol/auth.rs` | Basic 凭据校验（等时比较）、407 / 401 质询 |
 | `protocol/http_util.rs` | 头部结束查找、逐跳头判定、authority 构造 |
 | `protocol/http_body.rs` | chunked 分帧状态机与流式转发 |
-| `protocol/http_response.rs` | 代理自产响应构造（404 / 407 / 401 / 431 / 502 / 400 共用骨架） |
+| `protocol/http_response.rs` | 代理自产响应（404 / 407 / 401 / 431 / 502 / 400 共用骨架，404/431 在此定义） |
 | `transport/tls.rs` | TLS 证书加载、自签回退、mtime 热重载 |
 | `transport/tls_client.rs` | 客户端 TLS 配置与握手：系统根证书 / `insecure` 跳过校验 |
 | `transport/proxy_protocol.rs` | PROXY Protocol v1/v2 解析、模式映射、真实地址解析（`PpPolicy`） |

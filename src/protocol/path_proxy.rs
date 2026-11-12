@@ -208,7 +208,7 @@ pub(super) async fn handle_path_proxy<S>(
     };
 
     info!(
-        "{} -> PATH {} {} (prefix /{}/)",
+        "[path-proxy] {} -> PATH {} {} (prefix /{}/)",
         client_addr,
         method,
         target_url,

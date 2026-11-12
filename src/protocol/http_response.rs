@@ -1,10 +1,11 @@
 //! HTTP 响应报文构造
 //!
-//! 代理自己产生的响应：反扫描 404/431、代理认证 401/407、经典代理 400/502、
-//! 路径前缀直连 400/502。
+//! 代理自产响应的唯一构造点：反扫描 404 与超限 431 由本模块定义，
+//! 经典代理 / CONNECT / 路径前缀直连的 400、502 走 `send_error`；
+//! 代理认证的 401 / 407 质询头在 [`crate::protocol::auth`] 组装，骨架同样来自 `write_response`。
 //! 它们的骨架完全一致（状态行 → 附加头 → `Content-Length` → `Connection: close` → body），
-//! 差别只在状态行、质询头与 body，因此收敛成一个写入函数；经典代理与路径代理的
-//! 错误响应都走这里，不再各自手写字符串。
+//! 差别只在状态行、质询头与 body，因此收敛成一个写入函数；调用方只决定「发什么」，
+//! 不再各自手写字符串。
 //!
 //! 收敛的理由不只是"少写几行"：这类响应是**机器可读的协议输出**，多处手写字符串时
 //! 任何一处漏写 `Content-Length` 或 `Connection: close` 都会造成客户端挂起，
@@ -79,6 +80,32 @@ pub(super) async fn send_error<W: AsyncWrite + Unpin>(
         &format!("{} {}", code, reason),
         &[("Content-Type", "text/plain; charset=utf-8")],
         msg.as_bytes(),
+        timeout,
+    )
+    .await;
+}
+
+/// 返回最小化的 404 Not Found 响应，模仿普通静态服务器。
+///
+/// 设计原则：
+/// - **不返回 Server 头**（避免暴露运行时 / 框架特征）
+/// - **不返回 X-Powered-By 等**
+/// - 简短，最小化攻击面与指纹
+/// - Connection: close，避免占着连接
+pub(super) async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
+    send_error(client, 404, "Not Found", "404 Not Found", timeout).await;
+}
+
+/// 请求头超过上限时的 431 响应
+///
+/// 用 431 而不是 400：语义精确（RFC 6585 §5 专为"头部过大"定义），且只会在客户端
+/// 已经发出超长头时出现——扫描器通常只发一行 `GET /`，因此不构成代理特征泄漏。
+pub(super) async fn send_head_too_large<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
+    send_error(
+        client,
+        431,
+        "Request Header Fields Too Large",
+        "431 Request Header Fields Too Large",
         timeout,
     )
     .await;

@@ -7,7 +7,7 @@ use crate::config::AuthUser;
 use crate::protocol::auth::{check_path_auth, check_proxy_auth, send_auth_required, send_path_auth_required};
 use crate::protocol::classic::handle_http_request_generic;
 use crate::protocol::connect::handle_connect_generic;
-use crate::protocol::http_response::write_response;
+use crate::protocol::http_response::{send_404_not_found, send_head_too_large};
 use crate::protocol::http_util::{head_end_offset, MAX_HEAD_BYTES};
 use crate::protocol::path_proxy::{
     handle_path_proxy, PathProxyConfig, PathProxyRequest, PathProxyRuntime,
@@ -267,39 +267,6 @@ fn classify_proxy_request(method: &str, url: &str) -> ProxyRequestKind {
 
     // 3) 其余情况：相对路径（GET /、GET /admin）、其它 scheme（ftp://）等
     ProxyRequestKind::Invalid
-}
-
-/// 返回最小化的 404 Not Found 响应，模仿普通静态服务器。
-///
-/// 设计原则：
-/// - **不返回 Server 头**（避免暴露运行时 / 框架特征）
-/// - **不返回 X-Powered-By 等**
-/// - 简短，最小化攻击面与指纹
-/// - Connection: close，避免占着连接
-async fn send_404_not_found<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
-    write_response(
-        client,
-        "404 Not Found",
-        &[("Content-Type", "text/plain; charset=utf-8")],
-        b"404 Not Found",
-        timeout,
-    )
-    .await;
-}
-
-/// 请求头超过上限时的 431 响应
-///
-/// 用 431 而不是 400：语义精确（RFC 6585 §5 专为"头部过大"定义），且只会在客户端
-/// 已经发出超长头时出现——扫描器通常只发一行 `GET /`，因此不构成代理特征泄漏。
-async fn send_head_too_large<W: AsyncWrite + Unpin>(client: &mut W, timeout: Duration) {
-    write_response(
-        client,
-        "431 Request Header Fields Too Large",
-        &[("Content-Type", "text/plain; charset=utf-8")],
-        b"431 Request Header Fields Too Large",
-        timeout,
-    )
-    .await;
 }
 
 #[cfg(test)]

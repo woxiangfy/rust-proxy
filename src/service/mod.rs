@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(parsed.log_level, Some(crate::support::logging::LogLevel::Debug));
     }
 
-    /// 服务模式参数必须由 clap 统一解析（B11 / A4 的回归）
+    /// 服务模式参数必须由 clap 统一解析
     ///
     /// 此前是手写 `match` 逐参数解析，新增 flag 时容易漏同步；改为复用
     /// `RunAsServiceArgs` 后，`ServerRunArgs` 上新增字段自动生效。此测试固定

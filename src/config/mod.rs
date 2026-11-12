@@ -5,7 +5,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-// `LogLevel` 属于日志域，定义在 `logging` 模块（见 B4）。
+// `LogLevel` 属于日志域，定义在 `support::logging`。
 // 这里重新导出，既保持 `config::LogLevel` 这个既有路径可用，又让依赖方向变成
 // `config → support::logging`（单向），避免 logging 为了一个枚举反查配置模块。
 pub use crate::support::logging::LogLevel;

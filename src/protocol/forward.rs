@@ -323,7 +323,7 @@ mod tests {
     // ─── host:port 解析 / chunked 分帧 ───
     // 这两组原语的实现与测试已迁至 `crate::support::net` 与 `crate::protocol::http_body`（消除模块循环依赖）。
 
-    // ─── 转发目标解析（B3 拆分后的纯函数） ───
+    // ─── 转发目标解析（纯函数） ───
 
     #[test]
     fn test_forward_target_parses_absolute_url() {

@@ -71,7 +71,7 @@ static TZ_OFFSET_SECONDS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 /// 本地时区偏移（秒）
 ///
 /// 由 `time` crate 提供跨平台实现（Windows 走 `GetTimeZoneInformation`、
-/// Unix 走 `localtime_r`），项目自己不再维护 FFI 与 `unsafe`（B5）。
+/// Unix 走 `localtime_r`），项目自己不再维护 FFI 与 `unsafe`。
 fn local_offset_seconds() -> i32 {
     *TZ_OFFSET_SECONDS.get_or_init(|| {
         time::UtcOffset::current_local_offset()
@@ -406,7 +406,7 @@ mod tests {
 
     /// 本地时间换算不得让时钟走偏
     ///
-    /// 这条测试固定 B5 重构的关键不变量：换成 `time` crate 之后，时区偏移只能
+    /// 这条测试固定时区换算的关键不变量：时区偏移只能
     /// "平移显示用的墙上时间"，不能改变时间点本身。若偏移被重复施加（或符号搞反），
     /// 会立刻偏离数小时。
     #[test]

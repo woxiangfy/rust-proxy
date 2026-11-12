@@ -43,7 +43,9 @@ pub mod service;
 pub mod support;
 pub mod transport;
 
-// 兼容旧路径：这些模块只是换了目录，类型与函数可见性未变。
+// 兼容旧路径：模块只是换了目录，这里保留旧路径别名。
+// 其中 `auth` / `http_body` / `http_response` / `http_util` 的条目都是 `pub(super)`，
+// 因此这四个别名目前不导出任何对外的类型或函数；真正可用的只有 `path_proxy` 与 `proxy`。
 pub use protocol::{auth, http_body, http_response, http_util, path_proxy, proxy};
 pub use support::{buffer_pool, logging, net};
 pub use transport::{proxy_protocol, stream, tls, tls_client};

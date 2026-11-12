@@ -31,8 +31,10 @@
 //!   app      → 以上全部 + clap 分派
 //! ```
 //!
-//! 旧的平铺路径（如 `rust_proxy::http_util`）通过文末的 `pub use` 保留，避免
-//! 仅因目录调整破坏已有调用方；新代码请使用分层路径（`rust_proxy::protocol::...`）。
+//! 旧路径别名只保留确实有公开入口的模块（`protocol::{path_proxy, proxy}` 与
+//! support / transport 的平铺导出）；`protocol` 内部的 `auth` / `http_body` /
+//! `http_response` / `http_util` 条目均为 `pub(super)`，不再做无意义的别名。
+//! 新代码请使用分层路径（`rust_proxy::protocol::...`）。
 
 pub mod app;
 pub mod client;
@@ -43,9 +45,7 @@ pub mod service;
 pub mod support;
 pub mod transport;
 
-// 兼容旧路径：模块只是换了目录，这里保留旧路径别名。
-// 其中 `auth` / `http_body` / `http_response` / `http_util` 的条目都是 `pub(super)`，
-// 因此这四个别名目前不导出任何对外的类型或函数；真正可用的只有 `path_proxy` 与 `proxy`。
-pub use protocol::{auth, http_body, http_response, http_util, path_proxy, proxy};
+// 兼容旧路径：只保留有公开入口的模块别名。
+pub use protocol::{path_proxy, proxy};
 pub use support::{buffer_pool, logging, net};
 pub use transport::{proxy_protocol, stream, tls, tls_client};

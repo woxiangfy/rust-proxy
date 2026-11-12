@@ -250,7 +250,7 @@ openssl rsa -in key.pem -check -noout     # 验证私钥
 
 | 模块 | 职责 |
 | --- | --- |
-| `lib.rs` / `main.rs` | 库入口（分层导出、兼容旧路径）/ 薄壳二进制 |
+| `lib.rs` / `main.rs` | 库入口（分层导出、保留少数旧路径别名）/ 薄壳二进制 |
 | `app.rs` | 进程编排：运行时装配、关停信号、子命令分派 |
 | `server.rs` | 监听管理、连接分发（`ConnContext`）、优雅关闭（装配入口） |
 | `config/mod.rs` / `config/schema.rs` | 配置加载、运行时派生与校验 / 声明层字段表（统一生成 CLI、TOML、服务参数） |

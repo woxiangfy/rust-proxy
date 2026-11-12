@@ -43,7 +43,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 mod response;
 mod upstream;
 
-use crate::protocol::relay::{send_upstream_request, RelayLink, RequestBodyForward};
+use crate::protocol::relay::{
+    send_upstream_request, RelayLink, RequestBodyForward, SendRequestError,
+};
 use response::{forward_response, ResponseDelivery};
 use upstream::connect_upstream;
 /// 路径前缀直连模式配置
@@ -261,7 +263,7 @@ pub(super) async fn handle_path_proxy<S>(
     // ── 4. 转发请求（写头 → 按需应答 100-continue → 转发 body）──
     // 与经典代理共用 relay::send_upstream_request，仅用 RelayLink 区分日志来源
     let buffered_body = &request_data[head_end..];
-    if send_upstream_request(
+    match send_upstream_request(
         &mut client,
         &mut upstream,
         RequestBodyForward {
@@ -274,9 +276,22 @@ pub(super) async fn handle_path_proxy<S>(
         },
     )
     .await
-    .is_err()
     {
-        return;
+        Ok(_) => {}
+        // 写上游失败：目标已不可用，响应还没开始，给客户端一个明确的 502
+        Err(SendRequestError::Upstream) => {
+            send_error(
+                &mut client,
+                502,
+                "Bad Gateway",
+                "upstream send failed",
+                timeout,
+            )
+            .await;
+            return;
+        }
+        // 客户端侧失败（应答 100 / 读请求体）：客户端已不可用，回写没有接收方
+        Err(SendRequestError::Client) => return,
     }
 
     // ── 5. 回传响应（必要时重写 Location）──

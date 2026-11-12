@@ -18,7 +18,9 @@
 //! 经典代理的编排在 [`crate::protocol::classic`]，本模块只提供它需要的原语。
 
 use crate::protocol::forward::UpstreamHead;
-use crate::protocol::http_body::{forward_chunked_body, forward_content_length_body};
+use crate::protocol::http_body::{
+    forward_chunked_body, forward_content_length_body, BodyFailureSide, BodyForwardError,
+};
 use crate::support::buffer_pool::{AdaptiveBuffer, BufferPool};
 use crate::support::net::{is_benign_close_error, write_all_with_timeout};
 use log::{debug, warn};
@@ -132,6 +134,29 @@ where
     }
 }
 
+/// 发送请求失败发生在哪一侧
+///
+/// 调用方据此决定能否向客户端回写：写上游失败说明目标不可用，可回 502；
+/// 与客户端交互失败（应答 `100 Continue`、读请求体）说明客户端已经不可用，
+/// 回写没有接收方。原始 io 错误已由 [`log_send_error`] / [`log_body_error`]
+/// 在失败点记录，这里只保留方向。
+#[derive(Debug)]
+pub(super) enum SendRequestError {
+    /// 客户端侧失败
+    Client,
+    /// 上游侧失败
+    Upstream,
+}
+
+impl From<BodyForwardError> for SendRequestError {
+    fn from(e: BodyForwardError) -> Self {
+        match e.side {
+            BodyFailureSide::Client => SendRequestError::Client,
+            BodyFailureSide::Upstream => SendRequestError::Upstream,
+        }
+    }
+}
+
 /// 请求体转发所属链路（日志里用于区分经典代理与路径前缀）
 #[derive(Clone, Copy)]
 pub(super) enum RelayLink {
@@ -219,11 +244,14 @@ pub(super) struct RequestBodyForward<'a> {
 ///
 /// 返回已向上游写出的 body 字节数（`Content-Length` 路径下可用于判断客户端是否
 /// 提前关闭；chunked 路径恒返回 0）。`link` 只影响日志标签，两条链路行为一致。
+///
+/// 失败时区分 [`SendRequestError::Client`]（读客户端）与
+/// [`SendRequestError::Upstream`]（写上游），调用方据此决定是否回 502。
 pub(super) async fn forward_request_body<S, T>(
     client: &mut S,
     upstream: &mut T,
     body: RequestBodyForward<'_>,
-) -> std::io::Result<u64>
+) -> Result<u64, SendRequestError>
 where
     S: AsyncRead + Unpin,
     T: AsyncWrite + Unpin,
@@ -241,8 +269,8 @@ where
         return match forward_chunked_body(client, upstream, buffered, timeout, buffer_pool).await {
             Ok(()) => Ok(0),
             Err(e) => {
-                log_body_error(link, client_addr, "chunked", &e);
-                Err(e)
+                log_body_error(link, client_addr, "chunked", &e.error);
+                Err(e.into())
             }
         };
     }
@@ -259,7 +287,7 @@ where
             .await
             {
                 log_body_error(link, client_addr, "buffered-only", &e);
-                return Err(e);
+                return Err(SendRequestError::Upstream);
             }
         }
         return Ok(buffered.len() as u64);
@@ -279,8 +307,8 @@ where
         }
         Ok(sent) => Ok(sent),
         Err(e) => {
-            log_body_error(link, client_addr, "content-length", &e);
-            Err(e)
+            log_body_error(link, client_addr, "content-length", &e.error);
+            Err(e.into())
         }
     }
 }
@@ -296,7 +324,7 @@ pub(super) async fn send_upstream_request<S, T>(
     client: &mut S,
     upstream: &mut T,
     body: RequestBodyForward<'_>,
-) -> std::io::Result<u64>
+) -> Result<u64, SendRequestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncWrite + Unpin,
@@ -309,7 +337,7 @@ where
             .await
     {
         log_send_error(body.link, body.client_addr, "request head to upstream", &e);
-        return Err(e);
+        return Err(SendRequestError::Upstream);
     }
 
     if head.expect_continue {
@@ -322,7 +350,7 @@ where
         .await
         {
             log_send_error(body.link, body.client_addr, "100-continue to client", &e);
-            return Err(e);
+            return Err(SendRequestError::Client);
         }
     }
 
@@ -532,5 +560,107 @@ mod tests {
 
         assert_eq!(sent, 3, "返回值应等于已转发的缓冲字节数");
         assert_eq!(upstream, b"abc");
+    }
+
+    fn head_with(content_length: Option<u64>, expect_continue: bool) -> UpstreamHead {
+        UpstreamHead {
+            bytes: "POST / HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+            content_length,
+            chunked: false,
+            expect_continue,
+        }
+    }
+
+    /// 写上游请求头失败 → `Upstream`（调用方据此回 502）
+    #[tokio::test]
+    async fn test_send_upstream_request_classifies_upstream_write_failure() {
+        // 上游对端已丢弃：任何写入都会立刻失败
+        let (mut upstream, upstream_peer) = tokio::io::duplex(64);
+        drop(upstream_peer);
+        let (mut client, _client_peer) = tokio::io::duplex(64);
+        let pool = BufferPool::new();
+        let head = head_with(None, false);
+
+        let err = send_upstream_request(
+            &mut client,
+            &mut upstream,
+            RequestBodyForward {
+                head: &head,
+                buffered: b"",
+                timeout: Duration::from_millis(200),
+                buffer_pool: &pool,
+                link: RelayLink::Classic,
+                client_addr: addr(),
+            },
+        )
+        .await
+        .expect_err("写上游失败必须返回错误");
+
+        assert!(
+            matches!(err, SendRequestError::Upstream),
+            "写上游失败必须归为 Upstream，实际：{:?}",
+            err
+        );
+    }
+
+    /// 应答 `100 Continue` 时客户端已断开 → `Client`（不得回写 502）
+    #[tokio::test]
+    async fn test_send_upstream_request_classifies_client_continue_write_failure() {
+        let (mut upstream, _upstream_peer) = tokio::io::duplex(1024);
+        let (mut client, client_peer) = tokio::io::duplex(64);
+        drop(client_peer);
+        let pool = BufferPool::new();
+        let head = head_with(None, true);
+
+        let err = send_upstream_request(
+            &mut client,
+            &mut upstream,
+            RequestBodyForward {
+                head: &head,
+                buffered: b"",
+                timeout: Duration::from_millis(200),
+                buffer_pool: &pool,
+                link: RelayLink::PathPrefix,
+                client_addr: addr(),
+            },
+        )
+        .await
+        .expect_err("100-continue 写客户端失败必须返回错误");
+
+        assert!(
+            matches!(err, SendRequestError::Client),
+            "客户端侧写失败必须归为 Client，实际：{:?}",
+            err
+        );
+    }
+
+    /// 读请求体超时（客户端连而不发）→ `Client`
+    #[tokio::test]
+    async fn test_send_upstream_request_classifies_client_body_read_timeout() {
+        let (mut client, _client_peer) = tokio::io::duplex(64);
+        let (mut upstream, _upstream_peer) = tokio::io::duplex(1024);
+        let pool = BufferPool::new();
+        let head = head_with(Some(8), false);
+
+        let err = send_upstream_request(
+            &mut client,
+            &mut upstream,
+            RequestBodyForward {
+                head: &head,
+                buffered: b"",
+                timeout: Duration::from_millis(20),
+                buffer_pool: &pool,
+                link: RelayLink::Classic,
+                client_addr: addr(),
+            },
+        )
+        .await
+        .expect_err("读请求体超时必须返回错误");
+
+        assert!(
+            matches!(err, SendRequestError::Client),
+            "读客户端失败必须归为 Client，实际：{:?}",
+            err
+        );
     }
 }

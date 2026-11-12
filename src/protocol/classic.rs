@@ -12,6 +12,7 @@ use crate::protocol::forward::{ForwardTarget, UpstreamHead};
 use crate::protocol::http_response::send_error;
 use crate::protocol::relay::{
     copy_upstream_to_client, send_upstream_request, RelayLink, RelayOutcome, RequestBodyForward,
+    SendRequestError,
 };
 use crate::support::buffer_pool::BufferPool;
 use crate::support::net::{connect_host, is_benign_close_error};
@@ -137,7 +138,7 @@ pub(super) async fn handle_http_request_generic<S>(
         }
     };
 
-    if send_upstream_request(
+    match send_upstream_request(
         &mut client,
         &mut upstream,
         RequestBodyForward {
@@ -150,9 +151,15 @@ pub(super) async fn handle_http_request_generic<S>(
         },
     )
     .await
-    .is_err()
     {
-        return;
+        Ok(_) => {}
+        // 写上游失败：目标已不可用，响应还没开始，给客户端一个明确的 502
+        Err(SendRequestError::Upstream) => {
+            send_error(&mut client, 502, "Bad Gateway", "502 Bad Gateway", timeout_duration).await;
+            return;
+        }
+        // 客户端侧失败（应答 100 / 读请求体）：客户端已不可用，回写没有接收方
+        Err(SendRequestError::Client) => return,
     }
 
     relay_response(&mut client, &mut upstream, &target, timeout_duration).await;

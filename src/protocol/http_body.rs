@@ -12,6 +12,41 @@ use crate::support::net::write_all_with_timeout;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
+/// 请求体转发失败发生在哪一侧
+///
+/// 调用方据此决定能否向客户端回写错误响应：写上游失败说明目标不可用，
+/// 可以回 502；读客户端失败说明客户端已经不可用，回写没有接收方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyFailureSide {
+    /// 读客户端失败（超时 / 连接错误）
+    Client,
+    /// 写上游失败（超时 / 连接错误）
+    Upstream,
+}
+
+/// 带方向的请求体转发错误
+#[derive(Debug)]
+pub(super) struct BodyForwardError {
+    pub(super) side: BodyFailureSide,
+    pub(super) error: std::io::Error,
+}
+
+impl BodyForwardError {
+    fn client(error: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Client,
+            error,
+        }
+    }
+
+    fn upstream(error: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Upstream,
+            error,
+        }
+    }
+}
+
 /// RFC 7230 chunked 请求体分帧状态机
 ///
 /// 仅用于识别 body 结束位置（最终块 `0\r\n` 及随后的空行），所有字节原样转发。
@@ -140,7 +175,7 @@ pub(super) async fn forward_chunked_body<S, T>(
     prefix: &[u8],
     timeout: Duration,
     buffer_pool: &BufferPool,
-) -> std::io::Result<()>
+) -> Result<(), BodyForwardError>
 where
     S: AsyncRead + Unpin,
     T: AsyncWrite + Unpin,
@@ -157,23 +192,27 @@ where
             out.push(b);
             if reader.done() {
                 // 整个 body 都在前缀里结束：立即收尾，不再等 socket
-                write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
+                write_all_with_timeout(target, &out, timeout, "chunked request body")
+                    .await
+                    .map_err(BodyForwardError::upstream)?;
                 return Ok(());
             }
         }
-        write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
+        write_all_with_timeout(target, &out, timeout, "chunked request body")
+            .await
+            .map_err(BodyForwardError::upstream)?;
         out.clear();
     }
 
     loop {
         let n = match tokio::time::timeout(timeout, client.read(buf_slice)).await {
             Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => return Err(BodyForwardError::client(e)),
             Err(_) => {
-                return Err(std::io::Error::new(
+                return Err(BodyForwardError::client(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timeout reading chunked body",
-                ))
+                )))
             }
         };
         if n == 0 {
@@ -185,12 +224,16 @@ where
             reader.push_byte(b);
             out.push(b);
             if out.len() >= BUFFER_SIZE {
-                write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
+                write_all_with_timeout(target, &out, timeout, "chunked request body")
+                    .await
+                    .map_err(BodyForwardError::upstream)?;
                 out.clear();
             }
             if reader.done() {
                 if !out.is_empty() {
-                    write_all_with_timeout(target, &out, timeout, "chunked request body").await?;
+                    write_all_with_timeout(target, &out, timeout, "chunked request body")
+                        .await
+                        .map_err(BodyForwardError::upstream)?;
                 }
                 return Ok(());
             }
@@ -213,7 +256,7 @@ pub(super) async fn forward_content_length_body<S, T>(
     content_length: u64,
     timeout: Duration,
     buffer_pool: &BufferPool,
-) -> std::io::Result<u64>
+) -> Result<u64, BodyForwardError>
 where
     S: AsyncRead + Unpin,
     T: AsyncWrite + Unpin,
@@ -225,7 +268,9 @@ where
     };
 
     if !buffered.is_empty() {
-        write_all_with_timeout(target, buffered, timeout, "request body (content-length)").await?;
+        write_all_with_timeout(target, buffered, timeout, "request body (content-length)")
+            .await
+            .map_err(BodyForwardError::upstream)?;
     }
     let mut sent = buffered.len() as u64;
     if sent >= content_length {
@@ -238,12 +283,12 @@ where
         let want = std::cmp::min((content_length - sent) as usize, tmp_slice.len());
         let n = match tokio::time::timeout(timeout, client.read(&mut tmp_slice[..want])).await {
             Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => return Err(BodyForwardError::client(e)),
             Err(_) => {
-                return Err(std::io::Error::new(
+                return Err(BodyForwardError::client(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timeout reading request body",
-                ))
+                )))
             }
         };
         if n == 0 {
@@ -251,7 +296,8 @@ where
             break;
         }
         write_all_with_timeout(target, &tmp_slice[..n], timeout, "request body (content-length)")
-            .await?;
+            .await
+            .map_err(BodyForwardError::upstream)?;
         sent += n as u64;
     }
 

@@ -58,7 +58,10 @@ struct ChunkedBodyReader {
     chunk_remaining: u64,
     /// chunk 数据后已消费的 CRLF 字节数（0..=2）
     crlf_seen: u8,
+    /// 正常结束（读到终止块与空行）
     done: bool,
+    /// 畸形分帧：既不是正常结束，也不应继续转发
+    malformed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,6 +84,7 @@ impl ChunkedBodyReader {
             chunk_remaining: 0,
             crlf_seen: 0,
             done: false,
+            malformed: false,
         }
     }
 
@@ -89,15 +93,21 @@ impl ChunkedBodyReader {
         self.done
     }
 
+    /// 分帧已损坏：调用方必须报错，不能当作 body 正常结束
+    #[inline]
+    fn malformed(&self) -> bool {
+        self.malformed
+    }
+
     /// 消费一个输入字节，推进分帧状态
     fn push_byte(&mut self, b: u8) {
-        if self.done {
+        if self.done || self.malformed {
             return;
         }
         match self.state {
             ChunkState::SizeLine => {
                 if self.line.len() >= 64 {
-                    self.done = true; // 防御：chunk-size/trailer 行异常长
+                    self.malformed = true; // 防御：chunk-size/trailer 行异常长
                     return;
                 }
                 self.line.push(b);
@@ -112,7 +122,7 @@ impl ChunkedBodyReader {
                             self.chunk_remaining = n;
                             self.state = ChunkState::Data;
                         }
-                        None => self.done = true, // 畸形行：停止转发
+                        None => self.malformed = true, // 畸形行：停止转发并报错
                     }
                 }
             }
@@ -132,12 +142,12 @@ impl ChunkedBodyReader {
                     self.crlf_seen = 2;
                     self.state = ChunkState::SizeLine;
                 } else {
-                    self.done = true; // 畸形 CRLF：停止转发
+                    self.malformed = true; // 畸形 CRLF：停止转发并报错
                 }
             }
             ChunkState::Trailers => {
                 if self.line.len() >= 64 {
-                    self.done = true;
+                    self.malformed = true;
                     return;
                 }
                 self.line.push(b);
@@ -161,6 +171,14 @@ fn parse_chunk_size(line: &[u8]) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
+/// 畸形 chunked 分帧：客户端输入错误，不属于上游故障
+fn malformed_chunked_error() -> BodyForwardError {
+    BodyForwardError::client(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "malformed chunked request body",
+    ))
+}
+
 /// 流式转发 chunked 编码的请求体。
 ///
 /// `prefix` 是调用方已从 socket 读入的 body 前缀（可能是完整 body，也可能只是开头）。
@@ -169,6 +187,9 @@ fn parse_chunk_size(line: &[u8]) -> Option<u64> {
 ///
 /// 分帧状态机逐字节解析并原样转发，直到遇到终止块 `0\r\n` 及随后的空行（trailer 结束）。
 /// 输出按 BUFFER_SIZE 批量 flush，避免逐字节写。
+///
+/// 畸形分帧（非十六进制 size 行、chunk 数据后不是 CRLF、行缓冲超限）一律返回
+/// [`BodyForwardError`]（客户端侧），不再像旧实现那样把它当作 body 正常结束。
 pub(super) async fn forward_chunked_body<S, T>(
     client: &mut S,
     target: &mut T,
@@ -190,6 +211,10 @@ where
         for &b in prefix {
             reader.push_byte(b);
             out.push(b);
+            if reader.malformed() {
+                // 分帧已损坏：丢弃未写出的字节并报错，调用方不得继续读响应
+                return Err(malformed_chunked_error());
+            }
             if reader.done() {
                 // 整个 body 都在前缀里结束：立即收尾，不再等 socket
                 write_all_with_timeout(target, &out, timeout, "chunked request body")
@@ -223,6 +248,9 @@ where
         for &b in &buf_slice[..n] {
             reader.push_byte(b);
             out.push(b);
+            if reader.malformed() {
+                return Err(malformed_chunked_error());
+            }
             if out.len() >= BUFFER_SIZE {
                 write_all_with_timeout(target, &out, timeout, "chunked request body")
                     .await
@@ -350,25 +378,31 @@ mod tests {
 
     #[test]
     fn test_chunked_incomplete_not_done() {
-        // body 未完整发送：不应判定为结束
+        // body 未完整发送：既不算结束，也不是畸形（上游/客户端都可能只是还没发完）
         let data = b"4\r\ndata\r\n0\r\n";
-        assert!(!drive_chunked(data), "缺少最终空行时不应视为结束");
+        let mut r = ChunkedBodyReader::new();
+        for &b in data {
+            r.push_byte(b);
+        }
+        assert!(!r.done(), "缺少最终空行时不应视为结束");
+        assert!(!r.malformed(), "输入不完整不等于畸形");
     }
 
     #[test]
     fn test_chunked_malformed_data_crlf_stops_forwarding() {
-        // 风险：chunk 数据后不是 CRLF 时必须立即停止，不能继续"重新同步"。
+        // 风险：chunk 数据后不是 CRLF 时必须立即停止并报错，不能继续"重新同步"。
         // 否则畸形分帧会被当成合法 body 转发，代理与上游对边界的理解随之分叉。
         let data = b"1\r\naX\r\n0\r\n\r\n";
         let mut r = ChunkedBodyReader::new();
         for (i, &b) in data.iter().enumerate() {
             r.push_byte(b);
-            if r.done() {
-                assert_eq!(i, 4, "数据后不是 CRLF 时应在该字节（索引 4）立即停止");
+            if r.malformed() {
+                assert_eq!(i, 4, "数据后不是 CRLF 时应在该字节（索引 4）立即报错");
+                assert!(!r.done(), "畸形分帧不得被标记为正常结束");
                 return;
             }
         }
-        panic!("畸形分帧必须触发 done，而不是读到终止块");
+        panic!("畸形分帧必须触发 malformed，而不是读到终止块");
     }
 
     #[test]
@@ -381,11 +415,12 @@ mod tests {
         for &b in &data {
             r.push_byte(b);
             consumed += 1;
-            if r.done() {
+            if r.malformed() {
                 break;
             }
         }
-        assert!(r.done(), "超长 size 行必须停止");
+        assert!(r.malformed(), "超长 size 行必须报错");
+        assert!(!r.done(), "超长 size 行不得被标记为正常结束");
         assert_eq!(consumed, 65, "行缓冲上限 64 字节，加上触发判断的一字节");
     }
 
@@ -397,9 +432,17 @@ mod tests {
 
     #[test]
     fn test_chunked_invalid_size_line_stops() {
-        // 畸形 chunk-size（非十六进制）→ 状态机应终止转发
+        // 畸形 chunk-size（非十六进制）→ 状态机必须标记畸形，而不是正常结束
         let data = b"zz\r\ndata\r\n";
-        assert!(drive_chunked(data), "畸形 chunk-size 应触发 done 停止");
+        let mut r = ChunkedBodyReader::new();
+        for &b in data {
+            r.push_byte(b);
+            if r.malformed() {
+                assert!(!r.done());
+                return;
+            }
+        }
+        panic!("畸形 chunk-size 必须触发 malformed");
     }
 
     #[test]
@@ -468,8 +511,58 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    // ─── Content-Length 精确转发 ───
+    /// 畸形 chunked（数据后不是 CRLF）必须报错，不得当作正常结束
+    ///
+    /// 旧实现把畸形分帧与「读到终止块」都记成 `done`，`forward_chunked_body` 返回
+    /// `Ok(())`，调用方会继续去读响应——而请求体实际上已经被截断。
+    #[tokio::test]
+    async fn test_forward_chunked_body_reports_malformed_data_crlf() {
+        let (mut client, mut client_peer) = tokio::io::duplex(64);
+        let mut upstream: Vec<u8> = Vec::new();
+        let pool = BufferPool::new();
 
+        // chunk 数据后是 "X" 而不是 CRLF：分帧已损坏
+        client_peer.write_all(b"1\r\naX\r\n0\r\n\r\n").await.unwrap();
+        drop(client_peer);
+
+        let res = forward_chunked_body(
+            &mut client,
+            &mut upstream,
+            &[],
+            Duration::from_millis(200),
+            &pool,
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "畸形 chunked 必须报错，而不是返回 Ok 让调用方继续读响应"
+        );
+    }
+
+    /// 已缓冲前缀里的畸形 chunk-size 行同样必须报错
+    #[tokio::test]
+    async fn test_forward_chunked_body_reports_malformed_size_line() {
+        let (_client_peer, mut client) = tokio::io::duplex(64);
+        let mut upstream: Vec<u8> = Vec::new();
+        let pool = BufferPool::new();
+
+        let res = forward_chunked_body(
+            &mut client,
+            &mut upstream,
+            b"zz\r\ndata\r\n",
+            Duration::from_millis(200),
+            &pool,
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "非十六进制 chunk-size 必须报错，而不是返回 Ok"
+        );
+    }
+
+    // ─── Content-Length 精确转发 ───
     #[tokio::test]
     async fn test_forward_cl_truncates_buffered_to_content_length() {
         // 已缓冲字节超出 CL 的部分属于管道化的下一个请求，不能一起发出去

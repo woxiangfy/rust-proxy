@@ -390,4 +390,105 @@ mod tests {
             assert_eq!(upstream, b"abc", "已收到的部分必须转发给上游");
         }
     }
+
+    /// 写客户端失败的三类归因：超时 → `ClientStalled`，其余 → `ClientGone`
+    ///
+    /// 非良性错误（如 `WriteZero`）仍按 `ClientGone` 收尾，但会先记 warn；
+    /// 这里只固定"归因不能反过来"，日志级别由 `outcome_for_client_write_error` 内部保证。
+    #[test]
+    fn test_client_write_error_classification() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(
+            matches!(
+                outcome_for_client_write_error(&Error::new(ErrorKind::TimedOut, "stalled")),
+                RelayOutcome::ClientStalled
+            ),
+            "写超时必须归为 ClientStalled，否则会把「对端不读」记成正常断开"
+        );
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::WriteZero,
+        ] {
+            assert!(
+                matches!(
+                    outcome_for_client_write_error(&Error::new(kind, "closed")),
+                    RelayOutcome::ClientGone
+                ),
+                "{:?} 必须归为 ClientGone",
+                kind
+            );
+        }
+    }
+
+    /// 上游一个字节都没写就 EOF：必须与「正常收尾」区分开
+    ///
+    /// `Completed` 的语义是"已向客户端写出过数据且正常结束"；若上游立刻关闭也报
+    /// `Completed`，调用方就无法区分空响应与正常响应。
+    #[tokio::test]
+    async fn test_copy_upstream_to_client_reports_upstream_closed_without_bytes() {
+        let mut client: Vec<u8> = Vec::new();
+        let mut upstream: &[u8] = b"";
+
+        let (outcome, copy_bytes) =
+            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(100)).await;
+
+        assert!(
+            matches!(outcome, RelayOutcome::UpstreamClosed),
+            "上游零字节 EOF 必须报 UpstreamClosed，实际：{:?}",
+            outcome
+        );
+        assert_eq!(copy_bytes, crate::support::buffer_pool::ADAPTIVE_INITIAL);
+        assert!(client.is_empty(), "没有数据可写");
+    }
+
+    /// 上游长时间无数据：读方向必须被 `timeout` 打断并报 `TimedOut`
+    #[tokio::test]
+    async fn test_copy_upstream_to_client_times_out_on_idle_upstream() {
+        // 保留写端不写也不关，制造"连接在但上游静默"的场景
+        let (mut client, _client_peer) = tokio::io::duplex(64);
+        let (_upstream_writer, mut upstream) = tokio::io::duplex(64);
+
+        let (outcome, _) =
+            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(50)).await;
+
+        assert!(
+            matches!(outcome, RelayOutcome::TimedOut),
+            "上游静默必须报 TimedOut，实际：{:?}",
+            outcome
+        );
+    }
+
+    /// 无 `Content-Length` 且非 chunked：只转发已缓冲字节，并如实返回字节数
+    #[tokio::test]
+    async fn test_forward_request_body_buffered_only_without_framing() {
+        let (mut client, _peer) = tokio::io::duplex(64);
+        let mut upstream: Vec<u8> = Vec::new();
+        let pool = BufferPool::new();
+        let head = UpstreamHead {
+            bytes: String::new(),
+            content_length: None,
+            chunked: false,
+            expect_continue: false,
+        };
+
+        let sent = forward_request_body(
+            &mut client,
+            &mut upstream,
+            RequestBodyForward {
+                head: &head,
+                buffered: b"abc",
+                timeout: Duration::from_millis(100),
+                buffer_pool: &pool,
+                link: RelayLink::Classic,
+                client_addr: addr(),
+            },
+        )
+        .await
+        .expect("buffered-only 转发不应读 socket");
+
+        assert_eq!(sent, 3, "返回值应等于已转发的缓冲字节数");
+        assert_eq!(upstream, b"abc");
+    }
 }

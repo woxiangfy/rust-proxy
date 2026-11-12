@@ -43,18 +43,40 @@ pub(super) enum RelayOutcome {
     UpstreamError(std::io::Error),
 }
 
-/// 写客户端失败归类：超时（对端不读）与普通断开（对端已关）含义不同，日志级别也不同
+/// 写客户端失败的归类结果（两条链路共用同一套判据）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientWriteFailure {
+    /// 对端已断开（含良性关闭）
+    Gone,
+    /// 对端在 `timeout` 内毫无进展
+    Stalled,
+}
+
+/// 归类写客户端失败，并按 `label` 统一日志口径
 ///
-/// 非超时且非良性关闭（如 `WriteZero`、TLS 内部错误）**不是**客户端正常断开，
-/// 记 warn 后才按 `ClientGone` 收尾，避免本地写缺陷被 debug 静默吞掉。
-fn outcome_for_client_write_error(e: &std::io::Error) -> RelayOutcome {
+/// 超时（对端不读）与普通断开（对端已关）含义不同：前者对端仍连着但不消费，
+/// 后者连接已经没了。非超时且非良性关闭（如 `WriteZero`、TLS 内部错误）**不是**
+/// 客户端正常断开，记 warn 后才按 [`ClientWriteFailure::Gone`] 收尾，避免本地写缺陷
+/// 被 debug 静默吞掉。`label` 用于区分链路来源（`classic` / `path-proxy`）。
+pub(super) fn classify_client_write_error(
+    e: &std::io::Error,
+    label: &str,
+) -> ClientWriteFailure {
     if e.kind() == std::io::ErrorKind::TimedOut {
-        RelayOutcome::ClientStalled
+        ClientWriteFailure::Stalled
     } else {
         if !is_benign_close_error(e) {
-            warn!("Unexpected error writing response to client: {}", e);
+            warn!("[{}] unexpected error writing response to client: {}", label, e);
         }
-        RelayOutcome::ClientGone
+        ClientWriteFailure::Gone
+    }
+}
+
+/// 把写客户端失败映射为拷贝循环的结束状态
+fn outcome_for_client_write_error(e: &std::io::Error, link: RelayLink) -> RelayOutcome {
+    match classify_client_write_error(e, link.label()) {
+        ClientWriteFailure::Stalled => RelayOutcome::ClientStalled,
+        ClientWriteFailure::Gone => RelayOutcome::ClientGone,
     }
 }
 
@@ -65,10 +87,12 @@ fn outcome_for_client_write_error(e: &std::io::Error) -> RelayOutcome {
 ///
 /// `Completed` 与 `UpstreamClosed` 的区分依据是"是否已向客户端写出过数据"：
 /// 前者表示响应体正常收尾，后者表示上游在这次响应里一个字节都没给出。
+/// `link` 只影响写客户端失败时的日志标签，判据与结果与链路无关。
 pub(super) async fn copy_upstream_to_client<S, T>(
     client: &mut S,
     upstream: &mut T,
     timeout: Duration,
+    link: RelayLink,
 ) -> (RelayOutcome, usize)
 where
     S: AsyncWrite + Unpin,
@@ -98,7 +122,7 @@ where
                 )
                 .await
                 {
-                    return (outcome_for_client_write_error(&e), copy.current_size());
+                    return (outcome_for_client_write_error(&e, link), copy.current_size());
                 }
                 wrote = true;
             }
@@ -116,7 +140,7 @@ pub(super) enum RelayLink {
 }
 
 impl RelayLink {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             RelayLink::Classic => "classic",
             RelayLink::PathPrefix => "path-proxy",
@@ -333,7 +357,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(100)),
+            copy_upstream_to_client(
+                &mut client,
+                &mut upstream,
+                Duration::from_millis(100),
+                RelayLink::Classic,
+            ),
         )
         .await;
 
@@ -401,7 +430,10 @@ mod tests {
 
         assert!(
             matches!(
-                outcome_for_client_write_error(&Error::new(ErrorKind::TimedOut, "stalled")),
+                outcome_for_client_write_error(
+                    &Error::new(ErrorKind::TimedOut, "stalled"),
+                    RelayLink::Classic
+                ),
                 RelayOutcome::ClientStalled
             ),
             "写超时必须归为 ClientStalled，否则会把「对端不读」记成正常断开"
@@ -413,7 +445,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    outcome_for_client_write_error(&Error::new(kind, "closed")),
+                    outcome_for_client_write_error(&Error::new(kind, "closed"), RelayLink::Classic),
                     RelayOutcome::ClientGone
                 ),
                 "{:?} 必须归为 ClientGone",
@@ -431,8 +463,13 @@ mod tests {
         let mut client: Vec<u8> = Vec::new();
         let mut upstream: &[u8] = b"";
 
-        let (outcome, copy_bytes) =
-            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(100)).await;
+        let (outcome, copy_bytes) = copy_upstream_to_client(
+            &mut client,
+            &mut upstream,
+            Duration::from_millis(100),
+            RelayLink::Classic,
+        )
+        .await;
 
         assert!(
             matches!(outcome, RelayOutcome::UpstreamClosed),
@@ -450,8 +487,13 @@ mod tests {
         let (mut client, _client_peer) = tokio::io::duplex(64);
         let (_upstream_writer, mut upstream) = tokio::io::duplex(64);
 
-        let (outcome, _) =
-            copy_upstream_to_client(&mut client, &mut upstream, Duration::from_millis(50)).await;
+        let (outcome, _) = copy_upstream_to_client(
+            &mut client,
+            &mut upstream,
+            Duration::from_millis(50),
+            RelayLink::PathPrefix,
+        )
+        .await;
 
         assert!(
             matches!(outcome, RelayOutcome::TimedOut),

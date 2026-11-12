@@ -33,7 +33,8 @@ async fn relay_response<S>(
 ) where
     S: AsyncWrite + Unpin,
 {
-    let (outcome, copy_bytes) = copy_upstream_to_client(client, upstream, timeout).await;
+    let (outcome, copy_bytes) =
+        copy_upstream_to_client(client, upstream, timeout, RelayLink::Classic).await;
 
     match outcome {
         // 正常收尾：完成日志在下方统一输出
